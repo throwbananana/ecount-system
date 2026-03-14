@@ -1,0 +1,9 @@
+.continue/mcpServers/excel-to-pdf-mcp.yaml
+name: excel-to-pdf-mcp
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: Excel to PDF MCP
+    command: npx
+    args:
+      - excel-to-pdf-mcp

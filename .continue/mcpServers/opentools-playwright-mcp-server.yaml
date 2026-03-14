@@ -1,0 +1,9 @@
+name: opentools-playwright-mcp-server
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: Playwright MCP Server
+    command: npx
+    args:
+      - -y
+      - @executeautomation/playwright-mcp-server

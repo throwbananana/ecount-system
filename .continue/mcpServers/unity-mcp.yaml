@@ -1,0 +1,8 @@
+name: unity-mcp
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: Unity MCP
+    command: npx
+    args:
+      - unitymcp@latest

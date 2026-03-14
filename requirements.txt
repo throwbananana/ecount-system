@@ -1,0 +1,6 @@
+pandas
+openpyxl
+pdfplumber
+zhipuai
+numpy
+xlrd

@@ -1,0 +1,9 @@
+.continue/mcpServers/pdf-parse-mcp.yaml
+name: pdf-parse-mcp
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: PDF Parsing MCP
+    command: npx
+    args:
+      - pdf-parse-mcp

@@ -1,0 +1,16 @@
+name: Local LM Studio
+version: 1.0.0
+schema: v1
+
+models:
+  - name: lmstudio-qwen-coder    # 这里随便取名字，不要叫 Autodetect 也行
+    provider: lmstudio
+    model: qwen2.5-coder-7b-instruct   # 改成你在 LM Studio 里看到的 model ID
+    apiBase: http://localhost:1234/v1  # LM Studio 默认就是这个地址:contentReference[oaicite:1]{index=1}
+    roles:
+      - chat
+      - edit
+      - apply
+      - autocomplete
+    capabilities:
+      - tool_use   # ★ 关键：告诉 Continue 这个模型支持 Tool Calling

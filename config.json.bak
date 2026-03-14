@@ -1,0 +1,858 @@
+{
+    "FIELD_RULES": {
+        "凭证日期": {
+            "type": "date"
+        },
+        "日期": {
+            "type": "date"
+        },
+        "序号": {
+            "type": "text",
+            "max_len": 4
+        },
+        "会计凭证No.": {
+            "type": "text",
+            "max_len": 30
+        },
+        "摘要编码": {
+            "type": "text",
+            "max_len": 2
+        },
+        "摘要": {
+            "type": "text",
+            "max_len": 200
+        },
+        "摘要名": {
+            "type": "text",
+            "max_len": 200
+        },
+        "类型": {
+            "type": "text",
+            "max_len": 1
+        },
+        "科目编码": {
+            "type": "text",
+            "max_len": 8
+        },
+        "对方科目": {
+            "type": "text",
+            "max_len": 8
+        },
+        "默认账户": {
+            "type": "text",
+            "max_len": 30
+        },
+        "往来单位编码": {
+            "type": "text",
+            "max_len": 30
+        },
+        "往来单位名": {
+            "type": "text",
+            "max_len": 100
+        },
+        "金额": {
+            "type": "number",
+            "max_int_len": 15,
+            "max_decimal_len": 2
+        },
+        "外币金额": {
+            "type": "number",
+            "max_int_len": 15,
+            "max_decimal_len": 4
+        },
+        "汇率": {
+            "type": "number",
+            "max_int_len": 14,
+            "max_decimal_len": 4
+        },
+        "部门": {
+            "type": "text",
+            "max_len": 50
+        },
+        "职员": {
+            "type": "text",
+            "max_len": 50
+        },
+        "发货仓库": {
+            "type": "text",
+            "max_len": 50
+        },
+        "交易类型": {
+            "type": "text",
+            "max_len": 2
+        },
+        "货币": {
+            "type": "text",
+            "max_len": 10
+        },
+        "收货公司": {
+            "type": "text",
+            "max_len": 200
+        },
+        "PEDIDO No": {
+            "type": "text",
+            "max_len": 200
+        },
+        "No.FACTURA": {
+            "type": "text",
+            "max_len": 200
+        },
+        "CONSIGNADO": {
+            "type": "text",
+            "max_len": 200
+        },
+        "CONDI. PAGO": {
+            "type": "text",
+            "max_len": 200
+        },
+        "CON DESTINO A": {
+            "type": "text",
+            "max_len": 200
+        },
+        "EMBARCADO VIA": {
+            "type": "text",
+            "max_len": 200
+        },
+        "MARCA": {
+            "type": "text",
+            "max_len": 200
+        },
+        "CARGOS": {
+            "type": "number",
+            "max_int_len": 15,
+            "max_decimal_len": 2
+        },
+        "品目编码": {
+            "type": "text",
+            "max_len": 20
+        },
+        "品目名": {
+            "type": "text",
+            "max_len": 100
+        },
+        "规格": {
+            "type": "text",
+            "max_len": 100
+        },
+        "Mo.TAMA": {
+            "type": "text",
+            "max_len": 200
+        },
+        "COLOR": {
+            "type": "text",
+            "max_len": 200
+        },
+        "装数": {
+            "type": "number",
+            "max_int_len": 15,
+            "max_decimal_len": 0
+        },
+        "CAJA": {
+            "type": "number",
+            "max_int_len": 12,
+            "max_decimal_len": 0
+        },
+        "数量": {
+            "type": "number",
+            "max_int_len": 12,
+            "max_decimal_len": 0
+        },
+        "单价": {
+            "type": "number",
+            "max_int_len": 12,
+            "max_decimal_len": 6
+        },
+        "供应价": {
+            "type": "number",
+            "max_int_len": 12,
+            "max_decimal_len": 2
+        },
+        "附带费用": {
+            "type": "number",
+            "max_int_len": 12,
+            "max_decimal_len": 2
+        },
+        "增值税": {
+            "type": "number",
+            "max_int_len": 12,
+            "max_decimal_len": 2
+        },
+        "生成生产入库": {
+            "type": "text",
+            "max_len": 1
+        },
+        "体积": {
+            "type": "number",
+            "max_int_len": 15,
+            "max_decimal_len": 2
+        },
+        "总体积": {
+            "type": "number",
+            "max_int_len": 15,
+            "max_decimal_len": 1
+        },
+        "重量": {
+            "type": "number",
+            "max_int_len": 15,
+            "max_decimal_len": 2
+        },
+        "总重量": {
+            "type": "number",
+            "max_int_len": 15,
+            "max_decimal_len": 2
+        }
+    },
+    "FIELD_SYNONYMS": {
+        "凭证日期": [
+            "日期",
+            "记账日期",
+            "制单日期"
+        ],
+        "日期": [
+            "日期",
+            "fecha",
+            "fecha日期",
+            "日期fecha",
+            "日期 fecha",
+            "fecha 日期"
+        ],
+        "序号": [
+            "行号",
+            "行次",
+            "序号",
+            "订单号",
+            "单据号",
+            "no.pedi",
+            "pedido",
+            "No.PEDI."
+        ],
+        "会计凭证No.": [
+            "凭证号",
+            "凭证编号",
+            "会计凭证号"
+        ],
+        "摘要编码": [
+            "摘要代码",
+            "摘要编码"
+        ],
+        "摘要": [
+            "摘要",
+            "摘要名",
+            "摘要说明",
+            "说明",
+            "备注",
+            "descrip",
+            "内容",
+            "descripción",
+            "DESCRIPCION",
+            "描述",
+            "description"
+        ],
+        "摘要名": [
+            "摘要名",
+            "摘要",
+            "摘要说明",
+            "说明",
+            "备注",
+            "descrip",
+            "内容",
+            "描述"
+        ],
+        "类型": [
+            "借贷标志",
+            "借贷",
+            "方向",
+            "类型"
+        ],
+        "科目编码": [
+            "科目代码",
+            "科目编号",
+            "会计科目",
+            "科目",
+            "code",
+            "codig",
+            "codigo"
+        ],
+        "对方科目": [
+            "对方科目",
+            "对应科目",
+            "反方科目",
+            "贷方科目",
+            "借方科目"
+        ],
+        "默认账户": [
+            "默认账户",
+            "账户",
+            "账户编码",
+            "银行账户",
+            "账号"
+        ],
+        "往来单位编码": [
+            "往来单位代码",
+            "客户编码",
+            "供应商编码",
+            "往来编码",
+            "客戶 cliente",
+            "cliente",
+            "客户"
+        ],
+        "往来单位名": [
+            "往来单位名称",
+            "客户名称",
+            "供应商名称",
+            "单位名称",
+            "cliente",
+            "客戶"
+        ],
+        "金额": [
+            "金额",
+            "本币金额",
+            "发生额",
+            "金额1",
+            "合计",
+            "total",
+            "本位币金额",
+            "本地金额",
+            "计价金额"
+        ],
+        "外币金额": [
+            "外币金额",
+            "原币金额",
+            "合计",
+            "total",
+            "合计 total"
+        ],
+        "汇率": [
+            "汇率",
+            "折算汇率"
+        ],
+        "部门": [
+            "部门",
+            "部门名称",
+            "成本中心"
+        ],
+        "发货仓库": [
+            "发货仓库",
+            "出货仓库",
+            "仓库"
+        ],
+        "品目编码": [
+            "品目编码",
+            "物料编码",
+            "商品编码",
+            "代号",
+            "代號",
+            "codig",
+            "代號 codigo",
+            "代號 codig"
+        ],
+        "品目名": [
+            "品目名",
+            "品目名称",
+            "商品名称",
+            "内容",
+            "descrip",
+            "descripcion",
+            "descripción"
+        ],
+        "数量": [
+            "数量",
+            "数量 canti",
+            "canti",
+            "qty"
+        ],
+        "单价": [
+            "单价",
+            "价格",
+            "precio",
+            "价格 precio"
+        ],
+        "供应价": [
+            "供应价",
+            "合计",
+            "total",
+            "合计 total",
+            "importe"
+        ],
+        "交易类型": [
+            "交易类型",
+            "交易编码",
+            "单据类型"
+        ],
+        "货币": [
+            "货币",
+            "币别",
+            "currency",
+            "货币代码"
+        ],
+        "收货公司": [
+            "收货公司",
+            "收货方",
+            "cliente",
+            "客户"
+        ],
+        "PEDIDO No": [
+            "pedido",
+            "No.PEDI.",
+            "订单号",
+            "pedido no"
+        ],
+        "No.FACTURA": [
+            "factura",
+            "发票号"
+        ],
+        "CONSIGNADO": [
+            "consignado"
+        ],
+        "CONDI. PAGO": [
+            "支付条件",
+            "付款条件",
+            "pago"
+        ],
+        "CON DESTINO A": [
+            "destino"
+        ],
+        "EMBARCADO VIA": [
+            "embarcado",
+            "via"
+        ],
+        "MARCA": [
+            "marca",
+            "品牌"
+        ],
+        "装数": [
+            "装数",
+            "装箱数"
+        ],
+        "CAJA": [
+            "caja",
+            "箱数"
+        ],
+        "附带费用": [
+            "附加费用",
+            "费用",
+            "运费"
+        ],
+        "增值税": [
+            "增值税",
+            "税额",
+            "营业税"
+        ]
+    },
+    "HEADER_SCHEMES": {
+        "一般凭证上传格式": [
+            {
+                "name": "日期",
+                "idx": 0,
+                "default": ""
+            },
+            {
+                "name": "序号",
+                "idx": 1,
+                "default": ""
+            },
+            {
+                "name": "会计凭证No.",
+                "idx": 14,
+                "default": ""
+            },
+            {
+                "name": "摘要编码",
+                "idx": 13,
+                "default": ""
+            },
+            {
+                "name": "摘要",
+                "idx": 2,
+                "default": ""
+            },
+            {
+                "name": "类型",
+                "idx": 12,
+                "default": ""
+            },
+            {
+                "name": "科目编码",
+                "idx": 3,
+                "default": ""
+            },
+            {
+                "name": "往来单位编码",
+                "idx": 6,
+                "default": ""
+            },
+            {
+                "name": "往来单位名",
+                "idx": 7,
+                "default": ""
+            },
+            {
+                "name": "金额",
+                "idx": 8,
+                "default": ""
+            },
+            {
+                "name": "外币金额",
+                "idx": 9,
+                "default": ""
+            },
+            {
+                "name": "汇率",
+                "idx": 10,
+                "default": ""
+            },
+            {
+                "name": "部门",
+                "idx": 11,
+                "default": ""
+            },
+            {
+                "name": "对方科目",
+                "idx": 4,
+                "default": ""
+            },
+            {
+                "name": "默认账户",
+                "idx": 5,
+                "default": ""
+            }
+        ]
+    },
+    "EXPORT_FORMATS": {
+        "shipping_product": {
+            "active": "亿看导出格式",
+            "formats": {
+                "亿看导出格式": [
+                    {
+                        "output": "日期",
+                        "source": "",
+                        "default": "20260119"
+                    },
+                    {
+                        "output": "序号",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "往来单位编码",
+                        "source": "BDV:business_partner|code|code|31750002",
+                        "default": ""
+                    },
+                    {
+                        "output": "往来单位名",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "职员",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "接收仓库",
+                        "source": "BDV:warehouse|code|code|100",
+                        "default": ""
+                    },
+                    {
+                        "output": "交易类型",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "货币",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "汇率",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "采购入库号",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "ENTR No:",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "DOCUM",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "Cargos",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "箱号",
+                        "source": "货柜号",
+                        "default": ""
+                    },
+                    {
+                        "output": "品目编码",
+                        "source": "型号",
+                        "default": ""
+                    },
+                    {
+                        "output": "品目名",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "规格名",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "COLOR",
+                        "source": "颜色",
+                        "default": ""
+                    },
+                    {
+                        "output": "CAJAS",
+                        "source": "装数",
+                        "default": ""
+                    },
+                    {
+                        "output": "数量",
+                        "source": "数量",
+                        "default": ""
+                    },
+                    {
+                        "output": "单价(包括税)",
+                        "source": "单价",
+                        "default": ""
+                    },
+                    {
+                        "output": "单价",
+                        "source": "不含税单价",
+                        "default": ""
+                    },
+                    {
+                        "output": "外币金额",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "供应价",
+                        "source": "不含税总金额",
+                        "default": ""
+                    },
+                    {
+                        "output": "附带费用",
+                        "source": "分摊杂费",
+                        "default": ""
+                    },
+                    {
+                        "output": "增值税",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "摘要",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "外币增值税",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "BULTO",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "total BULTO",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "C.I.F",
+                        "source": "",
+                        "default": ""
+                    }
+                ]
+            },
+            "use_original": true
+        },
+        "main_export": {
+            "active": "一般凭证",
+            "formats": {
+                "系统默认-模板同名": [
+                    {
+                        "output": "日期",
+                        "source": "日期",
+                        "default": ""
+                    },
+                    {
+                        "output": "序号",
+                        "source": "序号",
+                        "default": ""
+                    },
+                    {
+                        "output": "会计凭证No.",
+                        "source": "会计凭证No.",
+                        "default": ""
+                    },
+                    {
+                        "output": "摘要编码",
+                        "source": "摘要编码",
+                        "default": ""
+                    },
+                    {
+                        "output": "摘要",
+                        "source": "摘要",
+                        "default": ""
+                    },
+                    {
+                        "output": "类型",
+                        "source": "类型",
+                        "default": ""
+                    },
+                    {
+                        "output": "科目编码",
+                        "source": "科目编码",
+                        "default": ""
+                    },
+                    {
+                        "output": "往来单位编码",
+                        "source": "往来单位编码",
+                        "default": ""
+                    },
+                    {
+                        "output": "往来单位名",
+                        "source": "往来单位名",
+                        "default": ""
+                    },
+                    {
+                        "output": "金额",
+                        "source": "金额",
+                        "default": ""
+                    },
+                    {
+                        "output": "外币金额",
+                        "source": "外币金额",
+                        "default": ""
+                    },
+                    {
+                        "output": "汇率",
+                        "source": "汇率",
+                        "default": ""
+                    },
+                    {
+                        "output": "部门",
+                        "source": "部门",
+                        "default": ""
+                    },
+                    {
+                        "output": "对方科目",
+                        "source": "对方科目",
+                        "default": ""
+                    },
+                    {
+                        "output": "默认账户",
+                        "source": "默认账户",
+                        "default": ""
+                    }
+                ],
+                "一般凭证": [
+                    {
+                        "output": "日期",
+                        "source": "日期",
+                        "default": ""
+                    },
+                    {
+                        "output": "序号",
+                        "source": "序号",
+                        "default": ""
+                    },
+                    {
+                        "output": "会计凭证No.",
+                        "source": "会计凭证No.",
+                        "default": ""
+                    },
+                    {
+                        "output": "摘要编码",
+                        "source": "摘要编码",
+                        "default": ""
+                    },
+                    {
+                        "output": "摘要",
+                        "source": "摘要",
+                        "default": ""
+                    },
+                    {
+                        "output": "类型",
+                        "source": "类型",
+                        "default": ""
+                    },
+                    {
+                        "output": "科目编码",
+                        "source": "科目编码",
+                        "default": ""
+                    },
+                    {
+                        "output": "往来单位编码",
+                        "source": "往来单位编码",
+                        "default": ""
+                    },
+                    {
+                        "output": "往来单位名",
+                        "source": "往来单位名",
+                        "default": ""
+                    },
+                    {
+                        "output": "金额",
+                        "source": "金额",
+                        "default": ""
+                    },
+                    {
+                        "output": "外币金额",
+                        "source": "外币金额",
+                        "default": ""
+                    },
+                    {
+                        "output": "汇率",
+                        "source": "汇率",
+                        "default": ""
+                    },
+                    {
+                        "output": "部门",
+                        "source": "部门",
+                        "default": ""
+                    },
+                    {
+                        "output": "对方科目",
+                        "source": "对方科目",
+                        "default": ""
+                    },
+                    {
+                        "output": "默认账户",
+                        "source": "默认账户",
+                        "default": ""
+                    }
+                ]
+            },
+            "use_original": false
+        },
+        "summary_match_export": {
+            "active": "",
+            "formats": {}
+        },
+        "shipping_container": {
+            "active": "",
+            "formats": {}
+        },
+        "image_recognition": {
+            "active": "",
+            "formats": {}
+        }
+    }
+}

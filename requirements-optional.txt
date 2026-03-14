@@ -1,0 +1,6 @@
+# Optional dependencies for OCR/AI features
+Pillow
+pytesseract
+openai
+paddleocr
+easyocr

@@ -1,0 +1,8 @@
+name: calculate-expression-mcp
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: Calculate Expression MCP
+    command: npx
+    args:
+      - calculate-expression-mcp@latest

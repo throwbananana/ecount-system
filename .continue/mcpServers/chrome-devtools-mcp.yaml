@@ -1,0 +1,8 @@
+name: chrome-devtools-mcp
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: Chrome DevTools MCP
+    command: npx
+    args:
+      - chrome-devtools-mcp@latest
