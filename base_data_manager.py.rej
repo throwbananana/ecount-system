@@ -1,0 +1,45 @@
+diff a/base_data_manager.py b/base_data_manager.py	(rejected hunks)
+@@ -1,5 +1,6 @@
+ import hashlib
+ from typing import Optional, List, Dict, Any
++from runtime_paths import BASE_DATA_DB_FILE
+
+ class BaseDataManager:
+     """基础数据管理器"""
+@@ -1,6 +1,6 @@
+
+     APP_DIR = os.path.dirname(os.path.abspath(__file__))
+-    DB_FILE = os.path.join(APP_DIR, "base_data.db")
++    DB_FILE = str(BASE_DATA_DB_FILE)
+     BASE_DATA_DIR = os.path.join(APP_DIR, "基础数据", "基础数据")
+
+     # 定义基础数据文件和对应的表名
+@@ -1,8 +1,27 @@
+     def set_config(self, key: str, value: str):
+         """设置配置项"""
+         try:
++            if key in {"api_key", "ai_api_key"}:
++                print(f"已跳过敏感配置落库: {key}")
++                return
++
++            stored_value = str(value)
++            if key == "ai_backends":
++                try:
++                    parsed = json.loads(stored_value)
++                    if isinstance(parsed, list):
++                        for item in parsed:
++                            if isinstance(item, dict):
++                                item.pop("api_key", None)
++                        stored_value = json.dumps(parsed, ensure_ascii=False)
++                except Exception:
++                    pass
++
+             cursor = self.conn.cursor()
+-            cursor.execute("INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)", (key, str(value)))
++            cursor.execute(
++                "INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)",
++                (key, stored_value),
++            )
+             self.conn.commit()
+         except Exception as e:
+             print(f"配置保存失败: {e}")

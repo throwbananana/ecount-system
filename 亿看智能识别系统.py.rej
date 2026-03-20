@@ -1,0 +1,37 @@
+diff a/亿看智能识别系统.py b/亿看智能识别系统.py	(rejected hunks)
+@@ -1,5 +1,10 @@
+ TEMPLATE_FILE = "Template.xlsx"
+ APP_DIR = os.path.dirname(os.path.abspath(__file__))
+-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
++try:
++    from runtime_paths import CONFIG_FILE as RUNTIME_CONFIG_FILE
++except Exception:
++    RUNTIME_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
++
++CONFIG_FILE = str(RUNTIME_CONFIG_FILE)
+
+ # ======== 默认字段规则（兜底用） ========
+@@ -1,6 +1,6 @@
+ # --- 安全表达式求值（用于综合字段表达式） ---
+ ALLOWED_AST_NODES = (
+-    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Str, ast.Constant,
++    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
+     ast.Load, ast.Call, ast.Name, ast.Attribute, ast.Tuple, ast.List, ast.Dict,
+     ast.Compare, ast.Eq, ast.NotEq, ast.Gt, ast.GtE, ast.Lt, ast.LtE,
+@@ -1,6 +1,6 @@
+             self.active_default_group = raw_active_group
+
+         # AI 设置 (优先使用数据库中的 Key)
+-        self.api_key = db_configs.get("api_key", DEFAULT_API_KEY)
++        self.api_key = DEFAULT_API_KEY or db_configs.get("api_key", "")
+
+         # 默认值 (从数据库加载)
+@@ -1,5 +1,7 @@
+                 "setting_invert_bank_var",
+                 "main_field_formats",
+                 "default_value_groups",
++                "ai_backends",
++                "ai_api_key",
+                 "default_value_group_active"
+             ]}

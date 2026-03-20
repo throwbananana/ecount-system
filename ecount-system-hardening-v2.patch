@@ -1,0 +1,212 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,12 @@
++__pycache__/
++*.py[cod]
++*.db
++*.sqlite
++*.sqlite3
++config.json
++runtime/
++.pytest_cache/
++.mypy_cache/
++.vscode/
++.idea/
++*.log
+
+diff --git a/runtime_paths.py b/runtime_paths.py
+new file mode 100644
+--- /dev/null
++++ b/runtime_paths.py
+@@ -0,0 +1,39 @@
++# -*- coding: utf-8 -*-
++import os
++from pathlib import Path
++
++
++def _default_app_home() -> Path:
++    env_home = os.environ.get("ECOUNT_SYSTEM_HOME") or os.environ.get("YIKAN_APP_HOME")
++    if env_home:
++        return Path(env_home).expanduser()
++
++    if os.name == "nt":
++        appdata = os.environ.get("APPDATA")
++        if appdata:
++            return Path(appdata) / "ecount-system"
++
++    return Path.home() / ".ecount-system"
++
++
++APP_HOME = _default_app_home()
++CONFIG_FILE = APP_HOME / "config.json"
++BASE_DATA_DB_FILE = APP_HOME / "base_data.db"
++
++
++def runtime_file(name: str) -> Path:
++    return APP_HOME / name
++
++
++def ensure_app_home() -> Path:
++    APP_HOME.mkdir(parents=True, exist_ok=True)
++    return APP_HOME
++
++
++__all__ = [
++    "APP_HOME",
++    "CONFIG_FILE",
++    "BASE_DATA_DB_FILE",
++    "runtime_file",
++    "ensure_app_home",
++]
+
+diff --git a/migrate_runtime_state.py b/migrate_runtime_state.py
+new file mode 100644
+--- /dev/null
++++ b/migrate_runtime_state.py
+@@ -0,0 +1,36 @@
++# -*- coding: utf-8 -*-
++import shutil
++from pathlib import Path
++
++from runtime_paths import APP_HOME, ensure_app_home
++
++
++FILES_TO_MOVE = [
++    "config.json",
++    "base_data.db",
++    "reconciliation.db",
++    "shipping.bd",
++    "reconciliation_header_mapping.json",
++]
++
++
++def main():
++    repo_dir = Path(__file__).resolve().parent
++    ensure_app_home()
++    print(f"运行时目录: {APP_HOME}")
++
++    for name in FILES_TO_MOVE:
++        src = repo_dir / name
++        dst = APP_HOME / name
++
++        if not src.exists():
++            continue
++        if dst.exists():
++            print(f"[跳过] 目标已存在: {dst}")
++            continue
++        shutil.move(str(src), str(dst))
++        print(f"[迁移] {src} -> {dst}")
++
++
++if __name__ == "__main__":
++    main()
+
+diff --git a/base_data_manager.py b/base_data_manager.py
+--- a/base_data_manager.py
++++ b/base_data_manager.py
+@@ -1,5 +1,6 @@
+ import hashlib
+ from typing import Optional, List, Dict, Any
++from runtime_paths import BASE_DATA_DB_FILE
+
+ class BaseDataManager:
+     """基础数据管理器"""
+@@ -1,6 +1,6 @@
+
+     APP_DIR = os.path.dirname(os.path.abspath(__file__))
+-    DB_FILE = os.path.join(APP_DIR, "base_data.db")
++    DB_FILE = str(BASE_DATA_DB_FILE)
+     BASE_DATA_DIR = os.path.join(APP_DIR, "基础数据", "基础数据")
+
+     # 定义基础数据文件和对应的表名
+@@ -1,8 +1,27 @@
+     def set_config(self, key: str, value: str):
+         """设置配置项"""
+         try:
++            if key in {"api_key", "ai_api_key"}:
++                print(f"已跳过敏感配置落库: {key}")
++                return
++
++            stored_value = str(value)
++            if key == "ai_backends":
++                try:
++                    parsed = json.loads(stored_value)
++                    if isinstance(parsed, list):
++                        for item in parsed:
++                            if isinstance(item, dict):
++                                item.pop("api_key", None)
++                        stored_value = json.dumps(parsed, ensure_ascii=False)
++                except Exception:
++                    pass
++
+             cursor = self.conn.cursor()
+-            cursor.execute("INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)", (key, str(value)))
++            cursor.execute(
++                "INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)",
++                (key, stored_value),
++            )
+             self.conn.commit()
+         except Exception as e:
+             print(f"配置保存失败: {e}")
+
+diff --git a/summary_intelligence.py b/summary_intelligence.py
+--- a/summary_intelligence.py
++++ b/summary_intelligence.py
+@@ -1,5 +1,5 @@
+ except ImportError:
+     HAS_ZHIPUAI = False
+
+-DEFAULT_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
++DEFAULT_API_KEY = os.environ.get("YIKAN_AI_API_KEY") or os.environ.get("ZHIPU_API_KEY", "")
+ # 限制 AI 提示中带入的科目数量，避免上下文过长导致性能问题
+@@ -1,5 +1,6 @@
+         self.base_data_mgr = base_data_mgr or BaseDataManager()
+         self.default_values = default_values or {}
+-        self.api_key = self.default_values.get("ai_api_key") or api_key  # 优先从配置取，空值回退环境变量
++        env_api_key = os.environ.get("YIKAN_AI_API_KEY") or os.environ.get("ZHIPU_API_KEY", "")
++        self.api_key = env_api_key or self.default_values.get("ai_api_key") or api_key
+         self.ai_provider = self.default_values.get("ai_provider", "zhipu") # zhipu / lm_studio
+         self.ai_base_url = self.default_values.get("ai_base_url", "http://localhost:1234/v1")
+         self.ai_model_name = self.default_values.get("ai_model_name", "local-model")
+
+diff --git a/亿看智能识别系统.py b/亿看智能识别系统.py
+--- a/亿看智能识别系统.py
++++ b/亿看智能识别系统.py
+@@ -1,5 +1,10 @@
+ TEMPLATE_FILE = "Template.xlsx"
+ APP_DIR = os.path.dirname(os.path.abspath(__file__))
+-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
++try:
++    from runtime_paths import CONFIG_FILE as RUNTIME_CONFIG_FILE
++except Exception:
++    RUNTIME_CONFIG_FILE = os.path.join(APP_DIR, "config.json")
++
++CONFIG_FILE = str(RUNTIME_CONFIG_FILE)
+
+ # ======== 默认字段规则（兜底用） ========
+@@ -1,6 +1,6 @@
+ # --- 安全表达式求值（用于综合字段表达式） ---
+ ALLOWED_AST_NODES = (
+-    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Str, ast.Constant,
++    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow,
+     ast.Load, ast.Call, ast.Name, ast.Attribute, ast.Tuple, ast.List, ast.Dict,
+     ast.Compare, ast.Eq, ast.NotEq, ast.Gt, ast.GtE, ast.Lt, ast.LtE,
+@@ -1,6 +1,6 @@
+             self.active_default_group = raw_active_group
+
+         # AI 设置 (优先使用数据库中的 Key)
+-        self.api_key = db_configs.get("api_key", DEFAULT_API_KEY)
++        self.api_key = DEFAULT_API_KEY or db_configs.get("api_key", "")
+
+         # 默认值 (从数据库加载)
+@@ -1,5 +1,7 @@
+                 "setting_invert_bank_var",
+                 "main_field_formats",
+                 "default_value_groups",
++                "ai_backends",
++                "ai_api_key",
+                 "default_value_group_active"
+             ]}

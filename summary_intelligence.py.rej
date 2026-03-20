@@ -1,0 +1,16 @@
+diff a/summary_intelligence.py b/summary_intelligence.py	(rejected hunks)
+@@ -1,5 +1,5 @@
+ except ImportError:
+     HAS_ZHIPUAI = False
+
+-DEFAULT_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
++DEFAULT_API_KEY = os.environ.get("YIKAN_AI_API_KEY") or os.environ.get("ZHIPU_API_KEY", "")
+ # 限制 AI 提示中带入的科目数量，避免上下文过长导致性能问题
+@@ -1,5 +1,6 @@
+         self.base_data_mgr = base_data_mgr or BaseDataManager()
+         self.default_values = default_values or {}
+-        self.api_key = self.default_values.get("ai_api_key") or api_key  # 优先从配置取，空值回退环境变量
++        env_api_key = os.environ.get("YIKAN_AI_API_KEY") or os.environ.get("ZHIPU_API_KEY", "")
++        self.api_key = env_api_key or self.default_values.get("ai_api_key") or api_key
+         self.ai_provider = self.default_values.get("ai_provider", "zhipu") # zhipu / lm_studio
+         self.ai_base_url = self.default_values.get("ai_base_url", "http://localhost:1234/v1")

@@ -1,0 +1,309 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,30 @@
++__pycache__/
++*.py[cod]
++*.pyo
++*.pyd
++.pytest_cache/
++.mypy_cache/
++.ruff_cache/
++.venv/
++venv/
++env/
++
++build/
++dist/
++*.spec
++
++*.db
++*.sqlite
++*.sqlite3
++*.log
++logs/
++
++config.json
++config.json.bak
++base_data.db
++reconciliation.db
++shipping.bd
++reconciliation_header_mapping.json
++
++# user/runtime data
++data/
++runtime/
+diff --git a/runtime_paths.py b/runtime_paths.py
+new file mode 100644
+--- /dev/null
++++ b/runtime_paths.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++import os
++from pathlib import Path
++
++APP_NAME = "ecount-system"
++
++
++def _resolve_runtime_root() -> Path:
++    explicit = os.environ.get("ECOUNT_SYSTEM_HOME") or os.environ.get("YIKAN_APP_HOME")
++    if explicit:
++        return Path(explicit).expanduser()
++    if os.name == "nt":
++        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
++    else:
++        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
++    return Path(base) / APP_NAME
++
++
++def _ensure_dir(path: Path) -> Path:
++    path.mkdir(parents=True, exist_ok=True)
++    return path
++
++
++APP_RUNTIME_DIR = _ensure_dir(_resolve_runtime_root())
++APP_LOG_DIR = _ensure_dir(APP_RUNTIME_DIR / "logs")
++
++CONFIG_FILE = str(APP_RUNTIME_DIR / "config.json")
++BASE_DATA_DB_FILE = str(APP_RUNTIME_DIR / "base_data.db")
++BASE_DATA_DIR = str(APP_RUNTIME_DIR / "基础数据" / "基础数据")
++
++
++def runtime_file(name: str) -> str:
++    return str(APP_RUNTIME_DIR / name)
+diff --git a/migrate_runtime_state.py b/migrate_runtime_state.py
+new file mode 100644
+--- /dev/null
++++ b/migrate_runtime_state.py
+@@ -0,0 +1,49 @@
++from __future__ import annotations
++
++import shutil
++from pathlib import Path
++
++from runtime_paths import APP_RUNTIME_DIR
++
++
++FILES_TO_MOVE = [
++    "config.json",
++    "config.json.bak",
++    "base_data.db",
++    "reconciliation.db",
++    "shipping.bd",
++    "reconciliation_header_mapping.json",
++]
++
++
++def migrate(repo_root: Path) -> None:
++    APP_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
++    for name in FILES_TO_MOVE:
++        src = repo_root / name
++        dst = APP_RUNTIME_DIR / name
++        if not src.exists():
++            continue
++        if dst.exists():
++            print(f"[skip] {name} already exists at runtime dir: {dst}")
++            continue
++        shutil.copy2(src, dst)
++        print(f"[ok] migrated {name} -> {dst}")
++
++
++if __name__ == "__main__":
++    migrate(Path(__file__).resolve().parent)
+diff --git a/base_data_manager.py b/base_data_manager.py
+--- a/base_data_manager.py
++++ b/base_data_manager.py
+@@ -6,12 +6,16 @@
+
+ import os
+ import sqlite3
++import logging
+ import pandas as pd
+ import difflib
+ import json
+ import hashlib
+ from typing import Optional, List, Dict, Any
++from runtime_paths import BASE_DATA_DB_FILE, BASE_DATA_DIR as RUNTIME_BASE_DATA_DIR
+
++logger = logging.getLogger(__name__)
++SECRET_CONFIG_KEYS = {"api_key", "ai_api_key"}
+
+ class BaseDataManager:
+     """基础数据管理器"""
+@@ -19,8 +23,8 @@ class BaseDataManager:
+     APP_DIR = os.path.dirname(os.path.abspath(__file__))
+-    DB_FILE = os.path.join(APP_DIR, "base_data.db")
+-    BASE_DATA_DIR = os.path.join(APP_DIR, "基础数据", "基础数据")
++    DB_FILE = BASE_DATA_DB_FILE
++    BASE_DATA_DIR = RUNTIME_BASE_DATA_DIR
+
+     # 定义基础数据文件和对应的表名
+     DATA_FILES = {
+@@ -526,17 +530,42 @@ class BaseDataManager:
+     def set_config(self, key: str, value: str):
+         """设置配置项"""
+         try:
++            if key in SECRET_CONFIG_KEYS:
++                logger.info("Skip persisting sensitive config key: %s", key)
++                return
++
++            serialized_value = str(value)
++            if key == "ai_backends":
++                try:
++                    parsed = json.loads(value) if isinstance(value, str) else value
++                    if isinstance(parsed, list):
++                        sanitized = []
++                        for backend in parsed:
++                            if not isinstance(backend, dict):
++                                continue
++                            cleaned = dict(backend)
++                            cleaned.pop("api_key", None)
++                            sanitized.append(cleaned)
++                        serialized_value = json.dumps(sanitized, ensure_ascii=False)
++                except Exception as exc:
++                    logger.warning("Failed to sanitize ai_backends before persistence: %s", exc)
++
+             cursor = self.conn.cursor()
+-            cursor.execute("INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)", (key, str(value)))
++            cursor.execute("INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)", (key, serialized_value))
+             self.conn.commit()
+         except Exception as e:
+             print(f"配置保存失败: {e}")
+@@ -558,10 +587,23 @@ class BaseDataManager:
+     def get_all_configs(self) -> Dict[str, str]:
+         """获取所有配置"""
+         cursor = self.conn.cursor()
+         cursor.execute("SELECT key, value FROM app_config")
+-        return dict(cursor.fetchall())
++        configs = dict(cursor.fetchall())
++        configs.pop("api_key", None)
++        configs.pop("ai_api_key", None)
++        if "ai_backends" in configs:
++            try:
++                parsed = json.loads(configs["ai_backends"])
++                if isinstance(parsed, list):
++                    for backend in parsed:
++                        if isinstance(backend, dict):
++                            backend.pop("api_key", None)
++                    configs["ai_backends"] = json.dumps(parsed, ensure_ascii=False)
++            except Exception:
++                pass
++        return configs
+diff --git a/summary_intelligence.py b/summary_intelligence.py
+--- a/summary_intelligence.py
++++ b/summary_intelligence.py
+@@ -14,7 +14,7 @@ try:
+ except ImportError:
+     HAS_ZHIPUAI = False
+
+-DEFAULT_API_KEY = os.environ.get("ZHIPU_API_KEY", "")
++DEFAULT_API_KEY = os.environ.get("YIKAN_AI_API_KEY") or os.environ.get("ZHIPU_API_KEY", "")
+ # 限制 AI 提示中带入的科目数量，避免上下文过长导致性能问题
+ MAX_AI_SUBJECTS = 300
+
+@@ -29,7 +29,7 @@ class SummaryIntelligence:
+         """
+         self.base_data_mgr = base_data_mgr or BaseDataManager()
+         self.default_values = default_values or {}
+-        self.api_key = self.default_values.get("ai_api_key") or api_key  # 优先从配置取，空值回退环境变量
++        self.api_key = self.default_values.get("ai_api_key") or os.environ.get("YIKAN_AI_API_KEY") or api_key  # 优先从配置取，空值回退环境变量
+         self.ai_provider = self.default_values.get("ai_provider", "zhipu") # zhipu / lm_studio
+         self.ai_base_url = self.default_values.get("ai_base_url", "http://localhost:1234/v1")
+         self.ai_model_name = self.default_values.get("ai_model_name", "local-model")
+diff --git a/亿看智能识别系统.py b/亿看智能识别系统.py
+--- a/亿看智能识别系统.py
++++ b/亿看智能识别系统.py
+@@ -24,6 +24,7 @@ from openpyxl.styles import PatternFill
+ from treeview_tools import attach_treeview_tools, install_smart_restore_header
+ from base_data_manager import BaseDataManager
+ from summary_intelligence import SummaryIntelligence, DEFAULT_API_KEY
++from runtime_paths import CONFIG_FILE
+ from reconciliation_module import StandardReconciler
+ from export_format_manager import (
+     apply_export_format,
+@@ -54,7 +55,6 @@ try:
+ TEMPLATE_FILE = "Template.xlsx"
+ APP_DIR = os.path.dirname(os.path.abspath(__file__))
+-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+
+ # ======== 默认字段规则（兜底用） ========
+ DEFAULT_FIELD_RULES = {
+@@ -3391,16 +3391,21 @@ class App:
+         self.active_default_group = raw_active_group
+
+         # AI 设置 (优先使用数据库中的 Key)
+-        self.api_key = db_configs.get("api_key", DEFAULT_API_KEY)
++        self.api_key = (
++            os.environ.get("YIKAN_AI_API_KEY")
++            or os.environ.get("ZHIPU_API_KEY")
++            or db_configs.get("api_key", DEFAULT_API_KEY)
++        )
+
+         # 默认值 (从数据库加载)
+         # 过滤掉 api_key 和已持久化的设置，剩下的视为 default_values
+         legacy_defaults = {k: v for k, v in db_configs.items() if k not in [
+             "api_key",
++            "ai_api_key",
+             "setting_enable_smart_recognition",
+             "setting_use_ai_var",
+             "setting_use_foreign_currency_var",
+             "setting_auto_balance_var",
+             "setting_split_amount_var",
+             "setting_recon_fuzzy_var",
+             "setting_recon_use_ai_analysis",
+             "setting_invert_bank_var",
++            "ai_backends",
++            "ai_task_map",
++            "ai_provider",
++            "ai_base_url",
++            "ai_model_name",
+             "main_field_formats",
+             "default_value_groups",
+             "default_value_group_active"
+@@ -3552,7 +3557,11 @@ class App:
+         # 如果为空，尝试迁移旧配置
+         if not backends:
+             old_provider = db_configs.get("ai_provider", "zhipu")
+-            old_key = db_configs.get("ai_api_key", self.api_key)
++            old_key = (
++                os.environ.get("YIKAN_AI_API_KEY")
++                or os.environ.get("ZHIPU_API_KEY")
++                or db_configs.get("ai_api_key", self.api_key)
++            )
+             old_url = db_configs.get("ai_base_url", "http://localhost:1234/v1")
+             old_model = db_configs.get("ai_model_name", "local-model")
+             if old_provider == "zhipu" and old_key:
+@@ -3737,7 +3746,15 @@ class App:
+         def persist_backends():
+             if self.base_data_mgr:
+-                self.base_data_mgr.set_config("ai_backends", json.dumps(backends, ensure_ascii=False))
++                sanitized_backends = []
++                for backend in backends:
++                    if not isinstance(backend, dict):
++                        continue
++                    cleaned = dict(backend)
++                    cleaned.pop("api_key", None)
++                    sanitized_backends.append(cleaned)
++                self.base_data_mgr.set_config(
++                    "ai_backends", json.dumps(sanitized_backends, ensure_ascii=False)
++                )
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -29,7 +29,13 @@ pip install -r requirements-optional.txt
+ ```
+
+-提示：如需避免在本地保存 API Key，可设置环境变量 `YIKAN_AI_API_KEY` 或 `ZHIPU_API_KEY`，程序会自动读取。
++提示：如需避免在本地保存 API Key，可设置环境变量 `YIKAN_AI_API_KEY` 或 `ZHIPU_API_KEY`，程序会自动读取。
++
++## 运行时数据目录（新增）
++
++- 从本次补丁开始，`config.json` 与 `base_data.db` 默认不再写回仓库目录，而是写到用户运行时目录。
++- 可通过环境变量 `ECOUNT_SYSTEM_HOME` 或 `YIKAN_APP_HOME` 自定义运行时目录。
++- 如需迁移旧数据，可执行：
++  `python migrate_runtime_state.py`
+
+ ## 使用方法
+ 

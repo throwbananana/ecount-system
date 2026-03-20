@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+config.json
+runtime/
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+*.log
