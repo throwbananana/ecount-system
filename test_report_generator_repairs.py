@@ -119,6 +119,333 @@ def test_load_ar_data_groups_cross_year_detail_by_transaction_month(tmp_path):
     assert set(gen.ar_detail_df["MonthStr"].unique()) == {"2025-12", "2026-01"}
 
 
+def test_load_ar_data_recognizes_multiblock_customer_ledger(tmp_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "科目 往来单位明细账"
+    headers = [
+        "摘要", "相对科目编码名", "日期-号码", "对应往来单位编码", "对应往来单位名",
+        "相对科目编码", "债权债务号码", "外币借方金额", "外币贷方金额", "外币余额",
+        "借方金额", "贷方金额", "余额", "部门名",
+    ]
+
+    ws.append(["公司名称 : A / 应收账款 / 2026/01/01  ~ 2026/03/31  / 科目/客户/供应商明细账 / C001(客户A)"])
+    ws.append(headers)
+    ws.append(["期末调汇", "汇兑损益", "2026/01/31 -7", None, None, "660301", None, None, None, None, 10, None, 10, "销售部"])
+    ws.append(["合计", None, None, None, None, None, None, None, None, None, 10, None, 10, None])
+    ws.append(["2026/04/27 22:07:00"])
+    ws.append(["公司名称 : A / 应收账款 / 2026/01/01  ~ 2026/03/31  / 科目/客户/供应商明细账 / C002(客户B)"])
+    ws.append(headers)
+    ws.append(["销售", "主营业务收入", "2026/02/01 -1", None, None, "6001", None, None, None, None, 20, None, 20, "销售部"])
+    path = tmp_path / "应收_202601-202603.xlsx"
+    wb.save(path)
+
+    gen = ReportGenerator(str(tmp_path))
+    gen._load_ar_data(str(path), path.name)
+
+    assert sorted(gen.data["ar"].keys()) == ["2026-01", "2026-02"]
+    assert "往来单位名" in gen.ar_detail_df.columns
+    assert gen.data["ar"]["2026-01"]["往来单位名"].iloc[0] == "客户A"
+    assert gen.data["ar"]["2026-02"]["往来单位名"].iloc[0] == "客户B"
+
+    gen._run_data_quality_checks()
+    assert not [
+        issue for issue in gen.data_quality_issues
+        if issue["category"] == "ar" and issue["issue_type"] == "客户/单位缺失"
+    ]
+
+
+def test_classify_source_file_uses_workbook_header_content(tmp_path):
+    def make_book(filename, title):
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = title
+        ws["A2"] = "日期-号码"
+        path = tmp_path / filename
+        wb.save(path)
+        return path
+
+    gen = ReportGenerator(str(tmp_path))
+    ap_path = make_book("ledger_a.xlsx", "公司名称 : A / 应付账款 / 2025/01/01  ~ 2025/01/31 / 科目/客户/供应商明细账")
+    cash_path = make_book("ledger_b.xlsx", "公司名称 : A / 银行存款 / 2025/01/01  ~ 2025/01/31 / 科目/客户/供应商明细账")
+    expense_path = make_book("ledger_c.xlsx", "公司名称 : A / 2025/01/01  ~ 2025/01/31 / 科目账簿 / 660101(办公费)")
+
+    assert gen._classify_source_file(ap_path.name, str(ap_path)) == "ap"
+    assert gen._classify_source_file(cash_path.name, str(cash_path)) == "cash"
+    assert gen._classify_source_file(expense_path.name, str(expense_path)) == "expense"
+
+
+def test_load_ap_and_cash_detail_groups_by_transaction_month(tmp_path):
+    def make_ledger(path, title, amount_row):
+        wb = Workbook()
+        ws = wb.active
+        ws["A1"] = title
+        headers = ["摘要", "相对科目编码名", "日期-号码", "对应往来单位名", "借方金额", "贷方金额", "余额"]
+        for idx, header in enumerate(headers, start=1):
+            ws.cell(row=2, column=idx).value = header
+        ws.append(amount_row)
+        wb.save(path)
+
+    ap_path = tmp_path / "应付明细.xlsx"
+    cash_path = tmp_path / "银行明细.xlsx"
+    make_ledger(
+        ap_path,
+        "公司名称 : A / 应付账款 / 2026/03/01  ~ 2026/03/31 / 科目/客户/供应商明细账",
+        ["采购", "库存商品", "2026/03/05 -1", "供应商A", 0, 300, -300],
+    )
+    make_ledger(
+        cash_path,
+        "公司名称 : A / 银行存款 / 2026/03/01  ~ 2026/03/31 / 科目/客户/供应商明细账",
+        ["收款", "主营业务收入", "2026/03/08 -1", "客户A", 500, 0, 500],
+    )
+
+    gen = ReportGenerator(str(tmp_path))
+    gen._load_ap_data(str(ap_path), ap_path.name)
+    gen._load_cash_data(str(cash_path), cash_path.name)
+
+    assert sorted(gen.data["ap"].keys()) == ["2026-03"]
+    assert sorted(gen.data["cash"].keys()) == ["2026-03"]
+    assert gen.ap_detail_df is not None and len(gen.ap_detail_df) == 1
+    assert gen.cash_detail_df is not None and len(gen.cash_detail_df) == 1
+
+
+def test_load_expense_data_drops_export_footer_timestamp_rows(tmp_path):
+    path = tmp_path / "费用_202601-202603.xlsx"
+    df = pd.DataFrame([
+        {
+            "日期-号码": "2026/03/31 -1",
+            "摘要": "办公用品",
+            "科目名": "办公费",
+            "科目编码": "660101",
+            "借方金额": 100,
+            "贷方金额": None,
+            "余额": 100,
+            "外币借方金额": None,
+            "外币贷方金额": None,
+        },
+        {
+            "日期-号码": "2026/04/27 22:09:08",
+            "摘要": None,
+            "科目名": None,
+            "科目编码": None,
+            "借方金额": None,
+            "贷方金额": None,
+            "余额": None,
+            "外币借方金额": None,
+            "外币贷方金额": None,
+        },
+    ])
+    with pd.ExcelWriter(path) as writer:
+        df.to_excel(writer, index=False)
+
+    gen = ReportGenerator(str(tmp_path))
+    gen._load_expense_data(str(path), path.name)
+    gen._run_data_quality_checks()
+
+    assert sorted(gen.data["expense"].keys()) == ["2026-03"]
+    assert len(gen.data["expense"]["2026-03"]) == 1
+    assert not [
+        issue for issue in gen.data_quality_issues
+        if issue["category"] == "expense" and issue["period"] == "2026-04"
+    ]
+    assert not [
+        issue for issue in gen.data_quality_issues
+        if issue["category"] == "expense" and issue["issue_type"] == "数值缺失" and "外币" in issue["detail"]
+    ]
+
+
+def test_data_quality_ignores_blank_nan_keys_for_duplicate_checks():
+    gen = ReportGenerator('.')
+    gen.data['sales']['2026-01'] = pd.DataFrame({
+        '日期-号码': ['2026/01/01 -1', '2026/01/02 -1', '2026/01/03 -1'],
+        '销售订单号': [None, float('nan'), ''],
+        '品目编码': ['A', 'B', 'C'],
+        '数量': [1, 2, 3],
+        '合计': [10, 20, 30],
+        '销售金额合计': [10, 20, 30],
+        '销售出库供应价合计': [5, 10, 15],
+        '往来单位名': ['客户A', '客户B', '客户C'],
+    })
+
+    gen._run_data_quality_checks()
+
+    assert not [
+        issue for issue in gen.data_quality_issues
+        if issue["category"] == "sales" and issue["issue_type"] == "单号重复"
+    ]
+
+
+def test_update_ap_and_cash_analysis_sheets():
+    gen = ReportGenerator('.')
+    gen.ap_detail_df = pd.DataFrame([
+        {
+            "ParsedDate": pd.Timestamp("2026-03-05"),
+            "MonthStr": "2026-03",
+            "对应往来单位名": "供应商A",
+            "借方金额": 50,
+            "贷方金额": 300,
+            "余额": -250,
+            "摘要": "采购",
+        },
+    ])
+    gen.cash_detail_df = pd.DataFrame([
+        {
+            "ParsedDate": pd.Timestamp("2026-03-08"),
+            "MonthStr": "2026-03",
+            "相对科目编码名": "主营业务收入",
+            "借方金额": 500,
+            "贷方金额": 0,
+            "余额": 500,
+            "摘要": "收款",
+        },
+    ])
+    metrics = {"2026-03": {"ap_balance": 250, "cash": 500}}
+    wb = Workbook()
+    wb.active.title = "现金流量表(估算)"
+    wb.create_sheet("资金链预警")
+    wb.create_sheet("资产负债表")
+
+    gen._update_cash_balance_analysis_sheet(wb, metrics, "2026", "03", "current")
+    gen._update_ap_analysis_sheet(wb, metrics, "2026", "03", "current")
+
+    assert "货币资金分析" in wb.sheetnames
+    assert "应付账款分析" in wb.sheetnames
+    assert wb["货币资金分析"]["A1"].value == "月份"
+    assert wb["货币资金分析"]["A2"].value == "2026/03"
+    assert wb["应付账款分析"]["A1"].value == "月份"
+    assert wb["应付账款分析"]["A2"].value == "2026/03"
+    assert len(wb["货币资金分析"]._charts) >= 1
+    assert len(wb["应付账款分析"]._charts) >= 1
+
+
+def test_auto_warning_params_derive_from_inventory_and_cash_history():
+    gen = ReportGenerator('.')
+    gen.report_params["replenishment"].update({"manual": False})
+    gen.report_params["cashflow"].update({"manual": False})
+    gen.sales_df = pd.DataFrame([
+        {"MonthStr": "2026-01", "品目编码": "A", "数量": 100},
+        {"MonthStr": "2026-02", "品目编码": "A", "数量": 100},
+        {"MonthStr": "2026-03", "品目编码": "A", "数量": 100},
+        {"MonthStr": "2026-01", "品目编码": "B", "数量": 30},
+        {"MonthStr": "2026-02", "品目编码": "B", "数量": 30},
+        {"MonthStr": "2026-03", "品目编码": "B", "数量": 30},
+    ])
+    gen.data["cost"]["2026-01"] = pd.DataFrame({
+        "品目编码": ["A", "B"],
+        "库存_期末": [50, 120],
+        "库存_期末.2": [1000, 2000],
+    })
+    gen.data["cost"]["2026-02"] = pd.DataFrame({
+        "品目编码": ["A", "B"],
+        "库存_期末": [50, 120],
+        "库存_期末.2": [1500, 2500],
+    })
+    gen.data["cost"]["2026-03"] = pd.DataFrame({
+        "品目编码": ["A", "B"],
+        "库存_期末": [50, 120],
+        "库存_期末.2": [2000, 3000],
+    })
+    metrics = {
+        "2026-01": {
+            "revenue": 1000,
+            "cost": 1000,
+            "ar_balance": 2000,
+            "ap_balance": 1000,
+            "cash": 300,
+            "sales_expense": 100,
+            "admin_expense": 100,
+            "financial_expense": 100,
+        },
+        "2026-02": {
+            "revenue": 1000,
+            "cost": 1000,
+            "ar_balance": 3000,
+            "ap_balance": 1000,
+            "cash": 200,
+            "sales_expense": 100,
+            "admin_expense": 100,
+            "financial_expense": 100,
+        },
+        "2026-03": {
+            "revenue": 1000,
+            "cost": 1000,
+            "ar_balance": 4000,
+            "ap_balance": 1000,
+            "cash": 100,
+            "sales_expense": 100,
+            "admin_expense": 100,
+            "financial_expense": 100,
+        },
+    }
+
+    repl_params, cash_params, notes = gen._resolve_warning_params(metrics, "2026", "03", "current")
+
+    assert repl_params == {"lead_days": 15, "safety_days": 10, "window_months": 3}
+    assert cash_params["dso_threshold"] == 126
+    assert cash_params["dio_threshold"] == 162
+    assert cash_params["ccc_threshold"] == 252
+    assert cash_params["cash_coverage_threshold"] == 0.5
+    assert "自动分析" in notes["replenishment"]
+    assert "自动分析" in notes["cashflow"]
+
+
+def test_manual_warning_params_are_preserved_and_sanitized():
+    gen = ReportGenerator('.')
+    gen.report_params["replenishment"] = {
+        "manual": True,
+        "lead_days": "45",
+        "safety_days": "25",
+        "window_months": "4",
+    }
+    gen.report_params["cashflow"] = {
+        "manual": True,
+        "dso_threshold": "80",
+        "dio_threshold": "160",
+        "ccc_threshold": "140",
+        "cash_coverage_threshold": "2.3",
+    }
+
+    repl_params, cash_params, notes = gen._resolve_warning_params({}, "2026", "03", "current")
+
+    assert repl_params == {"lead_days": 45, "safety_days": 25, "window_months": 4}
+    assert cash_params == {
+        "dso_threshold": 80,
+        "dio_threshold": 160,
+        "ccc_threshold": 140,
+        "cash_coverage_threshold": 2.3,
+    }
+    assert "manual" not in repl_params
+    assert "manual" not in cash_params
+    assert notes["replenishment"] == "参数来源：手动填入"
+    assert notes["cashflow"] == "参数来源：手动填入"
+
+
+def test_read_budget_targets_allows_missing_optional_target_columns():
+    gen = ReportGenerator('.')
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "目标_预算"
+    ws.cell(row=1, column=1).value = "月份"
+    ws.cell(row=1, column=2).value = "主营业务收入目标"
+    ws.cell(row=2, column=1).value = "2026/03"
+    ws.cell(row=2, column=2).value = 1000
+
+    targets, _, _ = gen._read_budget_targets(wb)
+
+    assert targets["2026-03"]["revenue"] == 1000
+    assert targets["2026-03"]["sales_rate"] is None
+    assert targets["2026-03"]["financial_rate"] is None
+
+    gen._update_budget_variance_sheet(
+        wb,
+        {"2026-03": {"revenue": 1200, "operating_profit": 100}},
+        "2026",
+        "03",
+        "current",
+    )
+    assert wb["预算执行与偏差"].cell(row=2, column=1).value == "2026/03"
+
+
 def test_fill_product_summary_total_uses_weighted_averages():
     gen = ReportGenerator('.')
     gen.data['sales']['2025-11'] = pd.DataFrame([
@@ -349,6 +676,59 @@ def test_fill_product_summary_total_keeps_total_row_after_inserting_missing_code
     assert abs(ws.cell(row=row_5501, column=3).value - 1) < 1e-12
     # 总计应为001+5501。
     assert abs(ws.cell(row=total_row, column=3).value - 11) < 1e-12
+
+
+def test_fill_product_summary_total_year_columns_ignore_prior_year_when_all_scope():
+    gen = ReportGenerator('.')
+    gen.data['sales']['2025-12'] = pd.DataFrame([
+        {
+            'MonthStr': '2025-12',
+            '品目编码': '001',
+            '品目名': 'A',
+            '品目组合1名': '鞋类',
+            '数量': 1,
+            '合计': 100,
+        },
+    ])
+    gen.data['sales']['2026-01'] = pd.DataFrame([
+        {
+            'MonthStr': '2026-01',
+            '品目编码': '001',
+            '品目名': 'A',
+            '品目组合1名': '鞋类',
+            '数量': 3,
+            '合计': 300,
+        },
+    ])
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '按产品汇总_含合计'
+    headers = [
+        '产品名称',
+        '品目编码',
+        '年销售数量合计',
+        '年销售收入合计',
+        '2026/01_销售数量',
+        '2026/01_销售收入',
+        '2025/12_销售数量',
+        '2025/12_销售收入',
+    ]
+    for col, header in enumerate(headers, start=1):
+        ws.cell(row=1, column=col).value = header
+    ws.cell(row=2, column=2).value = '001'
+    ws.cell(row=3, column=1).value = '合计'
+
+    gen._fill_product_summary_total(ws, '2026', '01', 'all')
+
+    assert ws.cell(row=2, column=3).value == 3
+    assert ws.cell(row=2, column=4).value == 300
+    assert ws.cell(row=2, column=5).value == 3
+    assert ws.cell(row=2, column=6).value == 300
+    assert ws.cell(row=2, column=7).value == 1
+    assert ws.cell(row=2, column=8).value == 100
+    assert ws.cell(row=3, column=3).value == 3
+    assert ws.cell(row=3, column=4).value == 300
 
 
 def test_fill_expense_details_places_anomaly_section_below_main_table():
@@ -1004,6 +1384,99 @@ def test_trim_chart_data_ranges_shrinks_to_active_rows():
     assert series.cat.numRef.f == "'经营指标'!$A$3:$A$4" or series.cat.numRef.f == '经营指标!$A$3:$A$4'
 
 
+def test_history_scope_chart_month_categories_use_year_month_text():
+    gen = ReportGenerator('.')
+    gen.year_scope = 'all'
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '经营指标'
+    ws.append(['月份', '主营业务收入'])
+    ws.append(['2025/12', 100])
+    ws.append(['2026/01', 120])
+    ws.append(['2026/02', 130])
+
+    added = gen._add_line_chart_by_columns(ws, 1, [2], 1, 2, 4, '收入趋势', 'D1')
+
+    assert added is True
+    assert [ws.cell(row=r, column=1).value for r in range(2, 5)] == [
+        '2025/12',
+        '2026/01',
+        '2026/02',
+    ]
+    parsed = gen._parse_chart_range_formula(gen._chart_category_formula(ws._charts[0]))
+    assert parsed is not None
+    _, cat_col, cat_start, _, cat_end = parsed
+    assert cat_col != 1
+    assert [ws.cell(row=r, column=cat_col).value for r in range(cat_start, cat_end + 1)] == [
+        '2025.12月',
+        '2026.1月',
+        '2026.2月',
+    ]
+    assert gen._month_label_exact_to_key('2026.2月') == '2026-02'
+    assert gen._label_to_month_key('2026.2月') == '2026-02'
+
+    assert gen._reorder_month_rows_desc(ws) is True
+    assert [ws.cell(row=r, column=1).value for r in range(2, 5)] == [
+        '2026/02',
+        '2026/01',
+        '2025/12',
+    ]
+    assert [ws.cell(row=r, column=cat_col).value for r in range(2, 5)] == [
+        '2026.2月',
+        '2026.1月',
+        '2025.12月',
+    ]
+
+
+def test_current_scope_chart_month_categories_keep_existing_label():
+    gen = ReportGenerator('.')
+    gen.year_scope = 'current'
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(['月份', '主营业务收入'])
+    ws.append(['2026/01', 120])
+    ws.append(['2026/02', 130])
+
+    gen._add_line_chart_by_columns(ws, 1, [2], 1, 2, 3, '收入趋势', 'D1')
+
+    assert [ws.cell(row=r, column=1).value for r in range(2, 4)] == ['2026/01', '2026/02']
+    assert ws.max_column == 2
+
+
+def test_existing_history_chart_categories_are_repointed_to_year_month_helper():
+    gen = ReportGenerator('.')
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '经营指标'
+    ws.append(['月份', '主营业务收入'])
+    ws.append(['2025/12', 100])
+    ws.append(['2026/01', 120])
+
+    chart = openpyxl.chart.LineChart()
+    data = Reference(ws, min_col=2, min_row=1, max_row=3)
+    cats = Reference(ws, min_col=1, min_row=2, max_row=3)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+    ws.add_chart(chart, 'D1')
+
+    changed = gen._rewrite_chart_month_categories_for_history(wb, 'all')
+
+    assert changed == 1
+    assert [ws.cell(row=r, column=1).value for r in range(2, 4)] == ['2025/12', '2026/01']
+    parsed = gen._parse_chart_range_formula(gen._chart_category_formula(ws._charts[0]))
+    assert parsed is not None
+    _, cat_col, cat_start, _, cat_end = parsed
+    assert cat_col != 1
+    assert [ws.cell(row=r, column=cat_col).value for r in range(cat_start, cat_end + 1)] == [
+        '2025.12月',
+        '2026.1月',
+    ]
+    assert gen._rewrite_chart_month_categories_for_history(wb, 'all') == 0
+
+
 def test_management_metrics_sheet_includes_yoy_and_mom_columns():
     gen = ReportGenerator('.')
 
@@ -1022,6 +1495,8 @@ def test_management_metrics_sheet_includes_yoy_and_mom_columns():
             'cost': 60,
             'sales_expense': 10,
             'admin_expense': 5,
+            'financial_expense': 2,
+            'financial_expense_rate': 0.02,
             'operating_profit': 25,
         },
         '2025-12': {
@@ -1029,6 +1504,8 @@ def test_management_metrics_sheet_includes_yoy_and_mom_columns():
             'cost': 70,
             'sales_expense': 12,
             'admin_expense': 6,
+            'financial_expense': 3,
+            'financial_expense_rate': 0.025,
             'operating_profit': 32,
         },
     }
@@ -1039,6 +1516,7 @@ def test_management_metrics_sheet_includes_yoy_and_mom_columns():
             'cost': 50,
             'sales_expense': 8,
             'admin_expense': 4,
+            'financial_expense': 1,
             'operating_profit': 18,
         },
     }
@@ -1064,6 +1542,119 @@ def test_management_metrics_sheet_includes_yoy_and_mom_columns():
     assert abs(ws.cell(row_2025_12, column=header_map['主营业务收入_同比增速']).value - 0.5) < 1e-12
     assert abs(ws.cell(row_2025_12, column=header_map['主营业务收入_环比增量']).value - 20) < 1e-12
     assert abs(ws.cell(row_2025_12, column=header_map['主营业务收入_环比增速']).value - 0.2) < 1e-12
+    assert ws.cell(row_2025_12, column=header_map['财务费用']).value == 3
+    assert abs(ws.cell(row_2025_12, column=header_map['财务费用率']).value - 0.025) < 1e-12
+    assert abs(ws.cell(row_2025_12, column=header_map['财务费用_同比增量']).value - 2) < 1e-12
+    assert abs(ws.cell(row_2025_12, column=header_map['财务费用_环比增量']).value - 1) < 1e-12
+
+
+def test_expense_compare_sheet_includes_financial_expense_columns_and_totals():
+    gen = ReportGenerator('.')
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '费用对比'
+    headers = ['月份', '部门', '主营业务收入', '主营业务成本', '销售费用', '管理费用', '营业利润', '销售费用占比', '管理费用占比']
+    for c, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=c).value = h
+    ws.cell(row=2, column=1).value = '2025/11'
+    ws.cell(row=3, column=1).value = '2025/12'
+    ws.cell(row=4, column=1).value = '合计'
+
+    metrics = {
+        '2025-11': {
+            'revenue': 100,
+            'cost': 60,
+            'sales_expense': 10,
+            'admin_expense': 5,
+            'financial_expense': 2,
+            'operating_profit': 23,
+        },
+        '2025-12': {
+            'revenue': 200,
+            'cost': 120,
+            'sales_expense': 20,
+            'admin_expense': 10,
+            'financial_expense': 4,
+            'operating_profit': 46,
+        },
+    }
+
+    gen._update_expense_compare_sheet(ws, metrics, '2025', '12', 'current')
+
+    header_map = {str(ws.cell(row=1, column=c).value).strip(): c for c in range(1, ws.max_column + 1) if ws.cell(row=1, column=c).value}
+    assert '财务费用' in header_map
+    assert '财务费用占比' in header_map
+    assert ws.cell(row=3, column=header_map['财务费用']).value == 4
+    assert abs(ws.cell(row=3, column=header_map['财务费用占比']).value - 0.02) < 1e-12
+    assert ws.cell(row=4, column=header_map['财务费用']).value == 6
+    assert abs(ws.cell(row=4, column=header_map['财务费用占比']).value - 0.02) < 1e-12
+
+
+def test_compare_sheet_adds_financial_expense_indicator_rows():
+    gen = ReportGenerator('.')
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '同比经营分析'
+    headers = ['月份', '部门', '指标', '本期值', '同比增量', '同比增速', '环比增量', '环比增速']
+    for c, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=c).value = h
+    ws.append(['2025/12', '合计', '销售费用', None, None, None, None, None])
+
+    metrics = {
+        '2025-12': {'financial_expense': 30},
+        '2024-12': {'financial_expense': 10},
+    }
+
+    gen._update_compare_sheet(ws, metrics, 'yoy', '2025', '12', 'current')
+
+    financial_row = None
+    for r in range(2, ws.max_row + 1):
+        if ws.cell(row=r, column=1).value == '2025/12' and ws.cell(row=r, column=3).value == '财务费用':
+            financial_row = r
+            break
+
+    assert financial_row is not None
+    assert ws.cell(row=financial_row, column=4).value == 30
+    assert ws.cell(row=financial_row, column=5).value == 20
+    assert ws.cell(row=financial_row, column=6).value == 2
+
+
+def test_annual_metrics_sheet_includes_financial_expense_and_rate():
+    gen = ReportGenerator('.')
+    wb = openpyxl.Workbook()
+    wb.active.title = '经营指标'
+
+    metrics = {
+        '2025-11': {
+            'revenue': 100,
+            'cost': 60,
+            'financial_expense': 2,
+            'financial_expense_rate': 0.02,
+        },
+        '2025-12': {
+            'revenue': 200,
+            'cost': 120,
+            'financial_expense': 6,
+            'financial_expense_rate': 0.03,
+        },
+    }
+
+    gen._update_annual_metrics_sheet(wb, metrics, '2025')
+
+    ws = wb['年度经营指标']
+    header_map = {str(ws.cell(row=1, column=c).value).strip(): c for c in range(1, ws.max_column + 1) if ws.cell(row=1, column=c).value}
+    assert '财务费用' in header_map
+    assert '财务费用率' in header_map
+    total_row = None
+    for r in range(2, ws.max_row + 1):
+        if ws.cell(row=r, column=1).value == '全年合计':
+            total_row = r
+            break
+    assert total_row is not None
+    assert ws.cell(row=total_row, column=header_map['财务费用']).value == 8
+    assert abs(ws.cell(row=total_row, column=header_map['财务费用率']).value - (8 / 300)) < 1e-12
 
 
 def test_category_month_sheet_labels_show_revenue_share_and_remain_idempotent():
@@ -1113,6 +1704,58 @@ def test_category_month_sheet_labels_show_revenue_share_and_remain_idempotent():
     assert ws.cell(row=3, column=1).value == '电器类占比'
     assert ws.cell(row=4, column=1).value == '鞋类'
     assert ws.cell(row=5, column=1).value == '鞋类占比'
+
+
+def test_category_month_sheet_year_columns_ignore_prior_year_when_all_scope():
+    gen = ReportGenerator('.')
+    gen.data['sales']['2025-12'] = pd.DataFrame([
+        {
+            'MonthStr': '2025-12',
+            'ParsedDate': pd.Timestamp('2025-12-15'),
+            '品目编码': '001',
+            '品目组合1名': '鞋类',
+            '数量': 1,
+            '合计': 100,
+        },
+    ])
+    gen.data['sales']['2026-01'] = pd.DataFrame([
+        {
+            'MonthStr': '2026-01',
+            'ParsedDate': pd.Timestamp('2026-01-15'),
+            '品目编码': '001',
+            '品目组合1名': '鞋类',
+            '数量': 3,
+            '合计': 300,
+        },
+    ])
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '按品类汇总(按月)'
+    headers = [
+        '产品大类',
+        '年销售数量',
+        '年销售收入',
+        '2026/01_销售数量',
+        '2026/01_销售收入',
+        '2025/12_销售数量',
+        '2025/12_销售收入',
+    ]
+    for col, header in enumerate(headers, start=1):
+        ws.cell(row=1, column=col).value = header
+    ws.cell(row=2, column=1).value = '鞋类'
+    ws.cell(row=3, column=1).value = '合计'
+
+    gen._update_category_month_sheet(ws, '2026', '01', 'all')
+
+    assert ws.cell(row=2, column=2).value == 3
+    assert ws.cell(row=2, column=3).value == 300
+    assert ws.cell(row=2, column=4).value == 3
+    assert ws.cell(row=2, column=5).value == 300
+    assert ws.cell(row=2, column=6).value == 1
+    assert ws.cell(row=2, column=7).value == 100
+    assert ws.cell(row=4, column=2).value == 3
+    assert ws.cell(row=4, column=3).value == 300
 
 
 def test_category_contribution_is_merged_and_old_sheet_redirects():
@@ -1327,6 +1970,32 @@ def test_fill_profit_sheet_refreshes_annual_total_column():
     assert ws.cell(row=2, column=2).value == 300
 
 
+def test_fill_profit_sheet_annual_total_uses_target_year_when_all_scope():
+    gen = ReportGenerator('.')
+    gen.data['profit']['2025-12'] = pd.DataFrame([
+        {'项目': '四、净利润', '2025/12': 100},
+    ])
+    gen.data['profit']['2026-01'] = pd.DataFrame([
+        {'项目': '四、净利润', '2026/01': 200},
+    ])
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = '利润表'
+    ws.cell(row=1, column=1).value = '指标'
+    ws.cell(row=1, column=2).value = '全年汇总'
+    ws.cell(row=1, column=3).value = '2026/01'
+    ws.cell(row=1, column=4).value = '2025/12'
+    ws.cell(row=2, column=1).value = '四、净利润'
+    ws.cell(row=2, column=2).value = 999999
+
+    gen._fill_profit_sheet(ws, '2026', '01', 'all')
+
+    assert ws.cell(row=2, column=3).value == 200
+    assert ws.cell(row=2, column=4).value == 100
+    assert ws.cell(row=2, column=2).value == 200
+
+
 def test_profit_sheet_highlights_large_expense_mom_and_links_to_expense_details():
     gen = ReportGenerator('.')
     gen.data['expense']['2025-11'] = pd.DataFrame([
@@ -1414,6 +2083,7 @@ if __name__ == '__main__':
     test_fill_product_summary_aggregates_rows()
     test_list_available_months_uses_core_intersection_when_loaded()
     test_check_data_completeness_includes_sales_and_ar()
+    test_update_ap_and_cash_analysis_sheets()
     test_fill_product_summary_total_uses_weighted_averages()
     test_fill_product_summary_total_handles_total_marker_and_missing_parsed_date()
     test_fill_product_summary_total_keeps_total_row_after_inserting_missing_codes()

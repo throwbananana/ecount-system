@@ -122,95 +122,100 @@ class ShippingDB:
         """
         导入一个 Excel 文件
         """
-        xls = pd.ExcelFile(file_path)
-        
-        # 识别需要读取的Sheet
-        target_sheets = []
-        for sheet_name in xls.sheet_names:
-            # 只要包含"报关"或"清单"字样，或者整个文件只有一个Sheet
-            if "报关" in sheet_name or "清单" in sheet_name:
-                target_sheets.append(sheet_name)
-        
-        if not target_sheets:
-            # 如果没有找到匹配的名称，默认读取第一个
-            target_sheets = [xls.sheet_names[0]]
-
-        shipment = self.parse_shipment_code(file_path)
-        file_name = os.path.basename(file_path)
-
-        # 1. 预读取所有Sheet，统计每个货柜涉及的税率集合
-        # 结构: { "ContainerA": {0.09, 0.13}, "ContainerB": {0.13} }
-        container_tax_map = defaultdict(set)
-        
-        # 暂存预处理后的数据，避免重复读取Excel: [(df, tax_rate), ...]
-        prepared_data = []
-
-        for sheet_name in target_sheets:
-            df = pd.read_excel(file_path, sheet_name=sheet_name)
-            df = df.dropna(how="all")
+        with pd.ExcelFile(file_path) as xls:
+            # 识别需要读取的Sheet
+            target_sheets = []
+            for sheet_name in xls.sheet_names:
+                # 只要包含"报关"或"清单"字样，或者整个文件只有一个Sheet
+                if "报关" in sheet_name or "清单" in sheet_name:
+                    target_sheets.append(sheet_name)
             
-            # --- 识别税率 ---
-            # 1. 优先从Sheet名称获取: "报关清单9%", "报关清单 13%"
-            tax_rate = 0.13 # 默认13%
-            m_sheet = re.search(r"(\d+)%", sheet_name)
-            if m_sheet:
-                tax_rate = float(m_sheet.group(1)) / 100.0
-            else:
-                # 2. 从列名获取: "开票金额9%", "开票金额13%"
-                found_in_col = False
-                for col in df.columns:
-                    col_str = str(col)
-                    m_col = re.search(r"开票金额.*?(\d+)%", col_str)
-                    if m_col:
-                        tax_rate = float(m_col.group(1)) / 100.0
-                        found_in_col = True
-                        break
+            if not target_sheets:
+                # 如果没有找到匹配的名称，默认读取第一个
+                target_sheets = [xls.sheet_names[0]]
+
+            shipment = self.parse_shipment_code(file_path)
+            file_name = os.path.basename(file_path)
+            reset_product_keys = set()
+
+            # 1. 预读取所有Sheet，统计每个货柜涉及的税率集合
+            # 结构: { "ContainerA": {0.09, 0.13}, "ContainerB": {0.13} }
+            container_tax_map = defaultdict(set)
             
-            df = self._normalize_product_columns(df)
+            # 暂存预处理后的数据，避免重复读取Excel: [(df, tax_rate), ...]
+            prepared_data = []
 
-            if '集装箱号' not in df.columns:
-                df['集装箱号'] = None
-            df['集装箱号'] = df['集装箱号'].ffill()
-            
-            # 记录该Sheet中的货柜号及其对应的税率
-            # 注意: 可能存在None的货柜号（未填写），这里先简单处理
-            unique_cns = df['集装箱号'].dropna().unique()
-            if len(unique_cns) == 0:
-                # 如果没有货柜号，视为 None 货柜
-                container_tax_map[None].add(tax_rate)
-            else:
-                for cn in unique_cns:
-                    container_tax_map[cn].add(tax_rate)
-
-            prepared_data.append((df, tax_rate))
-
-        # 2. 正式导入
-        for df, tax_rate in prepared_data:
-            container_nos = df['集装箱号'].dropna().unique()
-            if len(container_nos) == 0:
-                container_nos = [None]
-
-            for cn in container_nos:
-                if cn is not None:
-                    block_df = df[df['集装箱号'] == cn]
-                else:
-                    block_df = df
+            for sheet_name in target_sheets:
+                df = pd.read_excel(file_path, sheet_name=sheet_name)
+                df = df.dropna(how="all")
                 
-                # 逻辑判断：如果该货柜在所有Sheet中只涉及一种税率，则不加后缀；
-                # 如果涉及多种税率，则必须拆分，加后缀区分。
-                import_cn = cn
-                rates_set = container_tax_map[cn]
-                
-                if len(rates_set) > 1 and cn is not None:
-                    # 有多种税率，拆分
-                    rate_percent = int(round(tax_rate * 100))
-                    import_cn = f"{str(cn).strip()}({rate_percent}%)"
+                # --- 识别税率 ---
+                # 1. 优先从Sheet名称获取: "报关清单9%", "报关清单 13%"
+                tax_rate = 0.13 # 默认13%
+                m_sheet = re.search(r"(\d+)%", sheet_name)
+                if m_sheet:
+                    tax_rate = float(m_sheet.group(1)) / 100.0
                 else:
-                    # 只有一种税率，或者 cn is None，保持原样
-                    # 这样可以满足"同一税率不用分开，只有两个税率才分柜号"的需求
-                    pass
+                    # 2. 从列名获取: "开票金额9%", "开票金额13%"
+                    found_in_col = False
+                    for col in df.columns:
+                        col_str = str(col)
+                        m_col = re.search(r"开票金额.*?(\d+)%", col_str)
+                        if m_col:
+                            tax_rate = float(m_col.group(1)) / 100.0
+                            found_in_col = True
+                            break
+                
+                df = self._normalize_product_columns(df)
 
-                self._import_container_block(block_df, shipment, import_cn, file_name, special_linkage=special_linkage, tax_rate=tax_rate)
+                if '集装箱号' not in df.columns:
+                    df['集装箱号'] = None
+                df['集装箱号'] = df['集装箱号'].ffill()
+                
+                # 记录该Sheet中的货柜号及其对应的税率
+                # 注意: 可能存在None的货柜号（未填写），这里先简单处理
+                unique_cns = df['集装箱号'].dropna().unique()
+                if len(unique_cns) == 0:
+                    # 如果没有货柜号，视为 None 货柜
+                    container_tax_map[None].add(tax_rate)
+                else:
+                    for cn in unique_cns:
+                        container_tax_map[cn].add(tax_rate)
+
+                prepared_data.append((df, tax_rate))
+
+            # 2. 正式导入
+            for df, tax_rate in prepared_data:
+                container_nos = df['集装箱号'].dropna().unique()
+                if len(container_nos) == 0:
+                    container_nos = [None]
+
+                for cn in container_nos:
+                    if cn is not None:
+                        block_df = df[df['集装箱号'] == cn]
+                    else:
+                        block_df = df
+                    
+                    # 逻辑判断：如果该货柜在所有Sheet中只涉及一种税率，则不加后缀；
+                    # 如果涉及多种税率，则必须拆分，加后缀区分。
+                    import_cn = cn
+                    rates_set = container_tax_map[cn]
+                    
+                    if len(rates_set) > 1 and cn is not None:
+                        # 有多种税率，拆分
+                        rate_percent = int(round(tax_rate * 100))
+                        import_cn = f"{str(cn).strip()}({rate_percent}%)"
+                    else:
+                        # 只有一种税率，或者 cn is None，保持原样
+                        # 这样可以满足"同一税率不用分开，只有两个税率才分柜号"的需求
+                        pass
+
+                    import_key = (shipment, import_cn)
+                    if import_key not in reset_product_keys:
+                        self._clear_existing_products_for_container(shipment, import_cn)
+                        reset_product_keys.add(import_key)
+
+                    self._import_container_block(block_df, shipment, import_cn, file_name, special_linkage=special_linkage, tax_rate=tax_rate)
 
         self.conn.commit()
 
@@ -237,7 +242,10 @@ class ShippingDB:
                         has_carton = True
                         continue
             if not has_pack:
-                if re.search(r"(装数|装箱数|装箱数量|每箱|每箱数|PACK|装箱)", norm, flags=re.IGNORECASE):
+                if (
+                    norm not in {"集装箱号", "集装箱编号", "柜号", "货柜号"}
+                    and re.search(r"^(装数|装箱|装箱数|装箱数量|每箱|每箱数|PACK)$", norm, flags=re.IGNORECASE)
+                ):
                     col_map[col] = "装数"
                     has_pack = True
             
@@ -388,6 +396,47 @@ class ShippingDB:
         if row is None:
             return c.lastrowid
         return row["id"]
+
+    def _clear_existing_products_for_container(self, shipment_code, container_no):
+        """
+        重复导入同一票同一柜时，先清空旧产品明细，避免产品行累积。
+        """
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT id FROM containers WHERE shipment_code IS ? AND container_no IS ? ORDER BY id DESC LIMIT 1",
+            (shipment_code, container_no)
+        )
+        row = c.fetchone()
+        if row:
+            c.execute("DELETE FROM products WHERE container_id=?", (row["id"],))
+
+    def _get_container_fee_parts(self, container_id: int) -> dict:
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT tax_refund, sea_freight_usd, all_in_rmb,
+                   insurance_usd, exchange_rate, agency_fee_rmb,
+                   misc_rmb, misc_total_rmb
+            FROM containers
+            WHERE id=?
+        """, (container_id,))
+        row = c.fetchone()
+        if not row:
+            raise ValueError(f"货柜不存在: {container_id}")
+        return dict(row)
+
+    def _sync_container_total_and_allocations(self, container_id: int) -> float:
+        """
+        按当前费用明细重算货柜杂费汇总，并同步产品分摊。
+        """
+        fees = self._get_container_fee_parts(container_id)
+        new_total = self.calculate_misc_total(fees)
+        c = self.conn.cursor()
+        c.execute(
+            "UPDATE containers SET misc_total_rmb=? WHERE id=?",
+            (new_total, container_id)
+        )
+        self.allocate_misc_fees(container_id)
+        return new_total
 
     def _is_product_row(self, row: pd.Series) -> bool:
         text_vals = []
@@ -550,7 +599,7 @@ class ShippingDB:
             container_id
         ))
         self.conn.commit()
-        return new_total
+        return self._sync_container_total_and_allocations(container_id)
 
     # ---------- 数据管理 ----------
 
@@ -588,6 +637,31 @@ class ShippingDB:
         sql = f"UPDATE products SET {field_name}=? WHERE id=?"
         c.execute(sql, (value, product_id))
         self.conn.commit()
+
+    def update_container_field(self, container_id: int, field_name: str, value):
+        """
+        更新单个货柜字段
+        """
+        allowed_fields = [
+            "tax_refund",
+            "sea_freight_usd",
+            "all_in_rmb",
+            "insurance_usd",
+            "exchange_rate",
+            "agency_fee_rmb",
+            "misc_rmb",
+            "misc_total_rmb",
+        ]
+        if field_name not in allowed_fields:
+            raise ValueError(f"不允许修改字段: {field_name}")
+
+        c = self.conn.cursor()
+        sql = f"UPDATE containers SET {field_name}=? WHERE id=?"
+        c.execute(sql, (value, container_id))
+        self.conn.commit()
+        if field_name != "misc_total_rmb":
+            return self._sync_container_total_and_allocations(container_id)
+        return value
 
 
     # ---------- 查询接口 ----------
@@ -645,6 +719,7 @@ class ShippingModule(ttk.Frame):
     def __init__(self, master, db_path="shipping.bd", open_in_converter=None):
         super().__init__(master)
         self.db = ShippingDB(db_path)
+        self.shipping_tree_style = "ShippingPreview.Treeview"
         self.clipboard_data = None # 用于剪贴板
         self.open_in_converter = open_in_converter
         self.product_filters = {}
@@ -671,8 +746,23 @@ class ShippingModule(ttk.Frame):
         self.container_export_format_var = tk.StringVar(value=get_active_export_format_name("shipping_container"))
         self.special_linkage_var = tk.BooleanVar(value=True) # 特殊品名联动
         self._load_filter_state()
+        self._configure_tree_styles()
         self._create_widgets()
         self._refresh_export_format_options()
+
+    def _configure_tree_styles(self):
+        style = ttk.Style(self)
+        style.configure(
+            self.shipping_tree_style,
+            background="#ffffff",
+            fieldbackground="#ffffff",
+            foreground="#1f2937",
+        )
+        style.map(
+            self.shipping_tree_style,
+            background=[("selected", "#dbeafe")],
+            foreground=[("selected", "#111827")],
+        )
 
     def _create_widgets(self):
         # 顶部工具条
@@ -760,7 +850,12 @@ class ShippingModule(ttk.Frame):
             "gross_weight", "net_weight", "volume", "allocated_cost",
             "unit_allocated_cost", "unit_inventory_cost", "inventory_cost", "tax_rate"
         )
-        self.product_tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        self.product_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            style=self.shipping_tree_style,
+        )
         self.product_tree._skip_smart_restore_header_menu = True
 
         # 将数据库字段名映射到 Treeview 列名
@@ -816,7 +911,11 @@ class ShippingModule(ttk.Frame):
         self.product_tree.bind("<Double-1>", self.on_product_cell_double_click)
         
         # 使用增强版 Treeview 工具 (支持单元格级复制粘贴)
-        attach_treeview_tools(self.product_tree)
+        attach_treeview_tools(
+            self.product_tree,
+            sync_single_cell_to_row_selection=False,
+            auto_select_row_on_right_click=False,
+        )
         self.product_tree.bind("<<TreeviewPaste>>", self.on_product_paste_batch)
         self.product_tree.bind("<<TreeviewRefresh>>", lambda e: self.refresh_product_table())
         
@@ -909,32 +1008,47 @@ class ShippingModule(ttk.Frame):
 
         columns = (
             "id", "shipment_code", "container_no", "file_name",
-            "tax_refund", "sea_freight_usd", "all_in_rmb",
-            "insurance_usd", "exchange_rate", "agency_fee_rmb",
+            "tax_refund", "sea_freight_usd", "sea_freight_rmb", "all_in_rmb",
+            "insurance_usd", "insurance_rmb", "exchange_rate", "agency_fee_rmb",
             "misc_rmb", "misc_total_rmb", "tax_rate"
         )
-        self.container_tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        self.container_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            style=self.shipping_tree_style,
+        )
         self.container_tree._skip_smart_restore_header_menu = True
 
-        headings = {
-            "id": "ID",
-            "shipment_code":   "指令号",
-            "container_no":    "货柜号",
-            "file_name":       "来源文件",
-            "tax_refund":      "退税额",
-            "sea_freight_usd": "海运费($)",
-            "all_in_rmb":      "包干费(￥)",
-            "insurance_usd":   "保费($)",
-            "exchange_rate":   "汇率",
-            "agency_fee_rmb":  "代理费(￥)",
-            "misc_rmb":        "其他杂费(￥)",
-            "misc_total_rmb":  "杂费汇总(￥)",
-            "tax_rate":        "税率",
+        self.container_column_map = {
+            "ID": "id",
+            "指令号": "shipment_code",
+            "货柜号": "container_no",
+            "来源文件": "file_name",
+            "退税额": "tax_refund",
+            "海运费($)": "sea_freight_usd",
+            "海运费(￥)": "sea_freight_rmb",
+            "包干费(￥)": "all_in_rmb",
+            "保费($)": "insurance_usd",
+            "保费(￥)": "insurance_rmb",
+            "汇率": "exchange_rate",
+            "代理费(￥)": "agency_fee_rmb",
+            "其他杂费(￥)": "misc_rmb",
+            "杂费汇总(￥)": "misc_total_rmb",
+            "税率": "tax_rate",
         }
+        self.container_column_reverse_map = {v: k for k, v in self.container_column_map.items()}
         for col in columns:
-            self.container_tree.heading(col, text=headings[col], command=lambda c=col: self.on_container_heading_click(c))
+            self.container_tree.heading(
+                col,
+                text=self.container_column_reverse_map.get(col, col),
+                command=lambda c=col: self.on_container_heading_click(c)
+            )
             w = 90
-            if col == "id": w = 40
+            if col == "id":
+                w = 40
+            elif col in {"sea_freight_rmb", "insurance_rmb", "misc_total_rmb"}:
+                w = 100
             self.container_tree.column(col, width=w, anchor="center")
 
         vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.container_tree.yview)
@@ -948,15 +1062,21 @@ class ShippingModule(ttk.Frame):
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
+        self.container_tree.bind("<Double-1>", self.on_container_cell_double_click)
         self.container_tree.bind("<<TreeviewSelect>>", self.on_container_select)
         self.container_tree.bind("<Button-3>", self.on_container_heading_right_click, add="+")
         
         # 使用增强版 Treeview 工具 (支持单元格级复制粘贴)
-        attach_treeview_tools(self.container_tree)
+        attach_treeview_tools(
+            self.container_tree,
+            sync_single_cell_to_row_selection=False,
+            auto_select_row_on_right_click=False,
+        )
         self.container_tree.bind("<<TreeviewPaste>>", self.on_container_paste_batch)
         self.container_tree.bind("<<TreeviewRefresh>>", lambda e: self.refresh_container_table())
 
         self.container_tree.bind("<Button-1>", self.on_container_cell_click, add="+")
+        self.container_tree.bind("<ButtonRelease-1>", self.on_container_cell_release, add="+")
 
     def _build_log_tab(self):
         frame = ttk.Frame(self.notebook)
@@ -1106,6 +1226,49 @@ class ShippingModule(ttk.Frame):
         )
         self._refresh_export_format_options()
 
+    def _get_active_tree_item(self, tree, last_cell):
+        sel = tree.selection()
+        if sel:
+            return sel[0]
+        if last_cell:
+            item_id = last_cell[0]
+            if tree.exists(item_id):
+                return item_id
+        return None
+
+    def _get_active_tree_record_id(self, tree, last_cell):
+        item_id = self._get_active_tree_item(tree, last_cell)
+        if not item_id:
+            return None
+        values = self.tree_item_values(tree, item_id)
+        if not values or str(values[0]) == "汇总":
+            return None
+        return values[0]
+
+    def tree_item_values(self, tree, item_id):
+        if not item_id or not tree.exists(item_id):
+            return ()
+        return tree.item(item_id, "values")
+
+    def _load_container_info_from_item(self, item_id):
+        vals = self.tree_item_values(self.container_tree, item_id)
+        if not vals or vals[0] == "汇总":
+            for v in self.container_info_vars.values():
+                v.set(0.0)
+            return
+
+        data = dict(zip(self.container_tree["columns"], vals))
+        for k, var in self.container_info_vars.items():
+            val = data.get(k)
+            try:
+                if val and val != "None":
+                    var.set(float(val))
+                else:
+                    var.set(0.0)
+            except Exception as e:
+                self.log(f"Error setting container info var {k}: {e}")
+                var.set(0.0)
+
     def on_product_cell_double_click(self, event):
         # 获取点击的单元格
         region = self.product_tree.identify_region(event.x, event.y)
@@ -1176,6 +1339,67 @@ class ShippingModule(ttk.Frame):
 
         entry_edit.bind("<Return>", on_entry_edit_confirm)
         entry_edit.bind("<FocusOut>", on_entry_edit_confirm) # 失去焦点也保存
+
+    def on_container_cell_double_click(self, event):
+        region = self.container_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+
+        column = self.container_tree.identify_column(event.x)
+        item_id = self.container_tree.identify_row(event.y)
+        if not item_id:
+            return
+
+        col_index = int(column[1:]) - 1
+        current_values = self.container_tree.item(item_id, "values")
+        container_id = current_values[0]
+        if str(container_id) == "汇总":
+            return
+
+        db_col_name = self.container_tree["columns"][col_index]
+        editable_cols = {
+            "tax_refund",
+            "sea_freight_usd",
+            "all_in_rmb",
+            "insurance_usd",
+            "exchange_rate",
+            "agency_fee_rmb",
+            "misc_rmb",
+        }
+        if db_col_name not in editable_cols:
+            return
+
+        bbox = self.container_tree.bbox(item_id, column)
+        if bbox == "":
+            return
+
+        current_text = current_values[col_index]
+        entry_edit = ttk.Entry(self.container_tree, width=bbox[2])
+        entry_edit.place(x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3])
+        entry_edit.insert(0, current_text)
+        entry_edit.focus_set()
+
+        def on_entry_edit_confirm(e):
+            new_value_str = entry_edit.get().strip()
+            try:
+                new_value = float(new_value_str) if new_value_str else 0.0
+            except ValueError:
+                messagebox.showerror("输入错误", f"{self.container_column_reverse_map[db_col_name]} 必须是数字！")
+                entry_edit.destroy()
+                return
+
+            try:
+                self.db.update_container_field(container_id, db_col_name, new_value)
+                self.log(f"货柜ID {container_id} 的 {self.container_column_reverse_map[db_col_name]} 已更新为: {new_value_str}")
+                self.refresh_container_table()
+                self.refresh_product_table()
+            except Exception as ex:
+                messagebox.showerror("数据库错误", f"更新失败: {ex}")
+            finally:
+                entry_edit.destroy()
+
+        entry_edit.bind("<Return>", on_entry_edit_confirm)
+        entry_edit.bind("<FocusOut>", on_entry_edit_confirm)
 
     def on_product_heading_click(self, col_name: str):
         if self.product_sort_col == col_name:
@@ -1283,21 +1507,26 @@ class ShippingModule(ttk.Frame):
             
             try:
                 container_id = values[0]
+                if str(container_id) == "汇总":
+                    continue
+                fee_updates = self.db._get_container_fee_parts(container_id)
                 for i in range(1, len(columns)):
                     col_name = columns[i]
                     if col_name in editable_cols and i < len(values):
                         val_str = str(values[i])
                         try:
                             val = float(val_str) if val_str.strip() else 0.0
-                            self.db.update_container_field(container_id, col_name, val)
+                            fee_updates[col_name] = val
                         except ValueError:
                             continue
+                self.db.update_container_fees(container_id, fee_updates)
                 success_count += 1
             except Exception:
                 continue
         
         self.log(f"货柜批量更新完成：{success_count} 行")
         self.refresh_container_table()
+        self.refresh_product_table()
 
     def on_product_cell_click(self, event):
         pass # 使用 TreeviewTools 处理点击
@@ -1326,11 +1555,32 @@ class ShippingModule(ttk.Frame):
             return
         col_index = int(column_id[1:]) - 1
         self.container_last_cell = (item_id, col_index)
+        self._load_container_info_from_item(item_id)
+
+    def on_container_cell_release(self, event):
+        region = self.container_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+
+        item_id = self.container_tree.identify_row(event.y)
+        column_id = self.container_tree.identify_column(event.x)
+        if not item_id or not column_id:
+            return
+
+        try:
+            col_index = int(column_id[1:]) - 1
+        except Exception:
+            return
+
+        self.container_last_cell = (item_id, col_index)
+        self.container_tree.selection_set(item_id)
+        self._load_container_info_from_item(item_id)
 
 
     # --- 货柜页操作 ---
 
     def refresh_container_table(self):
+        active_container_id = self.get_selected_container_id()
         for i in self.container_tree.get_children():
             self.container_tree.delete(i)
         
@@ -1396,51 +1646,36 @@ class ShippingModule(ttk.Frame):
         self._refresh_container_headings()
         
         if formatted_rows:
-            # 尝试选中第一行有效数据（跳过汇总行）
             children = self.container_tree.get_children()
-            if len(children) > 1:
+            restored = False
+            if active_container_id is not None:
+                for child in children:
+                    values = self.container_tree.item(child, "values")
+                    if values and str(values[0]) == str(active_container_id):
+                        self.container_tree.selection_set(child)
+                        self.container_last_cell = (child, 0)
+                        self.on_container_select()
+                        restored = True
+                        break
+            if not restored and len(children) > 1:
                 self.container_tree.selection_set(children[1])
+                self.container_last_cell = (children[1], 0)
                 self.on_container_select()
-            elif len(children) == 1 and children[0] != "汇总": # 应该不会发生，因为有数据就有汇总
-                 self.container_tree.selection_set(children[0])
-                 self.on_container_select()
+            elif not restored and len(children) == 1 and children[0] != "汇总":
+                self.container_tree.selection_set(children[0])
+                self.container_last_cell = (children[0], 0)
+                self.on_container_select()
         else:
             # 清空输入框
+            self.container_last_cell = None
             for v in self.container_info_vars.values():
                 v.set(0.0)
 
     def on_container_select(self, event=None):
         sel = self.container_tree.selection()
-        if not sel: return
-        vals = self.container_tree.item(sel[0], "values")
-        
-        if vals[0] == "汇总":
-             # 如果选中的是汇总行，清空输入框或不做处理
-             for v in self.container_info_vars.values():
-                 v.set(0.0)
-             return
-
-        # Treeview columns 顺序
-        cols = (
-            "id", "shipment_code", "container_no", "file_name",
-            "tax_refund", "sea_freight_usd", "all_in_rmb",
-            "insurance_usd", "exchange_rate", "agency_fee_rmb",
-            "misc_rmb", "misc_total_rmb"
-        )
-        data = dict(zip(cols, vals))
-        
-        # 填充到输入框
-        for k, var in self.container_info_vars.items():
-            val = data.get(k)
-            try:
-                # 确保以浮点数形式填充，便于编辑，显示时再格式化
-                if val and val != "None":
-                    var.set(float(val))
-                else:
-                    var.set(0.0)
-            except Exception as e:
-                self.log(f"Error setting container info var {k}: {e}")
-                var.set(0.0)
+        if not sel:
+            return
+        self._load_container_info_from_item(sel[0])
 
     def on_container_heading_click(self, col_name: str):
         if self.container_sort_col == col_name:
@@ -1477,7 +1712,7 @@ class ShippingModule(ttk.Frame):
         menu.add_command(label="隐藏此列", command=lambda: self._hide_tree_column(self.container_tree, col_name))
         menu.add_command(label="显示全部列", command=lambda: self._show_all_tree_columns(self.container_tree))
         menu.add_command(label="列管理...", command=lambda: self._open_column_manager_dialog(
-            self.container_tree, None
+            self.container_tree, self.container_column_reverse_map
         ))
         menu.add_separator()
         add_smart_restore_menu(menu, self.container_tree)
@@ -1489,10 +1724,7 @@ class ShippingModule(ttk.Frame):
         self.refresh_container_table()
 
     def get_selected_container_id(self):
-        sel = self.container_tree.selection()
-        if not sel: return None
-        vals = self.container_tree.item(sel[0], "values")
-        return vals[0] # id is first col
+        return self._get_active_tree_record_id(self.container_tree, self.container_last_cell)
 
     def on_save_container_fees(self):
         cid = self.get_selected_container_id()
@@ -1514,6 +1746,7 @@ class ShippingModule(ttk.Frame):
             self.container_info_vars["misc_total_rmb"].set(f"{new_total:.2f}") # 格式化为两位小数
             
             self.refresh_container_table()
+            self.refresh_product_table()
             
             # 恢复选中状态
             for item in self.container_tree.get_children():
@@ -1581,8 +1814,8 @@ class ShippingModule(ttk.Frame):
     def _open_container_export_format_editor(self):
         columns = [
             "ID", "指令号", "货柜号", "来源文件",
-            "退税额", "海运费USD", "包干费", "保费USD", "汇率",
-            "代理费", "杂费", "杂费汇总"
+            "退税额", "海运费($)", "海运费(￥)", "包干费(￥)", "保费($)", "保费(￥)", "汇率",
+            "代理费(￥)", "其他杂费(￥)", "杂费汇总(￥)", "税率"
         ]
         open_export_format_editor(
             self,
@@ -1674,22 +1907,8 @@ class ShippingModule(ttk.Frame):
             self.product_tree.heading(col, text=base, command=lambda c=col: self.on_product_heading_click(c))
 
     def _refresh_container_headings(self):
-        headings = {
-            "id": "ID",
-            "shipment_code":   "指令号",
-            "container_no":    "货柜号",
-            "file_name":       "来源文件",
-            "tax_refund":      "退税额",
-            "sea_freight_usd": "海运费($)",
-            "all_in_rmb":      "包干费(￥)",
-            "insurance_usd":   "保费($)",
-            "exchange_rate":   "汇率",
-            "agency_fee_rmb":  "代理费(￥)",
-            "misc_rmb":        "其他杂费(￥)",
-            "misc_total_rmb":  "杂费汇总(￥)",
-        }
         for col in self.container_tree["columns"]:
-            base = headings.get(col, col)
+            base = self.container_column_reverse_map.get(col, col)
             if col in self.container_filters:
                 base += " [F]"
             if self.container_sort_col == col:
@@ -2010,10 +2229,26 @@ class ShippingModule(ttk.Frame):
 
     def _get_container_decimal_cols(self):
         return [
-            "tax_refund", "sea_freight_usd", "all_in_rmb",
-            "insurance_usd", "exchange_rate", "agency_fee_rmb",
+            "tax_refund", "sea_freight_usd", "sea_freight_rmb", "all_in_rmb",
+            "insurance_usd", "insurance_rmb", "exchange_rate", "agency_fee_rmb",
             "misc_rmb", "misc_total_rmb", "tax_rate"
         ]
+
+    @staticmethod
+    def _calculate_converted_rmb(usd_value, exchange_rate):
+        try:
+            if usd_value is None or exchange_rate is None:
+                return None
+            return float(usd_value) * float(exchange_rate)
+        except (TypeError, ValueError):
+            return None
+
+    def _get_container_cell_value(self, row, col_name):
+        if col_name == "sea_freight_rmb":
+            return self._calculate_converted_rmb(row["sea_freight_usd"], row["exchange_rate"])
+        if col_name == "insurance_rmb":
+            return self._calculate_converted_rmb(row["insurance_usd"], row["exchange_rate"])
+        return row[col_name]
 
     def _get_product_row_entries(self, keyword, container_no):
         rows = self.db.query_products(keyword, container_no)
@@ -2080,7 +2315,7 @@ class ShippingModule(ttk.Frame):
         for r in rows:
             entry = {}
             for col_name in self.container_tree["columns"]:
-                entry[col_name] = r[col_name]
+                entry[col_name] = self._get_container_cell_value(r, col_name)
             row_entries.append(entry)
         return row_entries
 
@@ -2094,21 +2329,7 @@ class ShippingModule(ttk.Frame):
             entries = self._get_product_row_entries(kw, ct)
             filters = self.product_filters
         else:
-            headings = {
-                "id": "ID",
-                "shipment_code":   "指令号",
-                "container_no":    "货柜号",
-                "file_name":       "来源文件",
-                "tax_refund":      "退税额",
-                "sea_freight_usd": "海运费($)",
-                "all_in_rmb":      "包干费(￥)",
-                "insurance_usd":   "保费($)",
-                "exchange_rate":   "汇率",
-                "agency_fee_rmb":  "代理费(￥)",
-                "misc_rmb":        "其他杂费(￥)",
-                "misc_total_rmb":  "杂费汇总(￥)",
-            }
-            title = headings.get(col_name, col_name)
+            title = self.container_column_reverse_map.get(col_name, col_name)
             decimal_cols = set(self._get_container_decimal_cols())
             if "exchange_rate" in decimal_cols:
                 decimal_cols.remove("exchange_rate")

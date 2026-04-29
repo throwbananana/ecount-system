@@ -28,28 +28,34 @@ class ReportGenerator:
     def __init__(self, base_data_dir):
         self.base_data_dir = base_data_dir
         # Data structure: self.data[category][month_str] = dataframe
-        # categories: 'profit', 'cost', 'expense', 'asset', 'sales', 'ar'
+        # categories: 'profit', 'cost', 'expense', 'asset', 'sales', 'ar', 'ap', 'cash'
         self.data = {
             'profit': {},
             'cost': {},
             'expense': {},
             'asset': {},
             'sales': {},
-            'ar': {}
+            'ar': {},
+            'ap': {},
+            'cash': {},
         }
         # current: only target year; all: include previous years up to target month
         self.year_scope = "current"
         self.sales_df = None
         self.ar_detail_df = None
+        self.ap_detail_df = None
+        self.cash_detail_df = None
         self.audit_logs = []
         self.data_quality_issues = []
         self.report_params = {
             "replenishment": {
+                "manual": True,
                 "lead_days": 30,
                 "safety_days": 20,
                 "window_months": 3,
             },
             "cashflow": {
+                "manual": True,
                 "dso_threshold": 90,
                 "dio_threshold": 180,
                 "ccc_threshold": 120,
@@ -100,7 +106,7 @@ class ReportGenerator:
         bar_chart.title = title
         bar_chart.y_axis.title = "金额"
         
-        cats = Reference(ws, min_col=cat_col, min_row=data_start, max_row=data_end)
+        cats = self._chart_category_reference(ws, cat_col, data_start, data_end)
         data = Reference(ws, min_col=data_col, min_row=header_row, max_row=data_end)
         bar_chart.add_data(data, titles_from_data=True)
         bar_chart.set_categories(cats)
@@ -304,9 +310,9 @@ class ReportGenerator:
             "TOTAL": len(self.data_quality_issues),
         }
 
-    def _get_data_quality_summary_for_scope(self, target_year=None, target_month=None, year_scope=None):
-        counter = Counter()
-        total = 0
+    def get_data_quality_issues(self, target_year=None, target_month=None, year_scope=None):
+        """返回数据质量问题明细，可按报告目标期间过滤。"""
+        issues = []
         for item in self.data_quality_issues:
             period = item.get("period")
             if (
@@ -317,6 +323,52 @@ class ReportGenerator:
             ):
                 if not self._month_key_in_scope(period, target_year, target_month, year_scope):
                     continue
+            issues.append(item)
+        return issues
+
+    def format_data_quality_details(
+        self,
+        target_year=None,
+        target_month=None,
+        year_scope=None,
+        max_per_severity=None,
+    ):
+        """将数据质量问题格式化为可读明细。"""
+        issues = self.get_data_quality_issues(target_year, target_month, year_scope)
+        if not issues:
+            return "未发现数据质量问题。"
+
+        lines = []
+        severity_order = ["ERROR", "WARN", "INFO"]
+        for severity in severity_order:
+            group = [
+                item for item in issues
+                if str(item.get("severity") or "WARN").upper() == severity
+            ]
+            if not group:
+                continue
+
+            lines.append(f"{severity} ({len(group)}):")
+            shown = group
+            if max_per_severity is not None:
+                shown = group[:max(0, int(max_per_severity))]
+
+            for idx, item in enumerate(shown, start=1):
+                category = item.get("category") or "未知类别"
+                period = item.get("period") or "全局"
+                issue_type = item.get("issue_type") or "未知问题"
+                detail = item.get("detail") or ""
+                lines.append(f"  {idx}. [{category}] {period} - {issue_type}: {detail}")
+
+            if len(shown) < len(group):
+                lines.append(f"  ... 还有 {len(group) - len(shown)} 条 {severity} 未显示，请查看生成日志或“数据质量检查”Sheet。")
+
+        return "\n".join(lines)
+
+    def _get_data_quality_summary_for_scope(self, target_year=None, target_month=None, year_scope=None):
+        counter = Counter()
+        total = 0
+        for item in self.get_data_quality_issues(target_year, target_month, year_scope):
             severity = str(item.get("severity") or "WARN").upper()
             counter[severity] += 1
             total += 1
@@ -375,18 +427,23 @@ class ReportGenerator:
             path = os.path.join(self.base_data_dir, f)
             print(f"正在处理文件: {f}")
             
-            # Identify type by filename
-            if "成本" in f:
+            file_type = self._classify_source_file(f, path)
+            # Identify type by filename and workbook header content.
+            if file_type == "cost":
                 self._load_cost_data(path, f)
-            elif "费用" in f:
+            elif file_type == "expense":
                 self._load_expense_data(path, f)
-            elif "利润" in f:
+            elif file_type == "profit":
                 self._load_profit_data(path, f)
-            elif "销售" in f or "出库" in f:
+            elif file_type == "sales":
                 self._load_sales_data(path, f)
-            elif "应收" in f:
+            elif file_type == "ar":
                 self._load_ar_data(path, f)
-            elif "资产" in f:
+            elif file_type == "ap":
+                self._load_ap_data(path, f)
+            elif file_type == "cash":
+                self._load_cash_data(path, f)
+            elif file_type == "asset":
                 self._load_asset_data(path, f)
         
         print("基础资料加载完成。")
@@ -394,19 +451,61 @@ class ReportGenerator:
         self._print_stats()
         self._run_data_quality_checks()
 
-    def _classify_source_file(self, filename):
-        if "成本" in filename:
-            return "cost"
-        if "费用" in filename:
-            return "expense"
-        if "利润" in filename:
+    def _source_file_text(self, path=None, df_peek=None):
+        parts = []
+        if df_peek is not None:
+            try:
+                for value in df_peek.to_numpy().ravel():
+                    if value is not None and not pd.isna(value):
+                        parts.append(str(value))
+            except Exception:
+                pass
+        elif path:
+            try:
+                peek = pd.read_excel(path, header=None, nrows=3)
+                for value in peek.to_numpy().ravel():
+                    if value is not None and not pd.isna(value):
+                        parts.append(str(value))
+            except Exception:
+                pass
+
+        if path:
+            try:
+                xl = pd.ExcelFile(path)
+                parts.extend([str(s) for s in xl.sheet_names])
+            except Exception:
+                pass
+
+        return " ".join(parts)
+
+    def _classify_source_file(self, filename, path=None, df_peek=None):
+        name = str(filename or "")
+        text = f"{name} {self._source_file_text(path, df_peek)}"
+
+        if "利润表" in text or "利润" in name:
             return "profit"
-        if "销售" in filename or "出库" in filename:
-            return "sales"
-        if "应收" in filename:
-            return "ar"
-        if "资产" in filename:
+        if "资产负债表" in text or "资产" in name:
             return "asset"
+        if "销售出库" in text or "销售" in name or "出库" in name:
+            return "sales"
+        if "成本" in name:
+            return "cost"
+
+        # 明细账常见文件名不包含“应收/应付/银行”，需要优先看首行账簿描述。
+        if "应付账款" in text or "应付" in name:
+            return "ap"
+        if "应收账款" in text or "应收" in name:
+            return "ar"
+        if "银行存款" in text or "货币资金" in text:
+            return "cash"
+
+        # 科目账簿类费用文件可能只在首行出现 6601/6602/6603 或“办公费”等科目名。
+        expense_terms = (
+            "销售费用", "管理费用", "财务费用", "办公费", "工资", "福利费", "房租",
+            "水电费", "差旅费", "保险费", "手续费", "汇兑损益",
+        )
+        if "费用" in name or re.search(r"\b660[123]\d*\b", text) or any(term in text for term in expense_terms):
+            return "expense"
         return None
 
     def list_available_months(self, ready_only=True):
@@ -440,16 +539,15 @@ class ReportGenerator:
                 continue
             if str(f).startswith('~$'):
                 continue
-            cat = self._classify_source_file(f)
-            if cat not in month_by_cat:
-                continue
-
             path = os.path.join(self.base_data_dir, f)
             df_peek = None
             try:
                 df_peek = pd.read_excel(path, header=None, nrows=1)
             except Exception:
                 df_peek = None
+            cat = self._classify_source_file(f, path, df_peek)
+            if cat not in month_by_cat:
+                continue
             month_key = self._determine_period_key(path, f, df_peek)
             if month_key and month_key != "Unknown":
                 month_by_cat[cat].add(month_key)
@@ -640,6 +738,15 @@ class ReportGenerator:
                             return None
                 df['ParsedDate'] = df[date_col].apply(parse_date)
                 df.dropna(subset=['ParsedDate'], inplace=True)
+                non_business_cols = [
+                    c for c in df.columns
+                    if c not in {date_col, 'ParsedDate', 'MonthStr'}
+                ]
+                if non_business_cols:
+                    content = df[non_business_cols].apply(
+                        lambda col: col.notna() & (col.astype(str).str.strip() != "")
+                    )
+                    df = df[content.any(axis=1)].copy()
                 df['MonthStr'] = df['ParsedDate'].dt.strftime('%Y-%m')
                 for m, group in df.groupby('MonthStr'):
                     self.data['expense'][m] = group
@@ -710,8 +817,11 @@ class ReportGenerator:
             header_row = 1 if self._parse_header_date(df_peek)[0] else 0
             df = pd.read_excel(path, header=header_row)
             try:
-                detail_df = pd.read_excel(path, header=1)
-                detail_df.columns = [str(c).strip().rstrip('\t') for c in detail_df.columns]
+                detail_df = self._read_multiblock_ledger_df(path, filename)
+                if detail_df is None or detail_df.empty:
+                    detail_df = pd.read_excel(path, header=1)
+                    detail_df.columns = [str(c).strip().rstrip('\t') for c in detail_df.columns]
+                    detail_df["SourceFile"] = filename
                 date_col, parsed = self._pick_best_date_column(
                     detail_df, ["日期", "date", "业务日期", "单据日期", "日期-号码"]
                 )
@@ -745,6 +855,52 @@ class ReportGenerator:
                 self._log_audit(msg)
         except Exception as e:
             print(f"加载应收数据失败 {filename}: {e}")
+
+    def _append_detail_frame(self, attr_name, df):
+        if df is None or df.empty:
+            return
+        existing = getattr(self, attr_name, None)
+        if existing is None or existing.empty:
+            setattr(self, attr_name, df.copy())
+        else:
+            setattr(self, attr_name, pd.concat([existing, df.copy()], ignore_index=True))
+
+    def _load_account_detail_data(self, path, filename, category, detail_attr, label):
+        try:
+            df_peek = pd.read_excel(path, header=None, nrows=1)
+            detail_df = self._read_multiblock_ledger_df(path, filename)
+            if detail_df is None or detail_df.empty:
+                detail_df = pd.read_excel(path, header=1)
+                detail_df.columns = [str(c).strip().rstrip('\t') for c in detail_df.columns]
+                detail_df["SourceFile"] = filename
+
+            date_col, parsed = self._pick_best_date_column(
+                detail_df, ["日期", "date", "业务日期", "单据日期", "日期-号码"]
+            )
+            if date_col and parsed is not None and parsed.notna().sum() > 0:
+                detail_df = detail_df.copy()
+                detail_df["ParsedDate"] = parsed
+                detail_df = detail_df.dropna(subset=["ParsedDate"])
+                detail_df["MonthStr"] = detail_df["ParsedDate"].dt.strftime("%Y-%m")
+                for m_key, group in detail_df.groupby("MonthStr"):
+                    existing = self.data[category].get(m_key)
+                    if existing is None or existing.empty:
+                        self.data[category][m_key] = group.copy()
+                    else:
+                        self.data[category][m_key] = pd.concat([existing, group.copy()], ignore_index=True)
+                self._append_detail_frame(detail_attr, detail_df)
+            else:
+                month = self._determine_period_key(path, filename, df_peek)
+                self.data[category][month] = detail_df
+                self._append_detail_frame(detail_attr, detail_df)
+        except Exception as e:
+            print(f"加载{label}数据失败 {filename}: {e}")
+
+    def _load_ap_data(self, path, filename):
+        self._load_account_detail_data(path, filename, "ap", "ap_detail_df", "应付账款")
+
+    def _load_cash_data(self, path, filename):
+        self._load_account_detail_data(path, filename, "cash", "cash_detail_df", "货币资金")
 
     def _load_asset_data(self, path, filename):
         try:
@@ -871,21 +1027,175 @@ class ReportGenerator:
         if not candidates:
             return None, None
 
-        best_col = None
-        best_parsed = None
-        best_valid = -1
-        for col in candidates:
-            try:
-                parsed = self._parse_date_series_flexible(df[col])
-            except Exception:
-                continue
-            valid = int(parsed.notna().sum())
-            if valid > best_valid:
-                best_valid = valid
-                best_col = col
-                best_parsed = parsed
+        exact_candidates = []
+        for keyword in include_keywords:
+            for col in candidates:
+                if str(col).strip().lower() == str(keyword).strip().lower() and col not in exact_candidates:
+                    exact_candidates.append(col)
+        non_metadata_candidates = [
+            col for col in candidates
+            if col not in exact_candidates and not str(col).strip().startswith("账页")
+        ]
+        metadata_candidates = [
+            col for col in candidates
+            if col not in exact_candidates and col not in non_metadata_candidates
+        ]
 
-        return best_col, best_parsed
+        for candidate_group in [exact_candidates, non_metadata_candidates, metadata_candidates]:
+            best_col = None
+            best_parsed = None
+            best_valid = -1
+            for col in candidate_group:
+                try:
+                    parsed = self._parse_date_series_flexible(df[col])
+                except Exception:
+                    continue
+                valid = int(parsed.notna().sum())
+                if valid > best_valid:
+                    best_valid = valid
+                    best_col = col
+                    best_parsed = parsed
+            if best_valid > 0:
+                return best_col, best_parsed
+
+        return None, None
+
+    def _dedupe_excel_headers(self, headers):
+        result = []
+        seen = Counter()
+        for idx, header in enumerate(headers):
+            if header is None or pd.isna(header) or str(header).strip() == "":
+                base = f"Unnamed:{idx + 1}"
+            else:
+                base = str(header).strip().rstrip('\t')
+            count = seen[base]
+            seen[base] += 1
+            result.append(base if count == 0 else f"{base}.{count}")
+        return result
+
+    def _parse_ledger_block_title(self, title):
+        text = str(title or "").strip()
+        info = {
+            "账页标题": text,
+            "账页公司名称": None,
+            "账页科目名": None,
+            "账页起始日期": None,
+            "账页结束日期": None,
+            "账页往来单位编码": None,
+            "账页往来单位名": None,
+        }
+        m = re.search(r"公司名称\s*[:：]\s*(.*?)\s+/\s+", text)
+        if m:
+            info["账页公司名称"] = m.group(1).strip()
+        m = re.search(r"公司名称\s*[:：]\s*.*?\s+/\s+(.+?)\s+/\s+20\d{2}[/-]", text)
+        if m:
+            info["账页科目名"] = m.group(1).strip()
+        m = re.search(
+            r"(20\d{2}[/-]\d{1,2}[/-]\d{1,2})\s*~\s*(20\d{2}[/-]\d{1,2}[/-]\d{1,2})",
+            text,
+        )
+        if m:
+            info["账页起始日期"] = m.group(1)
+            info["账页结束日期"] = m.group(2)
+        m = re.search(r"/\s*([A-Za-z0-9_.-]+)\s*[(（](.*)[)）]\s*$", text)
+        if m:
+            info["账页往来单位编码"] = m.group(1).strip()
+            info["账页往来单位名"] = m.group(2).strip()
+        return info
+
+    def _row_matches_headers(self, row):
+        total = 0
+        match = 0
+        for col, val in row.items():
+            if val is None or pd.isna(val) or str(val).strip() == "":
+                continue
+            total += 1
+            if str(val).strip() == str(col).strip():
+                match += 1
+        return total > 0 and match / total >= 0.6
+
+    def _read_multiblock_ledger_df(self, path, filename):
+        try:
+            raw = pd.read_excel(path, sheet_name=0, header=None)
+        except Exception:
+            return None
+        if raw is None or raw.empty:
+            return None
+
+        first_col = raw.iloc[:, 0]
+        title_rows = [
+            idx for idx, value in first_col.items()
+            if "公司名称" in str(value) and ("明细账" in str(value) or "科目" in str(value))
+        ]
+        if not title_rows:
+            return None
+
+        def header_score(row):
+            values = [str(v).strip() for v in row.tolist() if v is not None and not pd.isna(v)]
+            joined = "|".join(values)
+            return sum(
+                1
+                for key in ["摘要", "日期-号码", "借方金额", "贷方金额", "余额", "相对科目编码", "对应往来单位"]
+                if key in joined
+            )
+
+        frames = []
+        for pos, title_idx in enumerate(title_rows):
+            next_title = title_rows[pos + 1] if pos + 1 < len(title_rows) else len(raw)
+            header_idx = None
+            for candidate in range(title_idx + 1, min(title_idx + 6, next_title)):
+                if header_score(raw.iloc[candidate]) >= 3:
+                    header_idx = candidate
+                    break
+            if header_idx is None:
+                continue
+
+            header_values = raw.iloc[header_idx].tolist()
+            non_empty_header_cols = [
+                i for i, value in enumerate(header_values)
+                if value is not None and not pd.isna(value) and str(value).strip() != ""
+            ]
+            if not non_empty_header_cols:
+                continue
+            last_col = max(non_empty_header_cols)
+            headers = self._dedupe_excel_headers(header_values[:last_col + 1])
+            block = raw.iloc[header_idx + 1:next_title, :last_col + 1].copy()
+            block.columns = headers
+            block = block.dropna(how="all")
+            if block.empty:
+                continue
+            repeated = block.apply(self._row_matches_headers, axis=1)
+            block = block.loc[~repeated].copy()
+            if block.empty:
+                continue
+
+            title_info = self._parse_ledger_block_title(raw.iloc[title_idx, 0])
+            party_code = title_info.get("账页往来单位编码")
+            party_name = title_info.get("账页往来单位名")
+
+            insert_at = 0
+            if "对应往来单位编码" in block.columns:
+                insert_at = block.columns.get_loc("对应往来单位编码")
+            if "往来单位编码" not in block.columns:
+                block.insert(insert_at, "往来单位编码", party_code)
+                insert_at += 1
+            else:
+                missing = block["往来单位编码"].isna() | (block["往来单位编码"].astype(str).str.strip() == "")
+                block.loc[missing, "往来单位编码"] = party_code
+            if "往来单位名" not in block.columns:
+                block.insert(insert_at, "往来单位名", party_name)
+            else:
+                missing = block["往来单位名"].isna() | (block["往来单位名"].astype(str).str.strip() == "")
+                block.loc[missing, "往来单位名"] = party_name
+
+            for col, value in title_info.items():
+                block[col] = value
+            block["SourceFile"] = filename
+            frames.append(block)
+
+        if not frames:
+            return None
+        return pd.concat(frames, ignore_index=True)
 
     def _ratio_str(self, count, total):
         if not total:
@@ -945,10 +1255,21 @@ class ReportGenerator:
     def _coerce_numeric(self, series):
         return pd.to_numeric(series, errors='coerce')
 
+    def _is_optional_empty_numeric_column(self, category, col_name):
+        name = str(col_name or "")
+        # 外币列在本报表中只是辅助信息；很多账簿某个月只有本位币或只有借/贷一边，
+        # 整列为空不代表业务数据缺失。
+        if "外币" in name:
+            return True
+        return False
+
     def _run_data_quality_checks(self):
         self.data_quality_issues = []
+        required_categories = {"profit", "cost", "expense", "asset", "sales", "ar"}
         for category, months in self.data.items():
             if not months:
+                if category not in required_categories:
+                    continue
                 self._add_quality_issue(category, None, "缺失数据", "未加载到数据", severity="ERROR")
                 continue
             for period, df in months.items():
@@ -1010,6 +1331,20 @@ class ReportGenerator:
                 elif category == "ar":
                     required = [
                         ["往来单位名", "客户名", "客户"],
+                        ["借方金额", "金额", "外币借方金额"],
+                        ["贷方金额", "外币贷方金额"],
+                    ]
+                    self._check_required_columns(df, category, period, required)
+                elif category == "ap":
+                    required = [
+                        ["往来单位名", "供应商", "对应往来单位名"],
+                        ["借方金额", "金额", "外币借方金额"],
+                        ["贷方金额", "外币贷方金额"],
+                    ]
+                    self._check_required_columns(df, category, period, required)
+                elif category == "cash":
+                    required = [
+                        ["日期-号码", "日期", "Date"],
                         ["借方金额", "金额", "外币借方金额"],
                         ["贷方金额", "外币贷方金额"],
                     ]
@@ -1088,8 +1423,11 @@ class ReportGenerator:
                                 category, period, "科目缺失",
                                 f"{subj_col} 为空 {self._ratio_str(missing.sum(), len(df))}", severity="WARN"
                             )
-                if category in {"sales", "cost", "ar"}:
-                    customer_col = self._pick_first_column(df, ["往来单位名", "客户名", "客户", "收货公司", "供应商"])
+                if category in {"sales", "cost", "ar", "ap"}:
+                    customer_col = self._pick_ledger_column(
+                        df,
+                        ["往来单位名", "账页往来单位名", "客户名", "客户", "收货公司", "供应商", "对应往来单位名"],
+                    )
                     if customer_col:
                         missing = df[customer_col].isna() | (df[customer_col].astype(str).str.strip() == "")
                         if missing.mean() > 0.1:
@@ -1099,7 +1437,7 @@ class ReportGenerator:
                             )
 
                 # 借贷金额合理性
-                if category in {"expense", "ar"}:
+                if category in {"expense", "ar", "ap", "cash"}:
                     debit_col = self._pick_first_column(df, ["借方金额", "借方"])
                     credit_col = self._pick_first_column(df, ["贷方金额", "贷方"])
                     if debit_col and credit_col:
@@ -1138,6 +1476,8 @@ class ReportGenerator:
                             f"{col_name} 非数值 {self._ratio_str(invalid, total)}", severity="WARN"
                         )
                     if valid == 0:
+                        if self._is_optional_empty_numeric_column(category, col_name):
+                            continue
                         self._add_quality_issue(
                             category, period, "数值缺失",
                             f"{col_name} 无有效数值", severity="WARN"
@@ -1149,7 +1489,7 @@ class ReportGenerator:
                             category, period, "零值占比高",
                             f"{col_name} 为零 {self._ratio_str(zeros, valid)}", severity="WARN"
                         )
-                    if category in {"sales", "cost", "asset", "ar"} or (category == "expense"):
+                    if category in {"sales", "cost", "asset", "ar", "ap", "cash"} or (category == "expense"):
                         neg = (values < 0).sum()
                         if neg / valid > 0.02:
                             self._add_quality_issue(
@@ -1208,8 +1548,10 @@ class ReportGenerator:
                 # 关键字段重复
                 if key_cols:
                     key_col = key_cols[0]
-                    key_series = df[key_col].astype(str).str.strip()
-                    valid_keys = key_series[key_series != ""]
+                    key_series = df[key_col].fillna("").astype(str).str.strip()
+                    valid_keys = key_series[
+                        (~key_series.str.lower().isin(["", "nan", "none", "nat"]))
+                    ]
                     if not valid_keys.empty:
                         dup = valid_keys.duplicated().sum()
                         ratio = dup / len(valid_keys)
@@ -1797,13 +2139,124 @@ class ReportGenerator:
     def _month_key_to_label(self, month_key):
         return month_key.replace('-', '/')
 
+    def _month_key_to_history_label(self, month_key):
+        key = self._month_label_exact_to_key(month_key) or self._extract_month_key_from_text(month_key)
+        if not key:
+            return month_key
+        m = re.match(r'^(20\d{2})-(\d{1,2})$', str(key))
+        if not m:
+            return month_key
+        return f"{m.group(1)}.{int(m.group(2))}月"
+
+    def _history_chart_category_col(self, ws, cat_col, data_start, data_end, year_scope=None):
+        if year_scope is None:
+            year_scope = self.year_scope
+        if year_scope != "all" or not cat_col or data_end < data_start:
+            return cat_col
+        labels = []
+        already_history = True
+        for row in range(data_start, data_end + 1):
+            value = ws.cell(row=row, column=cat_col).value
+            if value is None or str(value).strip() == "":
+                labels.append(None)
+                continue
+            month_key = self._month_label_exact_to_key(value)
+            if not month_key:
+                return cat_col
+            history_label = self._month_key_to_history_label(month_key)
+            labels.append(history_label)
+            if str(value).strip() != history_label:
+                already_history = False
+        if not any(label for label in labels):
+            return cat_col
+        if already_history:
+            return cat_col
+
+        helper_col = ws.max_column + 1
+        header_row = max(1, data_start - 1)
+        ws.cell(row=header_row, column=helper_col).value = "图表月份"
+        for offset, label in enumerate(labels):
+            cell = ws.cell(row=data_start + offset, column=helper_col)
+            cell.value = label
+            cell.number_format = "@"
+        return helper_col
+
+    def _chart_category_reference(self, ws, cat_col, data_start, data_end, year_scope=None):
+        chart_cat_col = self._history_chart_category_col(ws, cat_col, data_start, data_end, year_scope)
+        return Reference(ws, min_col=chart_cat_col, min_row=data_start, max_row=data_end)
+
+    def _history_chart_category_reference_from_formula(self, wb, formula, year_scope=None):
+        if year_scope is None:
+            year_scope = self.year_scope
+        if year_scope != "all":
+            return None
+        parsed = self._parse_chart_range_formula(formula)
+        if not parsed:
+            return None
+        sheet_name, min_col, min_row, max_col, max_row = parsed
+        if sheet_name not in wb.sheetnames:
+            return None
+        ws = wb[sheet_name]
+        if min_col == max_col:
+            helper_col = self._history_chart_category_col(ws, min_col, min_row, max_row, year_scope)
+            if helper_col == min_col:
+                return None
+            return Reference(ws, min_col=helper_col, min_row=min_row, max_row=max_row)
+        if min_row != max_row:
+            return None
+
+        labels = []
+        already_history = True
+        for col in range(min_col, max_col + 1):
+            value = ws.cell(row=min_row, column=col).value
+            if value is None or str(value).strip() == "":
+                labels.append(None)
+                continue
+            month_key = self._month_label_exact_to_key(value)
+            if not month_key:
+                return None
+            history_label = self._month_key_to_history_label(month_key)
+            labels.append(history_label)
+            if str(value).strip() != history_label:
+                already_history = False
+        if not any(label for label in labels) or already_history:
+            return None
+
+        helper_row = ws.max_row + 1
+        for offset, label in enumerate(labels):
+            cell = ws.cell(row=helper_row, column=min_col + offset)
+            cell.value = label
+            cell.number_format = "@"
+        return Reference(ws, min_col=min_col, max_col=max_col, min_row=helper_row, max_row=helper_row)
+
+    def _rewrite_chart_month_categories_for_history(self, wb, year_scope=None):
+        if year_scope is None:
+            year_scope = self.year_scope
+        if year_scope != "all":
+            return 0
+        changed = 0
+        for ws in wb.worksheets:
+            for chart in getattr(ws, "_charts", []):
+                formula = self._chart_category_formula(chart)
+                ref = self._history_chart_category_reference_from_formula(wb, formula, year_scope)
+                if ref is None:
+                    continue
+                try:
+                    chart.set_categories(ref)
+                    changed += 1
+                except Exception:
+                    continue
+        if changed:
+            print(f"已转换历年图表月份标签: {changed}")
+        return changed
+
     def _month_key_to_period_label(self, month_key):
         return month_key.replace('-', '/') + '/01-' + month_key.replace('-', '/') + '/01'
 
     def _label_to_month_key(self, label):
         if not label:
             return None
-        m = re.search(r'(20\d{2})[/-](\d{1,2})', str(label))
+        m = re.search(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?', str(label))
         if not m:
             return None
         return f"{m.group(1)}-{int(m.group(2)):02d}"
@@ -1819,7 +2272,7 @@ class ReportGenerator:
         m = re.search(r'(20\d{2})\s*年\s*(\d{1,2})\s*月', s)
         if m:
             return f"{m.group(1)}-{int(m.group(2)):02d}"
-        m = re.search(r'(20\d{2})[/-](\d{1,2})', s)
+        m = re.search(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?', s)
         if m:
             return f"{m.group(1)}-{int(m.group(2)):02d}"
         return None
@@ -2076,7 +2529,7 @@ class ReportGenerator:
             header = ws.cell(row=header_row, column=col).value
             if not header:
                 continue
-            m = re.match(r'(20\d{2})[/-](\d{1,2})_', str(header).strip())
+            m = re.match(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?_', str(header).strip())
             if not m:
                 continue
             month_key = f"{m.group(1)}-{int(m.group(2)):02d}"
@@ -2353,6 +2806,7 @@ class ReportGenerator:
             cost = combined.get('cost')
             sales_expense = combined.get('sales_expense')
             admin_expense = combined.get('admin_expense')
+            financial_expense = combined.get('financial_expense')
             operating_profit = combined.get('operating_profit')
             inventory_start = combined.get('inventory_start')
             inventory_end = combined.get('inventory_end')
@@ -2377,6 +2831,8 @@ class ReportGenerator:
                     combined['sales_expense_rate'] = sales_expense / revenue
                 if admin_expense is not None:
                     combined['admin_expense_rate'] = admin_expense / revenue
+                if financial_expense is not None:
+                    combined['financial_expense_rate'] = financial_expense / revenue
                 if operating_profit is not None:
                     combined['operating_profit_rate'] = operating_profit / revenue
                 if combined.get('net_profit') is not None:
@@ -2410,6 +2866,9 @@ class ReportGenerator:
             header = ws.cell(row=1, column=col).value
             if header:
                 header_map[str(header).strip()] = col
+        for required_header in ("财务费用", "财务费用率"):
+            if required_header not in header_map:
+                header_map[required_header] = self._ensure_header_column(ws, required_header)
 
         month_rows = {}
         non_month_rows = []
@@ -2454,6 +2913,7 @@ class ReportGenerator:
                 '主营业务成本': 'cost',
                 '销售费用': 'sales_expense',
                 '管理费用': 'admin_expense',
+                '财务费用': 'financial_expense',
                 '营业利润': 'operating_profit',
                 '净利润': 'net_profit',
                 '应收账款余额': 'ar_balance',
@@ -2463,6 +2923,7 @@ class ReportGenerator:
                 '主营业务成本率': 'cost_rate',
                 '销售费用率': 'sales_expense_rate',
                 '管理费用率': 'admin_expense_rate',
+                '财务费用率': 'financial_expense_rate',
                 '营业利润率': 'operating_profit_rate',
                 '存货周转天数': 'inventory_turnover_days',
             }
@@ -2480,6 +2941,7 @@ class ReportGenerator:
             ("主营业务成本", "cost"),
             ("销售费用", "sales_expense"),
             ("管理费用", "admin_expense"),
+            ("财务费用", "financial_expense"),
             ("营业利润", "operating_profit"),
         ]
         compare_cols = {}
@@ -2541,6 +3003,7 @@ class ReportGenerator:
             cost_total = self._safe_sum([m.get("cost") for m in month_metrics])
             sales_total = self._safe_sum([m.get("sales_expense") for m in month_metrics])
             admin_total = self._safe_sum([m.get("admin_expense") for m in month_metrics])
+            financial_total = self._safe_sum([m.get("financial_expense") for m in month_metrics])
             op_total = self._safe_sum([m.get("operating_profit") for m in month_metrics])
             net_total = self._safe_sum([m.get("net_profit") for m in month_metrics])
 
@@ -2555,6 +3018,7 @@ class ReportGenerator:
             cost_rate = (cost_total / revenue_total) if (revenue_total not in (None, 0) and cost_total is not None) else None
             sales_rate = (sales_total / revenue_total) if (revenue_total not in (None, 0) and sales_total is not None) else None
             admin_rate = (admin_total / revenue_total) if (revenue_total not in (None, 0) and admin_total is not None) else None
+            financial_rate = (financial_total / revenue_total) if (revenue_total not in (None, 0) and financial_total is not None) else None
             op_rate = (op_total / revenue_total) if (revenue_total not in (None, 0) and op_total is not None) else None
 
             inv_days = None
@@ -2572,6 +3036,7 @@ class ReportGenerator:
                 "主营业务成本": cost_total,
                 "销售费用": sales_total,
                 "管理费用": admin_total,
+                "财务费用": financial_total,
                 "营业利润": op_total,
                 "净利润": net_total,
                 "应收账款余额": ar_last,
@@ -2581,6 +3046,7 @@ class ReportGenerator:
                 "主营业务成本率": cost_rate,
                 "销售费用率": sales_rate,
                 "管理费用率": admin_rate,
+                "财务费用率": financial_rate,
                 "营业利润率": op_rate,
                 "存货周转天数": inv_days,
             }
@@ -2606,6 +3072,9 @@ class ReportGenerator:
             header = ws.cell(row=1, column=col).value
             if header:
                 header_map[str(header).strip()] = col
+        for required_header in ("财务费用", "财务费用占比"):
+            if required_header not in header_map:
+                header_map[required_header] = self._ensure_header_column(ws, required_header)
         month_rows = {}
         non_month_rows = []
         for r in range(2, ws.max_row + 1):
@@ -2646,6 +3115,7 @@ class ReportGenerator:
             cost = data.get('cost')
             sales_expense = data.get('sales_expense')
             admin_expense = data.get('admin_expense')
+            financial_expense = data.get('financial_expense')
             operating_profit = data.get('operating_profit')
             if '主营业务收入' in header_map:
                 ws.cell(row=r, column=header_map['主营业务收入']).value = revenue
@@ -2655,6 +3125,8 @@ class ReportGenerator:
                 ws.cell(row=r, column=header_map['销售费用']).value = sales_expense
             if '管理费用' in header_map:
                 ws.cell(row=r, column=header_map['管理费用']).value = admin_expense
+            if '财务费用' in header_map:
+                ws.cell(row=r, column=header_map['财务费用']).value = financial_expense
             if '营业利润' in header_map:
                 ws.cell(row=r, column=header_map['营业利润']).value = operating_profit
             if revenue is not None and revenue != 0:
@@ -2664,6 +3136,8 @@ class ReportGenerator:
                     ws.cell(row=r, column=header_map['销售费用占比']).value = sales_expense / revenue
                 if '管理费用占比' in header_map and admin_expense is not None:
                     ws.cell(row=r, column=header_map['管理费用占比']).value = admin_expense / revenue
+                if '财务费用占比' in header_map and financial_expense is not None:
+                    ws.cell(row=r, column=header_map['财务费用占比']).value = financial_expense / revenue
 
         if target_year and target_month:
             for m_label, r in month_rows.items():
@@ -2687,6 +3161,7 @@ class ReportGenerator:
             cost_total = self._safe_sum([m.get("cost") for m in month_metrics])
             sales_total = self._safe_sum([m.get("sales_expense") for m in month_metrics])
             admin_total = self._safe_sum([m.get("admin_expense") for m in month_metrics])
+            financial_total = self._safe_sum([m.get("financial_expense") for m in month_metrics])
             op_total = self._safe_sum([m.get("operating_profit") for m in month_metrics])
 
             write_map = {
@@ -2694,10 +3169,12 @@ class ReportGenerator:
                 "主营业务成本": cost_total,
                 "销售费用": sales_total,
                 "管理费用": admin_total,
+                "财务费用": financial_total,
                 "营业利润": op_total,
                 "主营业务成本占比": (cost_total / revenue_total) if (revenue_total not in (None, 0) and cost_total is not None) else None,
                 "销售费用占比": (sales_total / revenue_total) if (revenue_total not in (None, 0) and sales_total is not None) else None,
                 "管理费用占比": (admin_total / revenue_total) if (revenue_total not in (None, 0) and admin_total is not None) else None,
+                "财务费用占比": (financial_total / revenue_total) if (revenue_total not in (None, 0) and financial_total is not None) else None,
             }
             if '部门' in header_map:
                 self._safe_set_cell_value(ws, summary_row, header_map['部门'], '合计')
@@ -2721,8 +3198,38 @@ class ReportGenerator:
             '主营业务成本': 'cost',
             '销售费用': 'sales_expense',
             '管理费用': 'admin_expense',
+            '财务费用': 'financial_expense',
             '营业利润': 'operating_profit',
         }
+
+        month_col = header_map.get("月份")
+        indicator_col = header_map.get("指标")
+        dept_col = header_map.get("部门")
+        if month_col and indicator_col:
+            scoped_months = self._filter_month_keys(metrics_by_month.keys(), target_year, target_month, year_scope)
+            existing_pairs = set()
+            for r in range(2, ws.max_row + 1):
+                m_key = self._label_to_month_key(ws.cell(row=r, column=month_col).value)
+                indicator = ws.cell(row=r, column=indicator_col).value
+                if not m_key or not indicator:
+                    continue
+                existing_pairs.add((m_key, self._normalize_label(indicator)))
+            for label in ("财务费用",):
+                norm_label = self._normalize_label(label)
+                for m_key in scoped_months:
+                    if (m_key, norm_label) in existing_pairs:
+                        continue
+                    row = ws.max_row + 1
+                    src_row = row - 1 if row > 2 else 2
+                    if 1 <= src_row <= ws.max_row:
+                        self._copy_row_style(ws, src_row, row)
+                    for c in range(1, ws.max_column + 1):
+                        self._safe_set_cell_value(ws, row, c, None)
+                    ws.cell(row=row, column=month_col).value = self._month_key_to_label(m_key)
+                    ws.cell(row=row, column=indicator_col).value = label
+                    if dept_col:
+                        ws.cell(row=row, column=dept_col).value = "合计"
+                    existing_pairs.add((m_key, norm_label))
 
         for r in range(2, ws.max_row + 1):
             m_val = ws.cell(row=r, column=1).value
@@ -2808,6 +3315,7 @@ class ReportGenerator:
             ("主营业务成本", "cost"),
             ("销售费用", "sales_expense"),
             ("管理费用", "admin_expense"),
+            ("财务费用", "financial_expense"),
             ("营业利润", "operating_profit"),
         ]
 
@@ -3202,7 +3710,7 @@ class ReportGenerator:
     def _normalize_month_label(self, label):
         if not label:
             return None
-        m = re.search(r'(20\d{2})[/-](\d{1,2})', str(label))
+        m = re.search(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?', str(label))
         if not m:
             return None
         return f"{m.group(1)}/{int(m.group(2)):02d}"
@@ -3402,7 +3910,7 @@ class ReportGenerator:
                 header = ws.cell(row=1, column=col).value
                 if not header:
                     continue
-                m = re.match(r'(20\d{2})[/-](\d{1,2})_(.+)', str(header))
+                m = re.match(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?_(.+)', str(header))
                 if not m:
                     continue
                 label = f"{m.group(1)}/{int(m.group(2)):02d}"
@@ -3444,7 +3952,7 @@ class ReportGenerator:
                 header = ws.cell(row=1, column=col).value
                 if not header:
                     continue
-                m = re.match(r'(20\d{2})[/-](\d{1,2})_(.+)', str(header))
+                m = re.match(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?_(.+)', str(header))
                 if not m:
                     continue
                 label = f"{m.group(1)}/{int(m.group(2)):02d}"
@@ -3501,7 +4009,7 @@ class ReportGenerator:
             header = ws.cell(row=header_row, column=col).value
             if not header:
                 continue
-            m = re.match(r'(20\d{2})[/-](\d{1,2})_(.+)', str(header))
+            m = re.match(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?_(.+)', str(header))
             if not m:
                 continue
             label = f"{m.group(1)}/{int(m.group(2)):02d}"
@@ -3540,7 +4048,7 @@ class ReportGenerator:
             header = ws.cell(row=header_row, column=col).value
             if not header:
                 continue
-            m = re.match(r'^(20\d{2})[/-](\d{1,2})$', str(header))
+            m = re.match(r'^(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?$', str(header))
             if not m:
                 continue
             label = f"{m.group(1)}/{int(m.group(2)):02d}"
@@ -3571,7 +4079,7 @@ class ReportGenerator:
             header = ws.cell(row=header_row, column=col).value
             if not header:
                 continue
-            m = re.match(r'(20\d{2})[/-](\d{1,2})_(.+)', str(header))
+            m = re.match(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?_(.+)', str(header))
             if not m:
                 continue
             label = f"{m.group(1)}/{int(m.group(2)):02d}"
@@ -3610,7 +4118,7 @@ class ReportGenerator:
         s = str(label).strip()
         if not s:
             return None
-        m = re.match(r'^(20\d{2})[/-](\d{1,2})$', s)
+        m = re.match(r'^(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?$', s)
         if m:
             return f"{m.group(1)}-{int(m.group(2)):02d}"
         m = re.match(r'^(20\d{2})\s*年\s*(\d{1,2})\s*月$', s)
@@ -3812,12 +4320,7 @@ class ReportGenerator:
                 max_row=data_end_row,
             )
             chart.add_data(data_ref, titles_from_data=True)
-        cats_ref = Reference(
-            ws,
-            min_col=cat_col,
-            min_row=data_start_row,
-            max_row=data_end_row,
-        )
+        cats_ref = self._chart_category_reference(ws, cat_col, data_start_row, data_end_row)
         chart.set_categories(cats_ref)
         chart.height = 8
         chart.width = 18
@@ -3834,12 +4337,7 @@ class ReportGenerator:
             min_row=start_row,
             max_row=end_row,
         )
-        cats_ref = Reference(
-            ws,
-            min_col=start_col,
-            min_row=start_row + 1,
-            max_row=end_row,
-        )
+        cats_ref = self._chart_category_reference(ws, start_col, start_row + 1, end_row)
         chart.add_data(data_ref, titles_from_data=True)
         chart.set_categories(cats_ref)
         chart.height = 8
@@ -3859,7 +4357,7 @@ class ReportGenerator:
         bar_chart.y_axis.title = "金额"
         bar_chart.x_axis.title = "月份"
         
-        cats_ref = Reference(ws, min_col=cat_col, min_row=data_start, max_row=data_end)
+        cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
         bar_chart.set_categories(cats_ref)
 
         for col in bar_cols:
@@ -3894,7 +4392,7 @@ class ReportGenerator:
         chart.overlap = 100
         chart.title = title
         
-        cats_ref = Reference(ws, min_col=cat_col, min_row=data_start, max_row=data_end)
+        cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
         chart.set_categories(cats_ref)
 
         for col in data_cols:
@@ -4261,10 +4759,10 @@ class ReportGenerator:
         data_end = self._find_last_row_by_column(ws, cat_col, data_start)
         if data_end < data_start:
             return False
-        preferred = ["主营业务成本占比", "销售费用占比", "管理费用占比"]
+        preferred = ["主营业务成本占比", "销售费用占比", "管理费用占比", "财务费用占比"]
         series_cols = self._pick_existing_columns(header_map, preferred)
         if not series_cols:
-            preferred = ["主营业务成本", "销售费用", "管理费用"]
+            preferred = ["主营业务成本", "销售费用", "管理费用", "财务费用"]
             series_cols = self._pick_existing_columns(header_map, preferred)
         if not series_cols:
             return False
@@ -4281,7 +4779,7 @@ class ReportGenerator:
             anchor,
         )
         if added:
-            self._write_chart_note(ws, anchor_col, 1, "图表说明：成本/销售/管理费用占比的月度变化。")
+            self._write_chart_note(ws, anchor_col, 1, "图表说明：成本、销售、管理、财务费用占比的月度变化。")
         return added
 
     def _add_chart_cvp(self, ws):
@@ -4323,7 +4821,7 @@ class ReportGenerator:
         margin_chart.y_axis.title = "金额"
         margin_chart.x_axis.title = "月份"
         
-        cats_ref = Reference(ws, min_col=cat_col, min_row=data_start, max_row=data_end)
+        cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
         margin_chart.set_categories(cats_ref)
         
         # Add Revenue
@@ -4365,6 +4863,7 @@ class ReportGenerator:
             "成本率目标",
             "销售费用率目标",
             "管理费用率目标",
+            "财务费用率目标",
             "应收账款余额目标",
             "存货期末余额目标",
         ]
@@ -4414,7 +4913,7 @@ class ReportGenerator:
             data.setdefault(indicator, {})[month] = value
         if not months or not data:
             return False
-        preferred = ["主营业务收入", "主营业务成本", "销售费用", "管理费用", "营业利润"]
+        preferred = ["主营业务收入", "主营业务成本", "销售费用", "管理费用", "财务费用", "营业利润"]
         indicators = [name for name in preferred if name in data]
         if not indicators:
             indicators = list(data.keys())[:3]
@@ -4700,7 +5199,7 @@ class ReportGenerator:
         month_cols = []
         for col in range(1, ws.max_column + 1):
             header = ws.cell(row=header_row, column=col).value
-            if isinstance(header, str) and re.match(r"20\d{2}[/\-]\d{2}", header):
+            if isinstance(header, str) and re.match(r"20\d{2}[./\-]\d{1,2}\s*月?", header):
                 month_cols.append((col, header))
         if len(month_cols) < 2:
             return False
@@ -4953,6 +5452,13 @@ class ReportGenerator:
                 break
         if header_row:
             header_map = self._get_header_map(ws, header_row)
+
+            def read_target_value(row_idx, header_name):
+                col_idx = header_map.get(header_name)
+                if not col_idx or col_idx < 1:
+                    return None
+                return self._to_float(ws.cell(row=row_idx, column=col_idx).value)
+
             for r in range(header_row + 1, ws.max_row + 1):
                 label = ws.cell(row=r, column=1).value
                 if not label:
@@ -4961,14 +5467,15 @@ class ReportGenerator:
                 if not month_key:
                     continue
                 targets[month_key] = {
-                    "revenue": self._to_float(ws.cell(row=r, column=header_map.get("主营业务收入目标", 0)).value),
-                    "profit": self._to_float(ws.cell(row=r, column=header_map.get("营业利润目标", 0)).value),
-                    "profit_rate": self._to_float(ws.cell(row=r, column=header_map.get("营业利润率目标", 0)).value),
-                    "cost_rate": self._to_float(ws.cell(row=r, column=header_map.get("成本率目标", 0)).value),
-                    "sales_rate": self._to_float(ws.cell(row=r, column=header_map.get("销售费用率目标", 0)).value),
-                    "admin_rate": self._to_float(ws.cell(row=r, column=header_map.get("管理费用率目标", 0)).value),
-                    "ar_balance": self._to_float(ws.cell(row=r, column=header_map.get("应收账款余额目标", 0)).value),
-                    "inventory_end": self._to_float(ws.cell(row=r, column=header_map.get("存货期末余额目标", 0)).value),
+                    "revenue": read_target_value(r, "主营业务收入目标"),
+                    "profit": read_target_value(r, "营业利润目标"),
+                    "profit_rate": read_target_value(r, "营业利润率目标"),
+                    "cost_rate": read_target_value(r, "成本率目标"),
+                    "sales_rate": read_target_value(r, "销售费用率目标"),
+                    "admin_rate": read_target_value(r, "管理费用率目标"),
+                    "financial_rate": read_target_value(r, "财务费用率目标"),
+                    "ar_balance": read_target_value(r, "应收账款余额目标"),
+                    "inventory_end": read_target_value(r, "存货期末余额目标"),
                 }
 
         for r in range(1, min(ws.max_row, 50) + 1):
@@ -5298,6 +5805,229 @@ class ReportGenerator:
 
         self._reorder_month_rows_desc(ws)
 
+    def _pick_ledger_column(self, df, preferred, exclude_keywords=None):
+        if df is None or df.empty:
+            return None
+        for name in preferred:
+            for col in df.columns:
+                if str(col).strip() == name:
+                    return col
+        return self._pick_first_column(df, preferred, exclude_keywords)
+
+    def _pick_ledger_amount_column(self, df, keyword):
+        if df is None or df.empty:
+            return None
+        for col in df.columns:
+            if str(col).strip() == keyword:
+                return col
+        for col in df.columns:
+            name = str(col).strip()
+            if keyword in name and "外币" not in name:
+                return col
+        for col in df.columns:
+            if keyword in str(col):
+                return col
+        return None
+
+    def _last_numeric_or_none(self, series):
+        if series is None:
+            return None
+        values = pd.to_numeric(series, errors="coerce").dropna()
+        if values.empty:
+            return None
+        return float(values.iloc[-1])
+
+    def _prepare_ledger_detail_df(self, df):
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        work = df.copy()
+        work.columns = [str(c).strip().rstrip('\t') for c in work.columns]
+        for col in work.columns:
+            if work[col].dtype == object:
+                work[col] = work[col].apply(lambda v: v.strip().replace('\t', '') if isinstance(v, str) else v)
+
+        if "ParsedDate" in work.columns:
+            parsed = pd.to_datetime(work["ParsedDate"], errors="coerce")
+        else:
+            _, parsed = self._pick_best_date_column(
+                work, ["日期", "date", "业务日期", "单据日期", "日期-号码"]
+            )
+        if parsed is None:
+            return pd.DataFrame()
+
+        work["ParsedDate"] = parsed
+        work = work.dropna(subset=["ParsedDate"]).copy()
+        if work.empty:
+            return work
+        work["MonthStr"] = work["ParsedDate"].dt.strftime("%Y-%m")
+
+        debit_col = self._pick_ledger_amount_column(work, "借方金额") or self._pick_ledger_amount_column(work, "借方")
+        credit_col = self._pick_ledger_amount_column(work, "贷方金额") or self._pick_ledger_amount_column(work, "贷方")
+        balance_col = self._pick_ledger_amount_column(work, "余额")
+        summary_col = self._pick_ledger_column(work, ["摘要", "说明", "用途"])
+        party_col = self._pick_ledger_column(
+            work,
+            ["往来单位名", "对应往来单位名", "供应商名", "客户名", "供应商", "客户", "单位名", "收货公司"],
+        )
+        subject_col = self._pick_ledger_column(work, ["相对科目编码名", "科目名", "对方科目", "账户名"])
+
+        work["Debit"] = pd.to_numeric(work[debit_col], errors="coerce") if debit_col else 0.0
+        work["Credit"] = pd.to_numeric(work[credit_col], errors="coerce") if credit_col else 0.0
+        work["Balance"] = pd.to_numeric(work[balance_col], errors="coerce") if balance_col else None
+        work["SummaryText"] = work[summary_col].astype(str).str.strip() if summary_col else ""
+        work["Counterparty"] = work[party_col].astype(str).str.strip() if party_col else ""
+        work["SubjectName"] = work[subject_col].astype(str).str.strip() if subject_col else ""
+        work["Counterparty"] = work["Counterparty"].replace({"nan": "", "None": ""})
+        work["SubjectName"] = work["SubjectName"].replace({"nan": "", "None": ""})
+        work["SummaryText"] = work["SummaryText"].replace({"nan": "", "None": ""})
+        return work
+
+    def _ledger_group_label(self, row, prefer_counterparty=True):
+        labels = []
+        if prefer_counterparty:
+            labels = [row.get("Counterparty"), row.get("SubjectName"), row.get("SummaryText")]
+        else:
+            labels = [row.get("SubjectName"), row.get("Counterparty"), row.get("SummaryText")]
+        for label in labels:
+            if label is not None and str(label).strip() and str(label).strip().lower() != "nan":
+                return str(label).strip()
+        return "未识别"
+
+    def _update_ap_analysis_sheet(self, wb, metrics_by_month, target_year, target_month, year_scope=None):
+        ws = self._prepare_sheet(wb, "应付账款分析", insert_after="资金链预警")
+        df = self._prepare_ledger_detail_df(self.ap_detail_df)
+        if df.empty:
+            self._write_table(ws, 1, 1, ["提示"], [["未检测到应付账款明细文件"]])
+            return
+
+        df = self._filter_df_by_scope(df, target_year, target_month, year_scope)
+        if df.empty:
+            self._write_table(ws, 1, 1, ["提示"], [["当前口径下无应付账款明细"]])
+            return
+
+        month_keys = self._filter_month_keys(
+            set(metrics_by_month.keys()) | set(df["MonthStr"].dropna().astype(str).unique()),
+            target_year,
+            target_month,
+            year_scope,
+        )
+        headers = ["月份", "借方发生额", "贷方发生额", "应付净增加", "明细期末余额", "余额绝对值", "报表应付账款余额", "明细覆盖率"]
+        rows = []
+        for m_key in month_keys:
+            group = df[df["MonthStr"] == m_key].sort_values("ParsedDate")
+            debit = self._sum_numeric_or_none(group.get("Debit")) if not group.empty else None
+            credit = self._sum_numeric_or_none(group.get("Credit")) if not group.empty else None
+            net_increase = ((credit or 0) - (debit or 0)) if (debit is not None or credit is not None) else None
+            ending = self._last_numeric_or_none(group.get("Balance")) if not group.empty else None
+            ending_abs = abs(ending) if ending is not None else None
+            statement_ap = (metrics_by_month.get(m_key) or {}).get("ap_balance")
+            coverage = (ending_abs / statement_ap) if (ending_abs is not None and statement_ap not in (None, 0)) else None
+            rows.append([
+                self._month_key_to_label(m_key),
+                debit,
+                credit,
+                net_increase,
+                ending,
+                ending_abs,
+                statement_ap,
+                coverage,
+            ])
+
+        self._write_table(ws, 1, 1, headers, rows or [[None] * len(headers)])
+        if rows:
+            self._add_line_chart_by_columns(ws, 1, [2, 3, 6], 1, 2, 1 + len(rows), "应付账款发生额与余额", f"{get_column_letter(len(headers) + 2)}2")
+
+        summary = []
+        df = df.copy()
+        df["_GroupLabel"] = df.apply(lambda row: self._ledger_group_label(row, prefer_counterparty=True), axis=1)
+        for label, group in df.groupby("_GroupLabel"):
+            debit = self._sum_numeric_or_none(group.get("Debit"))
+            credit = self._sum_numeric_or_none(group.get("Credit"))
+            net_increase = ((credit or 0) - (debit or 0)) if (debit is not None or credit is not None) else None
+            ending = self._last_numeric_or_none(group.sort_values("ParsedDate").get("Balance"))
+            latest_date = group["ParsedDate"].max()
+            summary.append([
+                label,
+                int(len(group)),
+                debit,
+                credit,
+                net_increase,
+                ending,
+                abs(ending) if ending is not None else None,
+                latest_date.strftime("%Y-%m-%d") if pd.notna(latest_date) else None,
+            ])
+        summary.sort(key=lambda r: abs(r[6] if r[6] is not None else (r[4] or 0)), reverse=True)
+        start_row = len(rows) + 4
+        summary_headers = ["供应商/对象", "交易笔数", "借方发生额", "贷方发生额", "应付净增加", "期末余额", "余额绝对值", "最近交易日"]
+        self._write_table(ws, start_row, 1, summary_headers, summary[:50] or [[None] * len(summary_headers)])
+        if summary:
+            chart_col = len(summary_headers) + 2
+            chart_rows = [[r[0], r[6]] for r in summary[:10]]
+            self._write_table(ws, start_row, chart_col, ["供应商/对象", "余额绝对值"], chart_rows)
+            self._add_bar_chart_from_table(ws, start_row, chart_col, start_row + len(chart_rows), "应付余额Top", f"{get_column_letter(chart_col + 3)}{start_row + 1}")
+        self._write_chart_note(ws, 1, start_row + min(len(summary), 50) + 3, "说明：明细覆盖率=已导入应付明细余额绝对值/资产负债表应付账款余额；未导入全部供应商明细时该比例可能低于100%。")
+
+    def _update_cash_balance_analysis_sheet(self, wb, metrics_by_month, target_year, target_month, year_scope=None):
+        ws = self._prepare_sheet(wb, "货币资金分析", insert_after="现金流量表(估算)")
+        df = self._prepare_ledger_detail_df(self.cash_detail_df)
+        month_keys = set(metrics_by_month.keys())
+        if not df.empty:
+            df = self._filter_df_by_scope(df, target_year, target_month, year_scope)
+            month_keys.update(df["MonthStr"].dropna().astype(str).unique())
+        month_keys = self._filter_month_keys(month_keys, target_year, target_month, year_scope)
+
+        if not month_keys:
+            self._write_table(ws, 1, 1, ["提示"], [["未检测到货币资金明细或资产负债表货币资金数据"]])
+            return
+
+        headers = ["月份", "明细借方/流入", "明细贷方/流出", "明细净流入", "明细期末余额", "报表货币资金", "明细覆盖率", "差异"]
+        rows = []
+        for m_key in month_keys:
+            group = df[df["MonthStr"] == m_key].sort_values("ParsedDate") if not df.empty else pd.DataFrame()
+            debit = self._sum_numeric_or_none(group.get("Debit")) if not group.empty else None
+            credit = self._sum_numeric_or_none(group.get("Credit")) if not group.empty else None
+            net = ((debit or 0) - (credit or 0)) if (debit is not None or credit is not None) else None
+            ending = self._last_numeric_or_none(group.get("Balance")) if not group.empty else None
+            statement_cash = (metrics_by_month.get(m_key) or {}).get("cash")
+            coverage = (ending / statement_cash) if (ending is not None and statement_cash not in (None, 0)) else None
+            diff = (statement_cash - ending) if (statement_cash is not None and ending is not None) else None
+            rows.append([
+                self._month_key_to_label(m_key),
+                debit,
+                credit,
+                net,
+                ending,
+                statement_cash,
+                coverage,
+                diff,
+            ])
+
+        self._write_table(ws, 1, 1, headers, rows)
+        self._add_line_chart_by_columns(ws, 1, [4, 5, 6], 1, 2, 1 + len(rows), "货币资金余额与净流入", f"{get_column_letter(len(headers) + 2)}2")
+
+        if not df.empty:
+            df = df.copy()
+            df["_GroupLabel"] = df.apply(lambda row: self._ledger_group_label(row, prefer_counterparty=False), axis=1)
+            groups = []
+            for label, group in df.groupby("_GroupLabel"):
+                inflow = self._sum_numeric_or_none(group.get("Debit"))
+                outflow = self._sum_numeric_or_none(group.get("Credit"))
+                net = ((inflow or 0) - (outflow or 0)) if (inflow is not None or outflow is not None) else None
+                groups.append([label, int(len(group)), inflow, outflow, net])
+            groups.sort(key=lambda r: abs(r[3] if r[3] is not None else (r[4] or 0)), reverse=True)
+            start_row = len(rows) + 4
+            group_headers = ["科目/对象", "交易笔数", "流入", "流出", "净流入"]
+            self._write_table(ws, start_row, 1, group_headers, groups[:50] or [[None] * len(group_headers)])
+            if groups:
+                chart_col = len(group_headers) + 2
+                chart_rows = [[r[0], r[3]] for r in groups[:10]]
+                self._write_table(ws, start_row, chart_col, ["科目/对象", "流出"], chart_rows)
+                self._add_bar_chart_from_table(ws, start_row, chart_col, start_row + len(chart_rows), "货币资金流出Top", f"{get_column_letter(chart_col + 3)}{start_row + 1}")
+            self._write_chart_note(ws, 1, start_row + min(len(groups), 50) + 3, "说明：货币资金明细覆盖率=已导入银行/现金明细期末余额/资产负债表货币资金；只导入部分账户时该比例用于识别覆盖缺口。")
+        else:
+            self._write_chart_note(ws, 1, len(rows) + 3, "说明：未导入银行存款/现金明细，本页仅展示资产负债表货币资金余额。")
+
     def _update_budget_variance_sheet(self, wb, metrics_by_month, target_year, target_month, year_scope=None):
         ws = self._prepare_sheet(wb, "预算执行与偏差", insert_after="目标_预算")
         targets, (attain_green, attain_yellow), _ = self._read_budget_targets(wb)
@@ -5316,8 +6046,10 @@ class ReportGenerator:
             cost_rate = data.get("cost_rate")
             sales_expense = data.get("sales_expense")
             admin_expense = data.get("admin_expense")
+            financial_expense = data.get("financial_expense")
             sales_rate = sales_expense / revenue if (sales_expense is not None and revenue not in (None, 0)) else None
             admin_rate = admin_expense / revenue if (admin_expense is not None and revenue not in (None, 0)) else None
+            financial_rate = financial_expense / revenue if (financial_expense is not None and revenue not in (None, 0)) else None
             
             if m_key == current_month_key:
                 tgt_rev = targets.get(m_key, {}).get("revenue")
@@ -5341,6 +6073,7 @@ class ReportGenerator:
                 ("成本率", "cost_rate", cost_rate),
                 ("销售费用率", "sales_rate", sales_rate),
                 ("管理费用率", "admin_rate", admin_rate),
+                ("财务费用率", "financial_rate", financial_rate),
                 ("应收账款余额", "ar_balance", data.get("ar_balance")),
                 ("存货期末余额", "inventory_end", data.get("inventory_end")),
             ]
@@ -5808,6 +6541,301 @@ class ReportGenerator:
 
         self._reorder_month_rows_desc(ws)
 
+    def _bool_param(self, value, default=True):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "手动", "manual"}:
+            return True
+        if text in {"0", "false", "no", "n", "自动", "auto"}:
+            return False
+        return default
+
+    def _clamp_int_param(self, value, default, min_value, max_value):
+        numeric = self._to_float(value)
+        if numeric is None:
+            numeric = default
+        numeric = int(round(numeric))
+        return max(min_value, min(max_value, numeric))
+
+    def _clamp_float_param(self, value, default, min_value, max_value, digits=1):
+        numeric = self._to_float(value)
+        if numeric is None:
+            numeric = default
+        numeric = max(min_value, min(max_value, float(numeric)))
+        return round(numeric, digits)
+
+    def _percentile_or_none(self, values, percentile):
+        valid = [self._to_float(v) for v in values]
+        valid = [v for v in valid if v is not None]
+        if not valid:
+            return None
+        return float(pd.Series(valid, dtype="float64").quantile(percentile))
+
+    def _latest_cost_month_key(self, target_year=None, target_month=None, year_scope=None):
+        month_keys = self._filter_month_keys(self.data.get("cost", {}).keys(), target_year, target_month, year_scope)
+        return month_keys[-1] if month_keys else None
+
+    def _cash_detail_balance_by_month(self, target_year=None, target_month=None, year_scope=None):
+        df = self._prepare_ledger_detail_df(self.cash_detail_df)
+        if df.empty:
+            return {}
+        df = self._filter_df_by_scope(df, target_year, target_month, year_scope)
+        if df.empty:
+            return {}
+        result = {}
+        for m_key, group in df.groupby("MonthStr"):
+            ending = self._last_numeric_or_none(group.sort_values("ParsedDate").get("Balance"))
+            if ending is not None:
+                result[str(m_key)] = ending
+        return result
+
+    def _cost_inventory_amount_by_month(self, target_year=None, target_month=None, year_scope=None):
+        result = {}
+        month_keys = self._filter_month_keys(self.data.get("cost", {}).keys(), target_year, target_month, year_scope)
+        for m_key in month_keys:
+            cost_map = self._build_cost_inventory_map(self.data.get("cost", {}).get(m_key), m_key)
+            amount = self._safe_sum([item.get("amt_end") for item in cost_map.values()])
+            if amount is not None:
+                result[str(m_key)] = amount
+        return result
+
+    def _infer_replenishment_warning_params(self, target_year, target_month, year_scope=None, fallback=None):
+        fallback = fallback or {}
+        params = {
+            "lead_days": self._clamp_int_param(fallback.get("lead_days"), 30, 1, 365),
+            "safety_days": self._clamp_int_param(fallback.get("safety_days"), 20, 0, 180),
+            "window_months": self._clamp_int_param(fallback.get("window_months"), 3, 1, 12),
+        }
+        notes = []
+
+        sales_df = self._get_sales_df()
+        if sales_df is None or sales_df.empty:
+            return params, "自动分析缺少销售数据，沿用默认补货参数"
+
+        sales_df = sales_df.copy()
+        if "MonthStr" not in sales_df.columns:
+            date_col = next((c for c in sales_df.columns if "日期" in str(c) or "Date" in str(c)), None)
+            if date_col:
+                sales_df["ParsedDate"] = pd.to_datetime(sales_df[date_col], errors="coerce")
+                sales_df["MonthStr"] = sales_df["ParsedDate"].dt.strftime("%Y-%m")
+        if "MonthStr" not in sales_df.columns or "品目编码" not in sales_df.columns or "数量" not in sales_df.columns:
+            return params, "自动分析缺少销售月份、品目编码或数量字段，沿用默认补货参数"
+
+        sales_df["Qty"] = pd.to_numeric(sales_df.get("数量"), errors="coerce")
+        sales_df = sales_df[sales_df["Qty"].notna()].copy()
+        sales_df = self._filter_df_by_scope(sales_df, target_year, target_month, year_scope)
+        if sales_df.empty:
+            return params, "自动分析当前口径下无销售数据，沿用默认补货参数"
+
+        available_months = sorted(sales_df["MonthStr"].dropna().astype(str).unique())
+        if available_months:
+            params["window_months"] = max(1, min(3, len(available_months)))
+            notes.append(f"销量窗口取最近{params['window_months']}个月")
+
+        cost_key = f"{target_year}-{int(target_month):02d}" if target_year and target_month else None
+        cost_df = self.data.get("cost", {}).get(cost_key)
+        if cost_df is None or cost_df.empty:
+            cost_key = self._latest_cost_month_key(target_year, target_month, year_scope)
+            cost_df = self.data.get("cost", {}).get(cost_key) if cost_key else None
+
+        coverage_days = []
+        volatility_values = []
+        if cost_df is not None and not cost_df.empty:
+            code_col = self._find_cost_col_contains(cost_df, "品目编码")
+            q_end_col = self._find_cost_col_suffix(cost_df, "期末")
+            if code_col and q_end_col:
+                window_keys = [
+                    m for m in self._last_n_month_keys(target_year, target_month, params["window_months"])
+                    if m in available_months
+                ]
+                if not window_keys:
+                    window_keys = available_months[-params["window_months"]:]
+                total_days = sum(self._month_days(m) for m in window_keys) or 30 * len(window_keys)
+                recent_sales = sales_df[sales_df["MonthStr"].isin(window_keys)].copy()
+                qty_by_code = recent_sales.groupby("品目编码")["Qty"].sum().to_dict()
+                for _, row in cost_df.iterrows():
+                    code = row.get(code_col)
+                    if code is None or pd.isna(code):
+                        continue
+                    code = str(code).strip()
+                    qty_sold = qty_by_code.get(code)
+                    inv_qty = self._to_float(row.get(q_end_col))
+                    if qty_sold is None or inv_qty is None or qty_sold <= 0 or total_days <= 0:
+                        continue
+                    avg_daily = qty_sold / total_days
+                    if avg_daily > 0:
+                        coverage_days.append(inv_qty / avg_daily)
+
+                monthly_qty = (
+                    recent_sales.groupby(["品目编码", "MonthStr"])["Qty"]
+                    .sum()
+                    .unstack(fill_value=0)
+                )
+                for _, qty_row in monthly_qty.iterrows():
+                    mean_qty = qty_row.mean()
+                    if mean_qty and mean_qty > 0 and len(qty_row) > 1:
+                        volatility_values.append(float(qty_row.std(ddof=0) / mean_qty))
+
+        median_coverage = self._percentile_or_none(coverage_days, 0.5)
+        if median_coverage is not None:
+            params["lead_days"] = self._clamp_int_param(median_coverage * 0.2, params["lead_days"], 15, 60)
+            notes.append("采购周期按库存覆盖天数中位数折算")
+
+        median_volatility = self._percentile_or_none(volatility_values, 0.5)
+        if median_volatility is not None:
+            params["safety_days"] = self._clamp_int_param(10 + median_volatility * 20, params["safety_days"], 10, 45)
+            notes.append("安全库存按销量波动系数折算")
+        elif median_coverage is not None:
+            params["safety_days"] = self._clamp_int_param(median_coverage * 0.15, params["safety_days"], 10, 45)
+            notes.append("安全库存按库存覆盖天数折算")
+
+        if not notes:
+            notes.append("自动分析未取得有效库存覆盖样本，沿用默认补货参数")
+        return params, "；".join(notes)
+
+    def _cashflow_indicator_history(self, metrics_by_month, target_year, target_month, year_scope=None):
+        month_keys = self._filter_month_keys(metrics_by_month.keys(), target_year, target_month, year_scope)
+        cash_detail_balances = self._cash_detail_balance_by_month(target_year, target_month, year_scope)
+        cost_inventory_amounts = self._cost_inventory_amount_by_month(target_year, target_month, year_scope)
+        history = {
+            "dso": [],
+            "dio": [],
+            "ccc": [],
+            "cash_cover": [],
+        }
+
+        for m_key in month_keys:
+            data = metrics_by_month.get(m_key, {})
+            revenue = data.get("revenue")
+            cost = data.get("cost")
+            cash = data.get("cash")
+            if cash is None:
+                cash = cash_detail_balances.get(m_key)
+            ar_balance = data.get("ar_balance")
+            inv_end = data.get("inventory_end")
+            if inv_end is None:
+                inv_end = cost_inventory_amounts.get(m_key)
+            ap_balance = data.get("ap_balance")
+            sales_exp = data.get("sales_expense")
+            admin_exp = data.get("admin_expense")
+            fin_exp = data.get("financial_expense")
+
+            dso = ar_balance / revenue * 30 if (ar_balance and revenue) else None
+            dio = inv_end / cost * 30 if (inv_end and cost) else None
+            dpo = ap_balance / cost * 30 if (ap_balance and cost) else None
+            ccc = (dso + dio - dpo) if (dso is not None and dio is not None and dpo is not None) else None
+            opex = None
+            if sales_exp is not None or admin_exp is not None or fin_exp is not None:
+                opex = (sales_exp or 0) + (admin_exp or 0) + (fin_exp or 0)
+                if opex < 0:
+                    opex = abs(opex)
+            cash_cover = (cash / opex) if (cash is not None and opex) else None
+
+            if dso is not None:
+                history["dso"].append(dso)
+            if dio is not None:
+                history["dio"].append(dio)
+            if ccc is not None:
+                history["ccc"].append(ccc)
+            if cash_cover is not None:
+                history["cash_cover"].append(cash_cover)
+        return history
+
+    def _infer_cashflow_warning_params(self, metrics_by_month, target_year, target_month, year_scope=None, fallback=None):
+        fallback = fallback or {}
+        params = {
+            "dso_threshold": self._clamp_int_param(fallback.get("dso_threshold"), 90, 1, 365),
+            "dio_threshold": self._clamp_int_param(fallback.get("dio_threshold"), 180, 1, 720),
+            "ccc_threshold": self._clamp_int_param(fallback.get("ccc_threshold"), 120, 1, 720),
+            "cash_coverage_threshold": self._clamp_float_param(fallback.get("cash_coverage_threshold"), 1.5, 0.1, 12.0, 1),
+        }
+        if fallback.get("negative_cfo_streak_threshold") is not None:
+            params["negative_cfo_streak_threshold"] = self._clamp_int_param(
+                fallback.get("negative_cfo_streak_threshold"), 2, 1, 12
+            )
+
+        history = self._cashflow_indicator_history(metrics_by_month, target_year, target_month, year_scope)
+        notes = []
+
+        dso_p75 = self._percentile_or_none(history["dso"], 0.75)
+        if dso_p75 is not None:
+            params["dso_threshold"] = self._clamp_int_param(dso_p75 * 1.2, params["dso_threshold"], 30, 180)
+            notes.append(f"DSO阈值基于{len(history['dso'])}个月历史75分位")
+
+        dio_p75 = self._percentile_or_none(history["dio"], 0.75)
+        if dio_p75 is not None:
+            params["dio_threshold"] = self._clamp_int_param(dio_p75 * 1.2, params["dio_threshold"], 45, 360)
+            notes.append(f"DIO阈值基于{len(history['dio'])}个月历史75分位")
+
+        ccc_p75 = self._percentile_or_none(history["ccc"], 0.75)
+        if ccc_p75 is not None:
+            params["ccc_threshold"] = self._clamp_int_param(ccc_p75 * 1.2, params["ccc_threshold"], 45, 360)
+            notes.append(f"CCC阈值基于{len(history['ccc'])}个月历史75分位")
+
+        cash_cover_p25 = self._percentile_or_none(history["cash_cover"], 0.25)
+        if cash_cover_p25 is not None:
+            params["cash_coverage_threshold"] = self._clamp_float_param(
+                cash_cover_p25 * 0.8,
+                params["cash_coverage_threshold"],
+                0.5,
+                6.0,
+                1,
+            )
+            notes.append(f"现金覆盖阈值基于{len(history['cash_cover'])}个月历史25分位")
+
+        if not notes:
+            notes.append("自动分析缺少应收、存货、货币资金或费用样本，沿用默认资金链参数")
+        return params, "；".join(notes)
+
+    def _resolve_warning_params(self, metrics_by_month, target_year, target_month, year_scope=None):
+        repl_config = dict((self.report_params or {}).get("replenishment", {}))
+        cash_config = dict((self.report_params or {}).get("cashflow", {}))
+        repl_manual = self._bool_param(repl_config.pop("manual", True), default=True)
+        cash_manual = self._bool_param(cash_config.pop("manual", True), default=True)
+
+        repl_params = {
+            "lead_days": self._clamp_int_param(repl_config.get("lead_days"), 30, 1, 365),
+            "safety_days": self._clamp_int_param(repl_config.get("safety_days"), 20, 0, 180),
+            "window_months": self._clamp_int_param(repl_config.get("window_months"), 3, 1, 12),
+        }
+        cash_params = {
+            "dso_threshold": self._clamp_int_param(cash_config.get("dso_threshold"), 90, 1, 365),
+            "dio_threshold": self._clamp_int_param(cash_config.get("dio_threshold"), 180, 1, 720),
+            "ccc_threshold": self._clamp_int_param(cash_config.get("ccc_threshold"), 120, 1, 720),
+            "cash_coverage_threshold": self._clamp_float_param(cash_config.get("cash_coverage_threshold"), 1.5, 0.1, 12.0, 1),
+        }
+        if cash_config.get("negative_cfo_streak_threshold") is not None:
+            cash_params["negative_cfo_streak_threshold"] = self._clamp_int_param(
+                cash_config.get("negative_cfo_streak_threshold"), 2, 1, 12
+            )
+
+        notes = {
+            "replenishment": "参数来源：手动填入",
+            "cashflow": "参数来源：手动填入",
+        }
+        if not repl_manual:
+            repl_params, repl_note = self._infer_replenishment_warning_params(
+                target_year, target_month, year_scope, fallback=repl_params
+            )
+            notes["replenishment"] = f"参数来源：自动分析（{repl_note}）"
+        if not cash_manual:
+            cash_params, cash_note = self._infer_cashflow_warning_params(
+                metrics_by_month, target_year, target_month, year_scope, fallback=cash_params
+            )
+            notes["cashflow"] = f"参数来源：自动分析（{cash_note}）"
+
+        self._log_audit(
+            "预警参数已解析: "
+            f"补货={repl_params}({notes['replenishment']}), "
+            f"资金链={cash_params}({notes['cashflow']})"
+        )
+        return repl_params, cash_params, notes
+
     def _update_cashflow_alert_sheet(
         self,
         wb,
@@ -5820,6 +6848,7 @@ class ReportGenerator:
         ccc_threshold=120,
         cash_coverage_threshold=1.5,
         negative_cfo_streak_threshold=2,
+        param_source_note=None,
     ):
         ws = self._prepare_sheet(wb, "资金链预警", insert_after="现金流量表(估算)")
         month_keys = self._filter_month_keys(metrics_by_month.keys(), target_year, target_month, year_scope)
@@ -5911,7 +6940,8 @@ class ReportGenerator:
             ws,
             1,
             len(rows) + 3,
-            f"说明：阈值 DSO>{dso_threshold}天、DIO>{dio_threshold}天、CCC>{ccc_threshold}天、现金覆盖<{cash_coverage_threshold}月、经营现金流连续为负。",
+            f"说明：阈值 DSO>{dso_threshold}天、DIO>{dio_threshold}天、CCC>{ccc_threshold}天、现金覆盖<{cash_coverage_threshold}月、经营现金流连续为负。"
+            + (f" {param_source_note}" if param_source_note else ""),
         )
         self._reorder_month_rows_desc(ws)
 
@@ -5924,6 +6954,7 @@ class ReportGenerator:
         lead_days=30,
         safety_days=20,
         window_months=3,
+        param_source_note=None,
     ):
         ws = self._prepare_sheet(wb, "补货预警", insert_after="存货健康度")
         if not target_year or not target_month:
@@ -6105,7 +7136,13 @@ class ReportGenerator:
 
         rows = sorted(rows, key=lambda x: x[5] if x[5] is not None else 999999)
         self._write_table(ws, 1, 1, headers, rows)
-        self._write_chart_note(ws, 1, len(rows) + 3, f"说明：覆盖天数 < 采购周期({lead_days})+安全库存({safety_days}) 列为需补货。")
+        self._write_chart_note(
+            ws,
+            1,
+            len(rows) + 3,
+            f"说明：覆盖天数 < 采购周期({lead_days})+安全库存({safety_days}) 列为需补货。"
+            + (f" {param_source_note}" if param_source_note else ""),
+        )
 
     def _update_slow_moving_inventory_sheet(self, wb, target_year, target_month):
         ws = self._prepare_sheet(wb, "滞销与风险存货", insert_after="存货健康度")
@@ -6271,8 +7308,10 @@ class ReportGenerator:
             cost_rate = data.get("cost_rate")
             sales_expense = data.get("sales_expense")
             admin_expense = data.get("admin_expense")
+            financial_expense = data.get("financial_expense")
             sales_rate = sales_expense / revenue if (sales_expense is not None and revenue not in (None, 0)) else None
             admin_rate = admin_expense / revenue if (admin_expense is not None and revenue not in (None, 0)) else None
+            financial_rate = financial_expense / revenue if (financial_expense is not None and revenue not in (None, 0)) else None
             inv_start = data.get("inventory_start")
             inv_end = data.get("inventory_end")
             avg_inv = (inv_start + inv_end) / 2 if (inv_start is not None and inv_end is not None) else inv_end
@@ -6316,6 +7355,7 @@ class ReportGenerator:
                 check_pp("成本率", cost_rate, prev_data.get("cost_rate"))
                 check_pp("销售费用率", sales_rate, prev_data.get("sales_rate"))
                 check_pp("管理费用率", admin_rate, prev_data.get("admin_rate"))
+                check_pp("财务费用率", financial_rate, prev_data.get("financial_rate"))
                 check_days("存货周转天数", inv_days, prev_data.get("inv_days"))
 
             prev_data = {
@@ -6324,6 +7364,7 @@ class ReportGenerator:
                 "cost_rate": cost_rate,
                 "sales_rate": sales_rate,
                 "admin_rate": admin_rate,
+                "financial_rate": financial_rate,
                 "ar_balance": data.get("ar_balance"),
                 "inventory_end": inv_end,
                 "inv_days": inv_days,
@@ -6591,8 +7632,10 @@ class ReportGenerator:
             cost_rate = data.get("cost_rate")
             sales_expense = data.get("sales_expense")
             admin_expense = data.get("admin_expense")
+            financial_expense = data.get("financial_expense")
             sales_rate = sales_expense / revenue if (sales_expense is not None and revenue not in (None, 0)) else None
             admin_rate = admin_expense / revenue if (admin_expense is not None and revenue not in (None, 0)) else None
+            financial_rate = financial_expense / revenue if (financial_expense is not None and revenue not in (None, 0)) else None
             inv_start = data.get("inventory_start")
             inv_end = data.get("inventory_end")
             avg_inv = (inv_start + inv_end) / 2 if (inv_start is not None and inv_end is not None) else inv_end
@@ -6636,6 +7679,7 @@ class ReportGenerator:
                 check_pp("成本率", cost_rate, prev_data.get("cost_rate"))
                 check_pp("销售费用率", sales_rate, prev_data.get("sales_rate"))
                 check_pp("管理费用率", admin_rate, prev_data.get("admin_rate"))
+                check_pp("财务费用率", financial_rate, prev_data.get("financial_rate"))
                 check_days("存货周转天数", inv_days, prev_data.get("inv_days"))
 
             prev_data = {
@@ -6644,6 +7688,7 @@ class ReportGenerator:
                 "cost_rate": cost_rate,
                 "sales_rate": sales_rate,
                 "admin_rate": admin_rate,
+                "financial_rate": financial_rate,
                 "ar_balance": data.get("ar_balance"),
                 "inventory_end": inv_end,
                 "inv_days": inv_days,
@@ -6680,6 +7725,7 @@ class ReportGenerator:
             "主营业务成本": "cost",
             "销售费用": "sales_expense",
             "管理费用": "admin_expense",
+            "财务费用": "financial_expense",
             "应收账款余额": "ar_balance",
             "存货期末余额": "inventory_end",
         }
@@ -6768,7 +7814,7 @@ class ReportGenerator:
         if not entity_dirs:
             self._write_table(ws, 1, 1, ["提示"], [["未检测到多主体数据目录"]])
             return
-        headers = ["主体", "主营业务收入", "主营业务成本", "营业利润", "销售费用", "管理费用", "应收账款余额", "存货期末余额"]
+        headers = ["主体", "主营业务收入", "主营业务成本", "营业利润", "销售费用", "管理费用", "财务费用", "应收账款余额", "存货期末余额"]
         rows = []
         for path in entity_dirs:
             name = os.path.basename(path)
@@ -6784,6 +7830,7 @@ class ReportGenerator:
                 data.get("operating_profit"),
                 data.get("sales_expense"),
                 data.get("admin_expense"),
+                data.get("financial_expense"),
                 data.get("ar_balance"),
                 data.get("inventory_end"),
             ])
@@ -6839,6 +7886,8 @@ class ReportGenerator:
             "客户贡献与回款": ["应收账款账龄分析"],
             "渠道贡献": ["客户贡献与回款"],
             "存货健康度": ["明细_销售与库存"],
+            "货币资金分析": ["现金流量表(估算)", "资产负债表"],
+            "应付账款分析": ["资金链预警", "资产负债表"],
         }
         for sheet, targets in link_map.items():
             if sheet not in wb.sheetnames:
@@ -6877,6 +7926,8 @@ class ReportGenerator:
         desired = [
             (self.expense_analysis_sheet_name, "费用趋势/环比/异常/明细一页整合", "费用分析主入口"),
             (self.expense_detail_sheet_name, "费用异常明细明细清单（按异常键）", "费用明细关联入口"),
+            ("货币资金分析", "银行/现金明细与资产负债表货币资金覆盖分析", "资金分析入口"),
+            ("应付账款分析", "应付明细、供应商余额与报表应付覆盖分析", "负债分析入口"),
             ("年度汇总总览", "年度利润/指标/资产负债/费用异常一页汇总", "年度汇报入口"),
         ]
 
@@ -6927,6 +7978,7 @@ class ReportGenerator:
         self._log_audit("开始生成扩展报表")
         self._update_dashboard(wb, metrics_by_month_scoped, target_year, target_month)
         self._update_cashflow_sheet(wb, target_year, target_month, self.year_scope)
+        self._update_cash_balance_analysis_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
         self._update_budget_variance_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
         self._update_product_contribution_sheet(wb, target_year, target_month, self.year_scope)
         self._update_category_contribution_sheet(wb, target_year, target_month, self.year_scope)
@@ -6934,12 +7986,18 @@ class ReportGenerator:
         self._update_channel_profit_sheet(wb, target_year, target_month, self.year_scope)
         self._update_inventory_health_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
         self._update_slow_moving_inventory_sheet(wb, target_year, target_month)
-        repl_params = (self.report_params or {}).get("replenishment", {})
+        repl_params, cash_params, warning_notes = self._resolve_warning_params(
+            metrics_by_month_scoped,
+            target_year,
+            target_month,
+            self.year_scope,
+        )
         self._update_replenishment_alert_sheet(
             wb,
             target_year,
             target_month,
             self.year_scope,
+            param_source_note=warning_notes.get("replenishment"),
             **repl_params,
         )
         self._update_expense_structure_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
@@ -6949,15 +8007,16 @@ class ReportGenerator:
         self._update_entity_summary_sheet(wb, target_year, target_month, self.year_scope)
         self._update_currency_summary_sheet(wb, target_year, target_month, self.year_scope)
 
-        cash_params = (self.report_params or {}).get("cashflow", {})
         self._update_cashflow_alert_sheet(
             wb,
             metrics_by_month_scoped,
             target_year,
             target_month,
             self.year_scope,
+            param_source_note=warning_notes.get("cashflow"),
             **cash_params,
         )
+        self._update_ap_analysis_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
 
         self._update_staff_efficiency_sheet(wb, target_year, target_month, self.year_scope)
         self._update_dupont_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
@@ -7085,6 +8144,7 @@ class ReportGenerator:
             ("毛利润", "gross_profit"),
             ("销售费用", "sales_expense"),
             ("管理费用", "admin_expense"),
+            ("财务费用", "financial_expense"),
             ("营业利润", "operating_profit"),
             ("净利润", "net_profit"),
             ("应收账款余额", "ar_balance"),
@@ -7094,6 +8154,7 @@ class ReportGenerator:
             ("成本率", "cost_rate"),
             ("销售费用率", "sales_expense_rate"),
             ("管理费用率", "admin_expense_rate"),
+            ("财务费用率", "financial_expense_rate"),
             ("营业利润率", "operating_profit_rate"),
             ("净利润率", "net_profit_rate"),
             ("存货周转天数", "inventory_turnover_days"),
@@ -7107,6 +8168,7 @@ class ReportGenerator:
             "gross_profit": [],
             "sales_expense": [],
             "admin_expense": [],
+            "financial_expense": [],
             "operating_profit": [],
             "net_profit": [],
         }
@@ -7131,6 +8193,7 @@ class ReportGenerator:
                 "gross_profit": gross_profit,
                 "sales_expense": data.get("sales_expense"),
                 "admin_expense": data.get("admin_expense"),
+                "financial_expense": data.get("financial_expense"),
                 "operating_profit": data.get("operating_profit"),
                 "net_profit": data.get("net_profit"),
                 "ar_balance": data.get("ar_balance"),
@@ -7161,6 +8224,7 @@ class ReportGenerator:
         total_cost = self._safe_sum(sum_totals["cost"])
         total_sales_expense = self._safe_sum(sum_totals["sales_expense"])
         total_admin_expense = self._safe_sum(sum_totals["admin_expense"])
+        total_financial_expense = self._safe_sum(sum_totals["financial_expense"])
         total_operating_profit = self._safe_sum(sum_totals["operating_profit"])
         total_net_profit = self._safe_sum(sum_totals["net_profit"])
         total_gross_profit = None
@@ -7169,11 +8233,12 @@ class ReportGenerator:
         else:
             total_gross_profit = self._safe_sum(sum_totals["gross_profit"])
 
-        cost_rate_total = (total_cost / total_revenue) if total_revenue else None
-        sales_rate_total = (total_sales_expense / total_revenue) if total_revenue else None
-        admin_rate_total = (total_admin_expense / total_revenue) if total_revenue else None
-        operating_rate_total = (total_operating_profit / total_revenue) if total_revenue else None
-        net_rate_total = (total_net_profit / total_revenue) if total_revenue else None
+        cost_rate_total = (total_cost / total_revenue) if (total_revenue not in (None, 0) and total_cost is not None) else None
+        sales_rate_total = (total_sales_expense / total_revenue) if (total_revenue not in (None, 0) and total_sales_expense is not None) else None
+        admin_rate_total = (total_admin_expense / total_revenue) if (total_revenue not in (None, 0) and total_admin_expense is not None) else None
+        financial_rate_total = (total_financial_expense / total_revenue) if (total_revenue not in (None, 0) and total_financial_expense is not None) else None
+        operating_rate_total = (total_operating_profit / total_revenue) if (total_revenue not in (None, 0) and total_operating_profit is not None) else None
+        net_rate_total = (total_net_profit / total_revenue) if (total_revenue not in (None, 0) and total_net_profit is not None) else None
 
         rows.append([
             "全年合计",
@@ -7182,6 +8247,7 @@ class ReportGenerator:
             total_gross_profit,
             total_sales_expense,
             total_admin_expense,
+            total_financial_expense,
             total_operating_profit,
             total_net_profit,
             last_non_none(balance_totals["ar_balance"]),
@@ -7189,6 +8255,7 @@ class ReportGenerator:
             cost_rate_total,
             sales_rate_total,
             admin_rate_total,
+            financial_rate_total,
             operating_rate_total,
             net_rate_total,
             avg(ratio_totals["inventory_turnover_days"]),
@@ -7269,6 +8336,7 @@ class ReportGenerator:
         cost_vals = [metrics_by_month.get(m, {}).get("cost") for m in months]
         sales_expense_vals = [metrics_by_month.get(m, {}).get("sales_expense") for m in months]
         admin_expense_vals = [metrics_by_month.get(m, {}).get("admin_expense") for m in months]
+        financial_expense_vals = [metrics_by_month.get(m, {}).get("financial_expense") for m in months]
         operating_profit_vals = [metrics_by_month.get(m, {}).get("operating_profit") for m in months]
         net_profit_vals = [metrics_by_month.get(m, {}).get("net_profit") for m in months]
         ar_vals = [metrics_by_month.get(m, {}).get("ar_balance") for m in months]
@@ -7278,6 +8346,7 @@ class ReportGenerator:
         total_cost = self._safe_sum(cost_vals)
         total_sales_expense = self._safe_sum(sales_expense_vals)
         total_admin_expense = self._safe_sum(admin_expense_vals)
+        total_financial_expense = self._safe_sum(financial_expense_vals)
         total_operating_profit = self._safe_sum(operating_profit_vals)
         total_net_profit = self._safe_sum(net_profit_vals)
         total_gross_profit = (total_revenue - total_cost) if (total_revenue is not None and total_cost is not None) else None
@@ -7289,6 +8358,7 @@ class ReportGenerator:
             ["毛利率(全年)", (total_gross_profit / total_revenue) if total_revenue else None, "毛利润/收入"],
             ["销售费用(全年)", total_sales_expense, "来自年度经营指标按月汇总"],
             ["管理费用(全年)", total_admin_expense, "来自年度经营指标按月汇总"],
+            ["财务费用(全年)", total_financial_expense, "来自年度经营指标按月汇总"],
             ["营业利润(全年)", total_operating_profit, "来自年度经营指标按月汇总"],
             ["净利润(全年)", total_net_profit, "来自年度经营指标按月汇总"],
             ["净利率(全年)", (total_net_profit / total_revenue) if total_revenue else None, "净利润/收入"],
@@ -7995,6 +9065,255 @@ class ReportGenerator:
         df['Code'] = df[code_col].astype(str).str.strip()
         return df.groupby('Code')['UnitCost'].last().to_dict()
 
+    def _build_cost_inventory_map(self, df_cost, month_key=None):
+        """将成本表整理为按品目编码索引的库存/成本快照。"""
+        month_map = {}
+        if df_cost is None or df_cost.empty:
+            return month_map
+
+        code_col = next((c for c in df_cost.columns if '品目编码' in str(c)), None)
+        name_col = next((c for c in df_cost.columns if '品目名' in str(c)), None)
+        qty_start_col = next((c for c in df_cost.columns if str(c).endswith('期初')), None)
+        amt_start_col = next((c for c in df_cost.columns if str(c).endswith('期初.2')), None)
+        qty_end_col = next((c for c in df_cost.columns if str(c).endswith('期末')), None)
+        amt_end_col = next((c for c in df_cost.columns if str(c).endswith('期末.2')), None)
+        if not code_col:
+            return month_map
+
+        unit_cost_map = self._get_unit_cost_map_for_month(month_key) if month_key else {}
+        for _, row in df_cost.iterrows():
+            raw_code = row.get(code_col)
+            if raw_code is None or pd.isna(raw_code):
+                continue
+            code = str(raw_code).strip()
+            if not code or code == "品目编码":
+                continue
+
+            qty_end = self._to_float(row.get(qty_end_col))
+            amt_end = self._to_float(row.get(amt_end_col))
+            latest_cost = unit_cost_map.get(code)
+            if latest_cost is None and qty_end not in (None, 0) and amt_end is not None:
+                latest_cost = amt_end / qty_end
+
+            month_map[code] = {
+                'name_spec': row.get(name_col),
+                'qty_start': self._to_float(row.get(qty_start_col)),
+                'amt_start': self._to_float(row.get(amt_start_col)),
+                'qty_end': qty_end,
+                'amt_end': amt_end,
+                'unit_cost': latest_cost,
+            }
+        return month_map
+
+    def get_latest_product_inventory_snapshot(self):
+        """返回最新成本月份的品目库存/成本快照，供基础数据同步使用。"""
+        valid_months = sorted(
+            month_key for month_key in self.data['cost'].keys()
+            if re.match(r'^20\d{2}-\d{2}$', str(month_key or '').strip())
+        )
+        if not valid_months:
+            return {"month_key": None, "records": []}
+
+        latest_month = valid_months[-1]
+        month_map = self._build_cost_inventory_map(self.data['cost'].get(latest_month), latest_month)
+        sales_meta = {}
+        sales_df = self._get_sales_df()
+        if sales_df is not None and not sales_df.empty and '品目编码' in sales_df.columns:
+            sales_df = sales_df.copy()
+            if 'MonthStr' not in sales_df.columns:
+                if 'ParsedDate' in sales_df.columns:
+                    sales_df['MonthStr'] = pd.to_datetime(sales_df['ParsedDate'], errors='coerce').dt.strftime('%Y-%m')
+                else:
+                    date_col = next((c for c in sales_df.columns if '日期' in str(c) or 'Date' in str(c)), None)
+                    if date_col:
+                        sales_df['ParsedDate'] = pd.to_datetime(sales_df[date_col], errors='coerce')
+                        sales_df['MonthStr'] = sales_df['ParsedDate'].dt.strftime('%Y-%m')
+            if 'MonthStr' in sales_df.columns:
+                sales_df = sales_df[sales_df['MonthStr'].notna()].copy()
+                sales_df = sales_df[sales_df['MonthStr'].astype(str) <= latest_month]
+                if not sales_df.empty:
+                    sales_df['Code'] = sales_df['品目编码'].astype(str).str.strip()
+                    sales_df = sales_df[sales_df['Code'] != ""]
+                    name_col = next((c for c in ['品目名', '产品名称', '品名', '商品名称'] if c in sales_df.columns), None)
+                    if name_col:
+                        sales_df['_resolved_name'] = sales_df[name_col]
+                    else:
+                        sales_df['_resolved_name'] = None
+                    sales_df = sales_df.sort_values(['MonthStr']).drop_duplicates('Code', keep='last')
+                    for _, row in sales_df.iterrows():
+                        code = row.get('Code')
+                        if not code:
+                            continue
+                        sales_meta[code] = {
+                            'product_name': row.get('_resolved_name'),
+                            'product_type': self._resolve_uncategorized_product(
+                                row.get('品目组合1名'),
+                                row.get('_resolved_name'),
+                            ),
+                        }
+
+        records = []
+        for code, snapshot in month_map.items():
+            qty = snapshot.get("qty_end")
+            cost = snapshot.get("unit_cost")
+            if qty is None and cost is None:
+                continue
+            meta = sales_meta.get(code, {})
+            name_spec = snapshot.get("name_spec")
+            product_name = meta.get("product_name") or name_spec
+            records.append({
+                "code": code,
+                "name": product_name,
+                "product_name": product_name,
+                "product_type": self._resolve_uncategorized_product(
+                    meta.get("product_type"),
+                    name_spec or product_name,
+                ),
+                "spec_info": name_spec,
+                "specification": name_spec,
+                "latest_inventory_qty": qty,
+                "latest_inventory_cost": cost,
+                "latest_inventory_date": latest_month,
+            })
+        return {"month_key": latest_month, "records": records}
+
+    def _build_business_partner_frame(self, df, fallback_month=None):
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["MonthStr", "PartnerCode", "PartnerName", "PartnerCategory", "AccountSubject"])
+
+        frame = df.copy()
+        if "MonthStr" not in frame.columns:
+            if "ParsedDate" in frame.columns:
+                frame["MonthStr"] = pd.to_datetime(frame["ParsedDate"], errors="coerce").dt.strftime("%Y-%m")
+            else:
+                date_col = next((c for c in frame.columns if '日期' in str(c) or 'Date' in str(c)), None)
+                if date_col:
+                    frame["ParsedDate"] = pd.to_datetime(frame[date_col], errors="coerce")
+                    frame["MonthStr"] = frame["ParsedDate"].dt.strftime("%Y-%m")
+        if "MonthStr" not in frame.columns and fallback_month:
+            frame["MonthStr"] = fallback_month
+        if "MonthStr" not in frame.columns:
+            return pd.DataFrame(columns=["MonthStr", "PartnerCode", "PartnerName", "PartnerCategory", "AccountSubject"])
+
+        code_col = self._pick_first_column(
+            frame,
+            ["往来单位编码", "客户编码", "供应商编码", "当地编码", "客户代码", "供应商代码"],
+        )
+        if not code_col:
+            return pd.DataFrame(columns=["MonthStr", "PartnerCode", "PartnerName", "PartnerCategory", "AccountSubject"])
+
+        name_col = self._pick_first_column(
+            frame,
+            ["往来单位名", "客户名称", "客户名", "客户", "收货公司", "供应商名称", "供应商"],
+            ["编码"],
+        )
+        subject_code_col = self._pick_first_column(
+            frame,
+            ["科目编码", "会计科目编码"],
+            ["往来", "品目"],
+        )
+        subject_name_col = self._pick_first_column(
+            frame,
+            ["科目名", "会计科目", "科目"],
+            ["编码", "往来", "品目"],
+        )
+        category_col = self._pick_first_column(
+            frame,
+            ["往来单位分级组合名", "客户分类", "供应商分类", "分类"],
+        )
+
+        result = pd.DataFrame()
+        result["MonthStr"] = frame["MonthStr"].astype(str).str.strip()
+        result["PartnerCode"] = frame[code_col].astype(str).str.strip()
+        result["PartnerName"] = (
+            frame[name_col].astype(str).str.strip() if name_col else None
+        )
+        result["PartnerCategory"] = (
+            frame[category_col].astype(str).str.strip() if category_col else None
+        )
+        if subject_code_col or subject_name_col:
+            subject_code_series = (
+                frame[subject_code_col].astype(str).str.strip() if subject_code_col else pd.Series([None] * len(frame), index=frame.index)
+            )
+            subject_name_series = (
+                frame[subject_name_col].astype(str).str.strip() if subject_name_col else pd.Series([None] * len(frame), index=frame.index)
+            )
+            result["AccountSubject"] = [
+                f"[{code}] {name}".strip()
+                if code and code.lower() != "nan" and name and name.lower() != "nan"
+                else (code if code and code.lower() != "nan" else (name if name and name.lower() != "nan" else None))
+                for code, name in zip(subject_code_series, subject_name_series)
+            ]
+        else:
+            result["AccountSubject"] = None
+        result = result[
+            (result["PartnerCode"] != "")
+            & (result["PartnerCode"].str.lower() != "nan")
+            & result["MonthStr"].str.match(r"^20\d{2}-\d{2}$", na=False)
+        ].copy()
+        if "PartnerName" in result.columns:
+            result.loc[result["PartnerName"].str.lower() == "nan", "PartnerName"] = None
+        if "PartnerCategory" in result.columns:
+            result.loc[result["PartnerCategory"].str.lower() == "nan", "PartnerCategory"] = None
+        if "AccountSubject" in result.columns:
+            result.loc[result["AccountSubject"].astype(str).str.lower() == "nan", "AccountSubject"] = None
+        return result
+
+    def get_latest_business_partner_snapshot(self):
+        """返回经营报告数据中可识别的往来单位快照。"""
+        frames = []
+        sales_df = self._get_sales_df()
+        if sales_df is not None and not sales_df.empty:
+            frames.append(self._build_business_partner_frame(sales_df))
+        if self.ar_detail_df is not None and not self.ar_detail_df.empty:
+            frames.append(self._build_business_partner_frame(self.ar_detail_df))
+
+        frames = [frame for frame in frames if frame is not None and not frame.empty]
+        if not frames:
+            return {"month_key": None, "records": []}
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged[merged["MonthStr"].str.match(r"^20\d{2}-\d{2}$", na=False)].copy()
+        if merged.empty:
+            return {"month_key": None, "records": []}
+
+        latest_month = sorted(merged["MonthStr"].dropna().astype(str).unique())[-1]
+        merged = merged.sort_values(["MonthStr"]).reset_index(drop=True)
+
+        latest_by_code = {}
+        for _, row in merged.iterrows():
+            code = str(row.get("PartnerCode") or "").strip()
+            if not code:
+                continue
+            current = latest_by_code.setdefault(
+                code,
+                {
+                    "code": code,
+                    "name": None,
+                    "local_code": code,
+                    "category": None,
+                    "account_subject": None,
+                    "latest_seen_date": None,
+                },
+            )
+            month_key = str(row.get("MonthStr") or "").strip()
+            if month_key:
+                current["latest_seen_date"] = month_key
+            partner_name = row.get("PartnerName")
+            if partner_name is not None and str(partner_name).strip():
+                current["name"] = str(partner_name).strip()
+            partner_category = row.get("PartnerCategory")
+            if partner_category is not None and str(partner_category).strip():
+                current["category"] = str(partner_category).strip()
+            account_subject = row.get("AccountSubject")
+            if account_subject is not None and str(account_subject).strip():
+                current["account_subject"] = str(account_subject).strip()
+
+        return {
+            "month_key": latest_month,
+            "records": list(latest_by_code.values()),
+        }
+
     def _attach_sales_cost(self, df, target_year=None, target_month=None, year_scope=None):
         if df is None or df.empty:
             return df
@@ -8046,13 +9365,23 @@ class ReportGenerator:
         if 'ParsedDate' not in sales_df.columns:
             return
         df = self._filter_df_by_scope(sales_df.copy(), target_year, target_month, year_scope)
-        if df.empty:
+        annual_df = self._filter_df_by_scope(sales_df.copy(), target_year, target_month, "current")
+        if (df is None or df.empty) and (annual_df is None or annual_df.empty):
             return
 
-        df['Category'] = df.get('品目组合1名')
-        df['Revenue'] = self._extract_sales_revenue(df)
-        df['Qty'] = pd.to_numeric(df.get('数量'), errors='coerce')
-        df = self._attach_sales_cost(df, target_year, target_month, year_scope)
+        def prepare_sales_scope(source_df, scope):
+            if source_df is None or source_df.empty:
+                return pd.DataFrame()
+            work = source_df.copy()
+            work['Category'] = work.get('品目组合1名')
+            work['Revenue'] = self._extract_sales_revenue(work)
+            work['Qty'] = pd.to_numeric(work.get('数量'), errors='coerce')
+            return self._attach_sales_cost(work, target_year, target_month, scope)
+
+        df = prepare_sales_scope(df, year_scope)
+        annual_df = prepare_sales_scope(annual_df, "current")
+        if df.empty and annual_df.empty:
+            return
 
         header_map = {}
         for col in range(1, ws.max_column + 1):
@@ -8164,7 +9493,48 @@ class ReportGenerator:
                 'revenue': revenue_val,
                 'cost': cost_val,
                 'profit': profit_val,
+                'sort_revenue': revenue_val,
                 'month': month_values,
+            }
+
+        annual_cat_stats = {}
+        if annual_df is not None and not annual_df.empty:
+            for cat, group in annual_df.groupby(['Category']):
+                if isinstance(cat, tuple):
+                    cat = cat[0] if cat else None
+                if cat is None:
+                    continue
+                if isinstance(cat, float) and pd.isna(cat):
+                    continue
+                display = self._strip_category_share_suffix(cat)
+                cat_key = self._normalize_category(display)
+                if not cat_key or cat_key == '合计':
+                    continue
+                metrics = self._calc_sales_metrics_from_group(group)
+                annual_cat_stats[cat_key] = {
+                    'display': str(display).strip(),
+                    'qty': metrics.get('qty'),
+                    'revenue': metrics.get('revenue'),
+                    'cost': metrics.get('cost'),
+                    'profit': metrics.get('profit'),
+                }
+
+        for cat_key, stat in cat_stats.items():
+            annual_stat = annual_cat_stats.get(cat_key)
+            for metric in ('qty', 'revenue', 'cost', 'profit'):
+                stat[metric] = annual_stat.get(metric) if annual_stat else None
+
+        for cat_key, annual_stat in annual_cat_stats.items():
+            if cat_key in cat_stats:
+                continue
+            cat_stats[cat_key] = {
+                'display': annual_stat.get('display') or cat_key,
+                'qty': annual_stat.get('qty'),
+                'revenue': annual_stat.get('revenue'),
+                'cost': annual_stat.get('cost'),
+                'profit': annual_stat.get('profit'),
+                'sort_revenue': annual_stat.get('revenue'),
+                'month': {},
             }
 
         if not cat_stats:
@@ -8184,7 +9554,7 @@ class ReportGenerator:
                 'qty': m_qty,
             }
 
-        total_stats = self._calc_sales_metrics_from_group(df)
+        total_stats = self._calc_sales_metrics_from_group(annual_df) if annual_df is not None and not annual_df.empty else {}
 
         existing_order = []
         existing_display_map = {}
@@ -8213,7 +9583,7 @@ class ReportGenerator:
             first_data_row = min(first_data_row, r)
 
         ordered_keys = [k for k in existing_order if k in cat_stats]
-        for k in sorted(cat_stats.keys(), key=lambda x: abs(cat_stats[x]['revenue'] or 0), reverse=True):
+        for k in sorted(cat_stats.keys(), key=lambda x: abs(cat_stats[x].get('sort_revenue') or cat_stats[x].get('revenue') or 0), reverse=True):
             if k not in ordered_keys:
                 ordered_keys.append(k)
         if not ordered_keys:
@@ -8311,8 +9681,9 @@ class ReportGenerator:
                 if date_col:
                     parsed = pd.to_datetime(sales_df[date_col], errors='coerce')
                     sales_df['MonthStr'] = parsed.dt.strftime('%Y-%m')
-        sales_df = self._filter_df_by_scope(sales_df, target_year, target_month, year_scope)
-        if sales_df is None or sales_df.empty:
+        display_sales_df = self._filter_df_by_scope(sales_df.copy(), target_year, target_month, year_scope)
+        annual_sales_df = self._filter_df_by_scope(sales_df.copy(), target_year, target_month, "current")
+        if (display_sales_df is None or display_sales_df.empty) and (annual_sales_df is None or annual_sales_df.empty):
             return
 
         cost_df = None
@@ -8347,13 +9718,22 @@ class ReportGenerator:
                     pass
             return v
 
-        sales_df['Revenue'] = self._extract_sales_revenue(sales_df)
-        sales_df['Qty'] = pd.to_numeric(sales_df.get('数量'), errors='coerce')
-        sales_df = self._attach_sales_cost(sales_df, target_year, target_month, year_scope)
+        def prepare_sales_scope(source_df, scope):
+            if source_df is None or source_df.empty:
+                return pd.DataFrame()
+            work = source_df.copy()
+            work['Revenue'] = self._extract_sales_revenue(work)
+            work['Qty'] = pd.to_numeric(work.get('数量'), errors='coerce')
+            return self._attach_sales_cost(work, target_year, target_month, scope)
+
+        sales_df = prepare_sales_scope(display_sales_df, year_scope)
+        annual_sales_df = prepare_sales_scope(annual_sales_df, "current")
+        if sales_df.empty and annual_sales_df.empty:
+            return
 
         month_cols = {}
         for header, col in header_map.items():
-            m = re.match(r'(20\d{2})[/-](\d{1,2})_(.+)', str(header))
+            m = re.match(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?_(.+)', str(header))
             if not m:
                 continue
             label = f"{m.group(1)}/{int(m.group(2)):02d}"
@@ -8408,22 +9788,49 @@ class ReportGenerator:
                 if metric:
                     month_cols.setdefault(target_label, {})[metric] = col
 
-        sales_by_code = sales_df.groupby('品目编码').agg(
-            year_qty=('Qty', 'sum'),
-            year_revenue=('Revenue', 'sum'),
-            year_cost=('Cost', lambda s: s.sum(min_count=1)),
-            year_cost_non_na=('Cost', lambda s: int(pd.to_numeric(s, errors='coerce').notna().sum())),
-            category=('品目组合1名', 'first'),
-            product_name=('品目名', 'first')
-        ).reset_index()
-        sales_by_code.loc[sales_by_code['year_cost_non_na'] == 0, 'year_cost'] = None
-        sales_by_code['year_profit'] = sales_by_code.apply(
-            lambda r: (r['year_revenue'] - r['year_cost'])
-            if pd.notna(r.get('year_revenue')) and pd.notna(r.get('year_cost'))
-            else None,
-            axis=1
-        )
-        sales_by_code.set_index('品目编码', inplace=True)
+        def build_sales_by_code(source_df):
+            if source_df is None or source_df.empty or '品目编码' not in source_df.columns:
+                empty = pd.DataFrame(columns=[
+                    'year_qty', 'year_revenue', 'year_cost', 'year_cost_non_na',
+                    'category', 'product_name', 'year_profit'
+                ])
+                empty.index.name = '品目编码'
+                return empty
+            work = source_df.copy()
+            work['品目编码'] = work['品目编码'].astype(str).str.strip()
+            grouped = work.groupby('品目编码').agg(
+                year_qty=('Qty', 'sum'),
+                year_revenue=('Revenue', 'sum'),
+                year_cost=('Cost', lambda s: s.sum(min_count=1)),
+                year_cost_non_na=('Cost', lambda s: int(pd.to_numeric(s, errors='coerce').notna().sum())),
+                category=('品目组合1名', 'first'),
+                product_name=('品目名', 'first')
+            ).reset_index()
+            grouped.loc[grouped['year_cost_non_na'] == 0, 'year_cost'] = None
+            grouped['year_profit'] = grouped.apply(
+                lambda r: (r['year_revenue'] - r['year_cost'])
+                if pd.notna(r.get('year_revenue')) and pd.notna(r.get('year_cost'))
+                else None,
+                axis=1
+            )
+            grouped.set_index('品目编码', inplace=True)
+            return grouped
+
+        def build_product_meta_by_code(source_df):
+            if source_df is None or source_df.empty or '品目编码' not in source_df.columns:
+                empty = pd.DataFrame(columns=['category', 'product_name'])
+                empty.index.name = '品目编码'
+                return empty
+            work = source_df.copy()
+            work['品目编码'] = work['品目编码'].astype(str).str.strip()
+            meta = work.groupby('品目编码').agg(
+                category=('品目组合1名', 'first'),
+                product_name=('品目名', 'first'),
+            )
+            return meta
+
+        sales_by_code = build_sales_by_code(annual_sales_df)
+        display_by_code = build_product_meta_by_code(sales_df)
 
         monthly_summary = sales_df.groupby(['MonthStr', '品目编码']).agg(
             qty=('Qty', 'sum'),
@@ -8452,13 +9859,15 @@ class ReportGenerator:
             monthly_map[(str(row.get('MonthStr')), str(code).strip())] = row
         months_count_by_code = {}
         total_months_count = 0
-        if not monthly_summary.empty:
+        if annual_sales_df is not None and not annual_sales_df.empty and '品目编码' in annual_sales_df.columns:
+            annual_count_df = annual_sales_df.copy()
+            annual_count_df['品目编码'] = annual_count_df['品目编码'].astype(str).str.strip()
             months_count_by_code = (
-                monthly_summary.groupby('品目编码')['MonthStr']
+                annual_count_df.groupby('品目编码')['MonthStr']
                 .nunique()
                 .to_dict()
             )
-            total_months_count = int(monthly_summary['MonthStr'].nunique())
+            total_months_count = int(annual_count_df['MonthStr'].nunique())
 
         def build_cost_month_map(df_cost):
             month_map = {}
@@ -8531,7 +9940,12 @@ class ReportGenerator:
                 existing_codes[code] = r
 
         missing_codes = []
-        for code in sales_by_code.index.tolist():
+        source_codes = []
+        for idx in list(display_by_code.index) + list(sales_by_code.index):
+            code = str(idx).strip()
+            if code and code not in source_codes:
+                source_codes.append(code)
+        for code in source_codes:
             code = str(code).strip()
             if code and code not in existing_codes:
                 missing_codes.append(code)
@@ -8545,11 +9959,12 @@ class ReportGenerator:
                     self._safe_set_cell_value(ws, insert_row, c, None)
                 ws.cell(row=insert_row, column=code_col).value = code
                 sales_row = sales_by_code.loc[code] if code in sales_by_code.index else None
+                meta_row = display_by_code.loc[code] if code in display_by_code.index else sales_row
                 cost_row = cost_map.get(code, {})
-                if '产品名称' in header_map and sales_row is not None:
-                    ws.cell(row=insert_row, column=header_map['产品名称']).value = sales_row.get('product_name')
+                if '产品名称' in header_map and meta_row is not None:
+                    ws.cell(row=insert_row, column=header_map['产品名称']).value = meta_row.get('product_name')
                 resolved_category = self._resolve_uncategorized_product(
-                    sales_row.get('category') if sales_row is not None else None,
+                    meta_row.get('category') if meta_row is not None else None,
                     cost_row.get('name_spec')
                 )
                 if '产品大类' in header_map and resolved_category is not None:
@@ -8582,13 +9997,14 @@ class ReportGenerator:
                 continue
             code = str(code).strip()
             sales_row = sales_by_code.loc[code] if code in sales_by_code.index else None
+            meta_row = display_by_code.loc[code] if code in display_by_code.index else sales_row
             cost_row = cost_map.get(code, {})
             resolved_category = self._resolve_uncategorized_product(
-                sales_row.get('category') if sales_row is not None else None,
+                meta_row.get('category') if meta_row is not None else None,
                 cost_row.get('name_spec')
             )
-            if '产品名称' in header_map and sales_row is not None:
-                ws.cell(row=r, column=header_map['产品名称']).value = sales_row.get('product_name')
+            if '产品名称' in header_map and meta_row is not None:
+                ws.cell(row=r, column=header_map['产品名称']).value = meta_row.get('product_name')
             if '品目名规格' in header_map and cost_row.get('name_spec') is not None:
                 ws.cell(row=r, column=header_map['品目名规格']).value = cost_row.get('name_spec')
             if '产品大类' in header_map and resolved_category is not None:
@@ -9236,19 +10652,19 @@ class ReportGenerator:
             if df[col].dtype == object:
                 df[col] = df[col].apply(lambda v: v.strip().replace('\t', '') if isinstance(v, str) else v)
 
-        date_col = None
-        for c in df.columns:
-            if '日期' in c:
-                date_col = c
-                break
+        date_col = "ParsedDate" if "ParsedDate" in df.columns else None
+        if not date_col:
+            for c in df.columns:
+                if '日期' in c:
+                    date_col = c
+                    break
         if not date_col:
             return
 
-        cust_col = None
-        for c in df.columns:
-            if '往来单位名' in c:
-                cust_col = c
-                break
+        cust_col = self._pick_ledger_column(
+            df,
+            ["往来单位名", "账页往来单位名", "客户名", "客户", "对应往来单位名"],
+        )
         if not cust_col:
             return
 
@@ -9524,7 +10940,7 @@ class ReportGenerator:
                     continue
                 h_text = str(header).strip()
                 m_key = self._label_to_month_key(h_text) or self._extract_month_key_from_text(h_text)
-                if m_key and self._month_key_in_scope(m_key, target_year, target_month, year_scope):
+                if m_key and self._month_key_in_scope(m_key, target_year, target_month, "current"):
                     scoped_month_cols.append(col)
                 if any(token in h_text for token in annual_tokens):
                     annual_cols.append(col)
@@ -9570,6 +10986,7 @@ class ReportGenerator:
             expected_map = {
                 "主营业务收入(全年)": _sum_metric("revenue"),
                 "主营业务成本(全年)": _sum_metric("cost"),
+                "财务费用(全年)": _sum_metric("financial_expense"),
                 "营业利润(全年)": _sum_metric("operating_profit"),
                 "净利润(全年)": _sum_metric("net_profit"),
             }
@@ -9660,6 +11077,7 @@ class ReportGenerator:
                     ("主营业务成本", "cost"),
                     ("销售费用", "sales_expense"),
                     ("管理费用", "admin_expense"),
+                    ("财务费用", "financial_expense"),
                     ("营业利润", "operating_profit"),
                     ("应收账款余额", "ar_balance"),
                     ("存货期末余额", "inventory_end"),
@@ -9667,6 +11085,7 @@ class ReportGenerator:
                     ("主营业务成本成本率", "cost_rate"),
                     ("销售费用率", "sales_expense_rate"),
                     ("管理费用率", "admin_expense_rate"),
+                    ("财务费用率", "financial_expense_rate"),
                     ("营业利润率", "operating_profit_rate"),
                     ("存货周转天数", "inventory_turnover_days"),
                 ]
@@ -9713,6 +11132,7 @@ class ReportGenerator:
                     ("主营业务成本", "cost"),
                     ("销售费用", "sales_expense"),
                     ("管理费用", "admin_expense"),
+                    ("财务费用", "financial_expense"),
                     ("营业利润", "operating_profit"),
                 ]
                 for header, key in checks:
@@ -9754,6 +11174,7 @@ class ReportGenerator:
                     ("主营业务成本", "cost"),
                     ("销售费用", "sales_expense"),
                     ("管理费用", "admin_expense"),
+                    ("财务费用", "financial_expense"),
                     ("营业利润", "operating_profit"),
                 ]
                 for header, key in checks:
@@ -10024,6 +11445,7 @@ class ReportGenerator:
             self._audit_chart_counts(wb)
             self._update_chart_titles(wb, target_year, target_month)
             self._update_dashboard_controls(wb, target_year, target_month, self.year_scope)
+            self._rewrite_chart_month_categories_for_history(wb, self.year_scope)
             self._trim_chart_data_ranges(wb)
             self._ensure_chart_month_axis_order(wb)
             self._append_chart_notes_below(wb, target_year, target_month)
@@ -10608,7 +12030,7 @@ class ReportGenerator:
 
         scoped_month_cols = []
         for m_key, col_idx in month_col_map.items():
-            if self._month_key_in_scope(m_key, target_year, target_month, year_scope):
+            if self._month_key_in_scope(m_key, target_year, target_month, "current"):
                 scoped_month_cols.append(col_idx)
         scoped_month_cols = sorted(set(scoped_month_cols))
         if not scoped_month_cols:
@@ -10707,7 +12129,7 @@ class ReportGenerator:
         # Clear future months.
         if target_year and target_month:
             for full_key, col_idx in col_map.items():
-                m_match = re.match(r'(20\d{2})[-/](\d{1,2})', full_key)
+                m_match = re.match(r'(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?', full_key)
                 if not m_match:
                     continue
                 m_key = f"{m_match.group(1)}-{int(m_match.group(2)):02d}"

@@ -356,11 +356,25 @@ def install_smart_restore_header(root: tk.Misc, base_data_mgr=None):
 
 
 class TreeviewTools:
-    def __init__(self, tree: ttk.Treeview, headings=None, allow_reorder=True, base_data_mgr=None):
+    def __init__(
+        self,
+        tree: ttk.Treeview,
+        headings=None,
+        allow_reorder=True,
+        base_data_mgr=None,
+        read_only=False,
+        sync_single_cell_to_row_selection=True,
+        auto_select_row_on_right_click=True,
+        enable_row_context_actions=True,
+    ):
         self.tree = tree
         self.headings = headings or {}
         self.allow_reorder = allow_reorder
         self.base_data_mgr = base_data_mgr
+        self.read_only = read_only
+        self.sync_single_cell_to_row_selection = sync_single_cell_to_row_selection
+        self.auto_select_row_on_right_click = auto_select_row_on_right_click
+        self.enable_row_context_actions = enable_row_context_actions
         self.filters = {}
         self.hidden_columns = set()
         self.all_items = []
@@ -398,10 +412,32 @@ class TreeviewTools:
         self.tree.bind("<Control-x>", self._on_cut)
         self.tree.bind("<Delete>", self._on_clear)
 
+    def _clear_row_selection(self):
+        try:
+            current = self.tree.selection()
+            if current:
+                self.tree.selection_remove(current)
+        except Exception:
+            pass
+
+    def _select_row(self, item_id, append=False):
+        if not item_id:
+            return
+        try:
+            if append:
+                self.tree.selection_add(item_id)
+            else:
+                self.tree.selection_set(item_id)
+            self.cell_select_range = None
+            self._hide_focus_lines()
+        except Exception:
+            pass
+
     def _on_box_click(self, event):
         # 转发单击
         x = event.widget.winfo_x() + event.x
         y = event.widget.winfo_y() + event.y
+        self.tree.focus_set()
         self.tree.event_generate("<Button-1>", x=x, y=y, state=event.state)
         return "break"
 
@@ -409,6 +445,7 @@ class TreeviewTools:
         # 转发双击
         x = event.widget.winfo_x() + event.x
         y = event.widget.winfo_y() + event.y
+        self.tree.focus_set()
         self.tree.event_generate("<Double-1>", x=x, y=y, state=event.state)
         return "break"
 
@@ -473,18 +510,24 @@ class TreeviewTools:
             item_id = self.tree.identify_row(event.y)
             col_id = self.tree.identify_column(event.x)
             if item_id:
-                if item_id not in self.tree.selection():
-                    self.tree.selection_set(item_id)
+                self.tree.focus_set()
                 self.last_clicked_cell = (item_id, col_id)
-                
-                # 同时也移动焦点框
-                bbox = self.tree.bbox(item_id, col_id)
-                if bbox:
-                    self._place_focus_lines(bbox)
+                if col_id:
+                    self._update_cell_selection(item_id, col_id, item_id, col_id)
+                if self.auto_select_row_on_right_click and item_id not in self.tree.selection():
+                    self.tree.selection_set(item_id)
 
                 menu = tk.Menu(self.tree, tearoff=0)
-                menu.add_command(label="复制选中行", command=self._on_copy, accelerator="Ctrl+C")
-                menu.add_command(label="粘贴到此处", command=self._on_paste, accelerator="Ctrl+V")
+                copy_label = "复制选中单元格/行" if self.cell_select_range else "复制选中行"
+                menu.add_command(label=copy_label, command=self._on_copy, accelerator="Ctrl+C")
+                if not self.read_only:
+                    menu.add_command(label="粘贴到此处", command=self._on_paste, accelerator="Ctrl+V")
+                if self.enable_row_context_actions:
+                    menu.add_separator()
+                    menu.add_command(label="选择当前整行", command=lambda iid=item_id: self._select_row(iid))
+                    menu.add_command(label="追加选择当前整行", command=lambda iid=item_id: self._select_row(iid, append=True))
+                    if self.tree.selection():
+                        menu.add_command(label="清空整行选择", command=self._clear_row_selection)
                 menu.add_separator()
                 menu.add_command(label="刷新表格", command=lambda: self.tree.event_generate("<<TreeviewRefresh>>"))
                 menu.tk_popup(event.x_root, event.y_root)
@@ -836,6 +879,7 @@ class TreeviewTools:
             item_id = self.tree.identify_row(event.y)
             col_id = self.tree.identify_column(event.x)
             if item_id and col_id:
+                self.tree.focus_set()
                 self.last_clicked_cell = (item_id, col_id)
                 self.drag_selecting = True
                 self.drag_start_item = item_id
@@ -854,6 +898,8 @@ class TreeviewTools:
                     self._update_cell_selection(item_id, col_id, item_id, col_id, keep_start=shift)
                 except Exception:
                     self._hide_focus_lines()
+                if not self.sync_single_cell_to_row_selection:
+                    return "break"
         else:
             self.drag_selecting = False
             self.drag_start_item = None
@@ -958,6 +1004,8 @@ class TreeviewTools:
         return "break"
 
     def _on_paste(self, event=None):
+        if self.read_only:
+            return "break"
         try:
             text = self.tree.clipboard_get()
         except tk.TclError:
@@ -1036,12 +1084,16 @@ class TreeviewTools:
         return "break"
 
     def _on_cut(self, event=None):
+        if self.read_only:
+            return "break"
         if self._on_copy() == "break":
             if self._clear_selected_cells():
                 self.tree.event_generate("<<TreeviewPaste>>", when="tail")
         return "break"
 
     def _on_clear(self, event=None):
+        if self.read_only:
+            return "break"
         if self._clear_selected_cells():
             self.tree.event_generate("<<TreeviewPaste>>", when="tail")
         return "break"
@@ -1082,10 +1134,14 @@ class TreeviewTools:
         self.drag_active = True
 
     def _on_left_release(self, event):
+        region = self.tree.identify_region(event.x, event.y)
         self.drag_selecting = False
         self.drag_start_item = None
         self.drag_start_col = None
-        
+
+        if region in ("cell", "tree", "item") and not self.sync_single_cell_to_row_selection:
+            return "break"
+
         if not self.allow_reorder:
             return None
         if self.drag_active:
@@ -1133,9 +1189,12 @@ class TreeviewTools:
 
         try:
             if row_min == row_max and col_min == col_max:
-                self.tree.selection_set(children[row_min])
+                if self.sync_single_cell_to_row_selection:
+                    self.tree.selection_set(children[row_min])
+                else:
+                    self._clear_row_selection()
             else:
-                self.tree.selection_remove(self.tree.selection())
+                self._clear_row_selection()
         except Exception:
             pass
 
@@ -1329,9 +1388,27 @@ class TreeviewTools:
         ttk.Button(action_frame, text="取消", command=dialog.destroy).pack(side="right")
 
 
-def attach_treeview_tools(tree: ttk.Treeview, headings=None, allow_reorder=True, base_data_mgr=None):
+def attach_treeview_tools(
+    tree: ttk.Treeview,
+    headings=None,
+    allow_reorder=True,
+    base_data_mgr=None,
+    read_only=False,
+    sync_single_cell_to_row_selection=True,
+    auto_select_row_on_right_click=True,
+    enable_row_context_actions=True,
+):
     # 强制开启多选模式，支持框选
     tree.configure(selectmode="extended")
-    tools = TreeviewTools(tree, headings=headings, allow_reorder=allow_reorder, base_data_mgr=base_data_mgr)
+    tools = TreeviewTools(
+        tree,
+        headings=headings,
+        allow_reorder=allow_reorder,
+        base_data_mgr=base_data_mgr,
+        read_only=read_only,
+        sync_single_cell_to_row_selection=sync_single_cell_to_row_selection,
+        auto_select_row_on_right_click=auto_select_row_on_right_click,
+        enable_row_context_actions=enable_row_context_actions,
+    )
     tree._treeview_tools = tools
     return tools

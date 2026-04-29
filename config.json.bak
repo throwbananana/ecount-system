@@ -848,11 +848,133 @@
         },
         "shipping_container": {
             "active": "",
-            "formats": {}
+            "formats": {
+                "采购入库": [
+                    {
+                        "output": "日期",
+                        "source": "",
+                        "default": "20260301"
+                    },
+                    {
+                        "output": "序号",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "往来单位编码",
+                        "source": "<选择基础数据字段>",
+                        "default": ""
+                    },
+                    {
+                        "output": "往来单位名",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "职员",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "接受仓库",
+                        "source": "BDV:warehouse|name|code|100",
+                        "default": ""
+                    },
+                    {
+                        "output": "交易类型",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "货币",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "汇率",
+                        "source": "",
+                        "default": "6.87977124"
+                    },
+                    {
+                        "output": "采购入库号",
+                        "source": "货柜号",
+                        "default": ""
+                    },
+                    {
+                        "output": "ENTR No:",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "DOCUM",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "Cargos",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "箱号",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "品目编码",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "品目名",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "规格名",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "COLOR",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "CAJAS",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "数量",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "单价(包括税)",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "单价",
+                        "source": "",
+                        "default": ""
+                    },
+                    {
+                        "output": "外币金额",
+                        "source": "",
+                        "default": ""
+                    }
+                ]
+            },
+            "use_original": false
         },
         "image_recognition": {
             "active": "",
             "formats": {}
         }
+    },
+    "EXPORT_FORMAT_SAMPLES": {
+        "main_export": "C:/Users/123/Downloads/亿看智能识别系统/Template.xlsx"
     }
 }

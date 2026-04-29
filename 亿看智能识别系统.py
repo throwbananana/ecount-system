@@ -89,6 +89,93 @@ except ImportError:
 
 TEMPLATE_FILE = "Template.xlsx"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DATA_DIR_NAME = os.path.join("基础数据", "基础数据")
+REPORT_BASE_DIR_NAME = "基础资料"
+DEFAULT_REPORT_TEMPLATE_FILE = "11月汇总结果_整理优化美化_含仪表盘_目标预算达成异常 (1).xlsx"
+
+
+def _dedupe_abs_paths(paths):
+    """去重并标准化路径列表。"""
+    unique_paths = []
+    for path in paths:
+        normalized = os.path.abspath(path)
+        if normalized not in unique_paths:
+            unique_paths.append(normalized)
+    return unique_paths
+
+
+def get_resource_root_dirs():
+    """返回资源根目录，兼容源码运行和打包运行。"""
+    dirs = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        dirs.extend([
+            exe_dir,
+            os.path.dirname(exe_dir),
+            os.path.dirname(os.path.dirname(exe_dir)),
+        ])
+    dirs.extend([APP_DIR, os.getcwd()])
+    return _dedupe_abs_paths(dirs)
+
+
+def get_resource_search_dirs():
+    """返回资源文件搜索目录，优先基础数据目录，其次基础资料和程序目录。"""
+    dirs = []
+    for root_dir in RESOURCE_ROOT_DIRS:
+        dirs.extend([
+            os.path.join(root_dir, BASE_DATA_DIR_NAME),
+            os.path.join(root_dir, REPORT_BASE_DIR_NAME),
+            os.path.join(root_dir, "基础数据"),
+            root_dir,
+        ])
+    return _dedupe_abs_paths(dirs)
+
+
+RESOURCE_ROOT_DIRS = get_resource_root_dirs()
+RESOURCE_SEARCH_DIRS = get_resource_search_dirs()
+
+
+def resolve_resource_file(resource_path, default_name=""):
+    """将资源文件解析为绝对路径。"""
+    raw_path = str(resource_path or default_name).strip()
+    if not raw_path:
+        raw_path = default_name
+
+    normalized_path = os.path.expanduser(raw_path)
+    if os.path.isabs(normalized_path):
+        return os.path.abspath(normalized_path)
+
+    for base_dir in RESOURCE_SEARCH_DIRS:
+        candidate = os.path.abspath(os.path.join(base_dir, normalized_path))
+        if os.path.exists(candidate):
+            return candidate
+
+    return os.path.abspath(os.path.join(RESOURCE_SEARCH_DIRS[0], normalized_path))
+
+
+def resolve_resource_dir(dir_path, default_dir=""):
+    """将资源目录解析为绝对路径。"""
+    raw_path = str(dir_path or default_dir).strip()
+    if not raw_path:
+        raw_path = default_dir
+
+    normalized_path = os.path.expanduser(raw_path)
+    if os.path.isabs(normalized_path):
+        return os.path.abspath(normalized_path)
+
+    for base_dir in RESOURCE_ROOT_DIRS:
+        candidate = os.path.abspath(os.path.join(base_dir, normalized_path))
+        if os.path.isdir(candidate):
+            return candidate
+
+    return os.path.abspath(os.path.join(RESOURCE_ROOT_DIRS[0], normalized_path))
+
+
+def resolve_template_path(template_path=TEMPLATE_FILE):
+    """将模板路径解析为绝对路径，兼容从其他目录启动程序。"""
+    return resolve_resource_file(template_path, TEMPLATE_FILE)
+
+
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 # ======== 默认字段规则（兜底用） ========
@@ -265,10 +352,11 @@ class TemplateHeader:
 
 def load_template_headers(template_path=TEMPLATE_FILE):
     """从模板文件中读取表头和批注。"""
-    if not os.path.exists(template_path):
-        raise FileNotFoundError(f"未找到模板文件：{template_path}")
+    resolved_path = resolve_template_path(template_path)
+    if not os.path.exists(resolved_path):
+        raise FileNotFoundError(f"未找到模板文件：{resolved_path}")
 
-    wb = load_workbook(template_path, data_only=True)
+    wb = load_workbook(resolved_path, data_only=True)
     ws = wb.active
     headers = []
     for cell in ws[1]:
@@ -504,11 +592,16 @@ def score_similarity(template_name: str, src_name: str, template_key: str) -> fl
 
 # --- 安全表达式求值（用于综合字段表达式） ---
 ALLOWED_AST_NODES = (
-    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Str, ast.Constant,
+    ast.Expression, ast.BinOp, ast.UnaryOp,
+    getattr(ast, "Num", ast.Constant),
+    getattr(ast, "Str", ast.Constant),
+    ast.Constant,
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.Load,
     ast.Call, ast.Name, ast.Attribute, ast.Tuple, ast.List, ast.Dict,
     ast.Compare, ast.Eq, ast.NotEq, ast.Gt, ast.GtE, ast.Lt, ast.LtE,
-    ast.BoolOp, ast.And, ast.Or, ast.IfExp, ast.Subscript, ast.Index, ast.Slice,
+    ast.BoolOp, ast.And, ast.Or, ast.IfExp, ast.Subscript,
+    getattr(ast, "Index", ast.Subscript),
+    ast.Slice,
 )
 ALLOWED_CALL_NAMES = {"col", "field", "mapped", "composite", "lookup", "abs", "round", "min", "max", "Decimal", "float", "int", "str"}
 MAX_COMPOSITE_EXPR_LEN = 1000
@@ -580,9 +673,10 @@ class ExcelConverterGUI:
         self.sheet_var = tk.StringVar()
         self.input_path_var = tk.StringVar()
         
-        default_template = TEMPLATE_FILE
-        if os.path.exists("Template_通用凭证.xlsx"):
-             default_template = "Template_通用凭证.xlsx"
+        default_template = resolve_template_path(TEMPLATE_FILE)
+        general_template = resolve_template_path("Template_通用凭证.xlsx")
+        if os.path.exists(general_template):
+             default_template = general_template
         self.template_path_var = tk.StringVar(value=default_template)
         
         self.convert_mode_var = tk.StringVar(value=MODE_GENERAL_VOUCHER)
@@ -1390,7 +1484,7 @@ class ExcelConverterGUI:
             ai_provider = self.default_values.get("ai_provider", "zhipu")
             base_url = self.default_values.get("ai_base_url", "http://localhost:1234/v1")
             model_name = self.default_values.get("ai_model_name", "local-model")
-        template_path = self.template_path_var.get() or TEMPLATE_FILE
+        template_path = resolve_template_path(self.template_path_var.get() or TEMPLATE_FILE)
 
         # 打开图片识别窗口
         try:
@@ -1553,7 +1647,7 @@ class ExcelConverterGUI:
         else:
             base_mode = current_mode
             
-        template_path = self.template_path_var.get()
+        template_path = resolve_template_path(self.template_path_var.get())
         
         # 收集映射关系
         mapping = {}
@@ -1947,7 +2041,7 @@ class ExcelConverterGUI:
         if scheme_name:
             self._debug_log("跳过自动映射: 方案模式")
             return
-        template_path = self.template_path_var.get() or TEMPLATE_FILE
+        template_path = resolve_template_path(self.template_path_var.get() or TEMPLATE_FILE)
         saved = self.base_data_mgr.get_auto_mapping(
             template_path,
             effective_mode,
@@ -1977,7 +2071,7 @@ class ExcelConverterGUI:
         if scheme_name:
             self._debug_log("跳过保存自动映射: 方案模式")
             return
-        template_path = self.template_path_var.get() or TEMPLATE_FILE
+        template_path = resolve_template_path(self.template_path_var.get() or TEMPLATE_FILE)
         cleaned = {k: v for k, v in mapping.items() if v}
         if not cleaned:
             return
@@ -2937,6 +3031,13 @@ class ExcelConverterGUI:
             return None
         return df_yikan
 
+    def _attach_readonly_preview_tools(self, tree):
+        """
+        为只读预览表格统一启用单元格框选复制能力。
+        保持只读，避免预览窗口被误粘贴或删除修改。
+        """
+        return attach_treeview_tools(tree, allow_reorder=False, read_only=True)
+
     def _show_recon_data_preview(self, df, title):
         win = tk.Toplevel(self.root)
         win.title(title)
@@ -2970,7 +3071,7 @@ class ExcelConverterGUI:
             vals = [str(v) for v in row]
             tree.insert("", tk.END, values=vals)
 
-        attach_treeview_tools(tree)
+        self._attach_readonly_preview_tools(tree)
 
         win.transient(self.root)
         win.grab_set()
@@ -3085,7 +3186,7 @@ class ExcelConverterGUI:
                 
             if len(df) > 100:
                 ttk.Label(frame, text=f"仅显示前 100 行预览，共 {len(df)} 行").grid(column=0, row=2, sticky="w")
-            attach_treeview_tools(tree)
+            self._attach_readonly_preview_tools(tree)
 
         add_tab("已匹配明细", matched)
         add_tab("当地未匹配", unmatched_l)
@@ -3150,7 +3251,7 @@ class ExcelConverterGUI:
                 for s in suggestions:
                     vals = [str(s.get(c, "")) for c in cols]
                     tree.insert("", "end", values=vals)
-                attach_treeview_tools(tree)
+                self._attach_readonly_preview_tools(tree)
                 
             except Exception as e:
                 btn_ai.config(state="normal", text="AI 智能分析未匹配项")
@@ -4327,7 +4428,7 @@ class ExcelConverterGUI:
         tree.pack(side="left", fill="both", expand=True)
         tree_scroll_y.pack(side="right", fill="y")
         tree_scroll_x.pack(side="bottom", fill="x")
-        attach_treeview_tools(tree)
+        self._attach_readonly_preview_tools(tree)
 
     def _on_summary_match_export_format_changed(self, event=None):
         name = self.summary_match_export_format_var.get().strip()
@@ -4807,20 +4908,22 @@ class ExcelConverterGUI:
         path = template_path if template_path else self.template_path_var.get()
         if not path:
              path = TEMPLATE_FILE
-             
+        resolved_path = resolve_template_path(path)
+
         try:
-            headers, wb, ws = load_template_headers(path)
+            headers, wb, ws = load_template_headers(resolved_path)
         except FileNotFoundError as e:
-            messagebox.showerror("错误", f"读取模板失败：\n{e}\n\n请确认 {path} 是否存在。")
+            messagebox.showerror("错误", f"读取模板失败：\n{e}\n\n请确认 {resolved_path} 是否存在。")
             return
         except Exception as e:
             messagebox.showerror("错误", f"读取模板失败：\n{e}")
             return
 
+        self.template_path_var.set(resolved_path)
         self.template_headers = headers
         self.template_workbook = wb
         self.template_sheet = ws
-        self._debug_log(f"已加载模板: {path}, 表头数={len(headers)}")
+        self._debug_log(f"已加载模板: {resolved_path}, 表头数={len(headers)}")
     
     def _load_original_headers(self):
         """原格式模式：使用源文件表头作为目标表头"""
@@ -4879,8 +4982,9 @@ class ExcelConverterGUI:
                 except Exception:
                     self.custom_composite_fields = {}
                 # 方案附带的模板路径
-                if scheme_data["template_path"] and os.path.exists(scheme_data["template_path"]):
-                    self.template_path_var.set(scheme_data["template_path"])
+                scheme_template = resolve_template_path(scheme_data["template_path"])
+                if scheme_data["template_path"] and os.path.exists(scheme_template):
+                    self.template_path_var.set(scheme_template)
                 base_title += f" - {scheme_name}"
             else:
                 # 方案丢失或错误，回退
@@ -4900,10 +5004,11 @@ class ExcelConverterGUI:
             base_title += " - 原格式模式"
         else:
             if not scheme_data: # 如果不是方案，重置为对应的默认模板
-                if mode == MODE_GENERAL_VOUCHER and os.path.exists("Template_通用凭证.xlsx"):
-                     self.template_path_var.set("Template_通用凭证.xlsx")
+                general_template = resolve_template_path("Template_通用凭证.xlsx")
+                if mode == MODE_GENERAL_VOUCHER and os.path.exists(general_template):
+                     self.template_path_var.set(general_template)
                 else:
-                     self.template_path_var.set(TEMPLATE_FILE)
+                     self.template_path_var.set(resolve_template_path(TEMPLATE_FILE))
 
             self.template_entry.config(state="readonly")
             self.template_btn.config(state="disabled")
@@ -5600,7 +5705,7 @@ class ExcelConverterGUI:
         tree.pack(side="left", fill="both", expand=True)
         scrollbar_y.pack(side="right", fill="y")
         scrollbar_x.pack(side="bottom", fill="x")
-        attach_treeview_tools(tree)
+        self._attach_readonly_preview_tools(tree)
 
         # 标签样式
         tree.tag_configure("mapped", background="#e6ffe6")  # 已映射 - 浅绿
@@ -8455,6 +8560,7 @@ class ExcelConverterGUI:
         preview_tree = None
         tree_scroll_y = None
         tree_scroll_x = None
+        preview_cell_overrides = {}
 
         table_frame = ttk.Frame(main_frame)
         table_frame.pack(fill="both", expand=True)
@@ -8474,6 +8580,24 @@ class ExcelConverterGUI:
                     self.log_message(f"兼容预览应用导出格式失败，已回退原始预览: {e}")
             return source_headers, source_rows, False
 
+        def _apply_preview_overrides(headers, rows):
+            if not preview_cell_overrides:
+                return rows
+            patched_rows = [list(r) for r in rows]
+            header_index = {name: idx for idx, name in enumerate(headers)}
+            for (row_idx, col_name), value in preview_cell_overrides.items():
+                if row_idx < 0 or row_idx >= len(patched_rows):
+                    continue
+                col_idx = header_index.get(col_name)
+                if col_idx is None:
+                    continue
+                row_values = list(patched_rows[row_idx])
+                if len(row_values) < len(headers):
+                    row_values.extend([""] * (len(headers) - len(row_values)))
+                row_values[col_idx] = value
+                patched_rows[row_idx] = row_values
+            return patched_rows
+
         unmatched_output_indices = {
             item.get("output_index") for item in unmatched_info if item.get("output_index")
         }
@@ -8485,6 +8609,7 @@ class ExcelConverterGUI:
             if not headers:
                 max_col_count = max((len(r) for r in rows), default=0)
                 headers = [f"列{i + 1}" for i in range(max_col_count)]
+            rows = _apply_preview_overrides(headers, rows)
 
             if preview_tree is not None:
                 try:
@@ -8531,9 +8656,61 @@ class ExcelConverterGUI:
             preview_tree.pack(side="left", fill="both", expand=True)
             tree_scroll_y.pack(side="right", fill="y")
             tree_scroll_x.pack(side="bottom", fill="x")
+            self._attach_readonly_preview_tools(preview_tree)
+            preview_tree.bind("<Double-1>", _open_cell_editor, add="+")
 
             mode_text = "已应用导出格式预览" if mapped_applied else "原始结果预览"
             preview_status_var.set(f"{mode_text} | 显示 {min(len(rows), display_limit)}/{len(rows)} 行，{len(headers)} 列")
+
+        def _open_cell_editor(event):
+            if preview_tree is None:
+                return
+            region = preview_tree.identify_region(event.x, event.y)
+            if region != "cell":
+                return
+            row_id = preview_tree.identify_row(event.y)
+            col_id = preview_tree.identify_column(event.x)
+            if not row_id or not col_id:
+                return
+            try:
+                row_idx = int(row_id)
+            except ValueError:
+                return
+            col_index = int(col_id.replace("#", "")) - 1
+            columns = list(preview_tree["columns"])
+            if col_index < 0 or col_index >= len(columns):
+                return
+            col_name = columns[col_index]
+            bbox = preview_tree.bbox(row_id, column=col_name)
+            if not bbox:
+                return
+            x, y, width, height = bbox
+            current_values = list(preview_tree.item(row_id, "values"))
+            current_val = current_values[col_index] if col_index < len(current_values) else ""
+
+            entry = ttk.Entry(preview_tree)
+            entry.place(x=x, y=y, width=width, height=height)
+            entry.insert(0, current_val)
+            entry.select_range(0, tk.END)
+            entry.focus()
+
+            def _save_edit(event=None):
+                new_val = entry.get()
+                entry.destroy()
+                if col_index >= len(current_values):
+                    current_values.extend([""] * (col_index + 1 - len(current_values)))
+                if new_val == str(current_values[col_index]):
+                    return
+                current_values[col_index] = new_val
+                preview_tree.item(row_id, values=current_values)
+                preview_cell_overrides[(row_idx, col_name)] = new_val
+
+            def _cancel_edit(event=None):
+                entry.destroy()
+
+            entry.bind("<Return>", _save_edit)
+            entry.bind("<FocusOut>", _save_edit)
+            entry.bind("<Escape>", _cancel_edit)
 
         def _open_format_editor_and_refresh():
             self._open_export_format_editor()
@@ -8556,6 +8733,7 @@ class ExcelConverterGUI:
 
         hint_text = f"注: 兼容模式仅显示前 {display_limit} 行（总计 {len(output_rows)} 行），仅用于格式核对"
         ttk.Label(main_frame, text=hint_text, foreground="gray").pack(anchor="w", pady=(5, 0))
+        ttk.Label(main_frame, text="操作提示：单击单元格后 Ctrl+C 可复制；拖拽可框选复制；双击单元格可直接编辑。", foreground="gray").pack(anchor="w", pady=(2, 0))
 
         detail_frame = ttk.Frame(main_frame)
         detail_frame.pack(fill="x", pady=(6, 0))
@@ -8591,6 +8769,7 @@ class ExcelConverterGUI:
                 return
             try:
                 export_headers, export_rows, _mapped_applied = _resolve_display_dataset()
+                export_rows = _apply_preview_overrides(export_headers, export_rows)
                 df = pd.DataFrame(export_rows, columns=export_headers)
                 df.to_excel(path, index=False)
                 messagebox.showinfo("完成", f"已导出预览数据：\n{path}")
@@ -8598,6 +8777,11 @@ class ExcelConverterGUI:
                 messagebox.showerror("错误", f"导出失败：{e}")
 
         def confirm():
+            export_headers, export_rows, _mapped_applied = _resolve_display_dataset()
+            export_rows = _apply_preview_overrides(export_headers, export_rows)
+            self._preview_header_override = True
+            self._preview_header_names = list(export_headers)
+            output_rows[:] = export_rows
             result["confirmed"] = True
             preview_window.destroy()
 
@@ -9812,7 +9996,7 @@ class ExcelConverterGUI:
                 return
 
             # 加载模板
-            template_path = self.template_path_var.get() or TEMPLATE_FILE
+            template_path = resolve_template_path(self.template_path_var.get() or TEMPLATE_FILE)
             if not os.path.exists(template_path):
                 raise FileNotFoundError(f"未找到模板文件：{template_path}")
 
@@ -10118,6 +10302,8 @@ class ExcelConverterGUI:
             elif col == "created_at": width = 150
             elif col == "account_code": width = 80
             elif col == "match_items": width = 220
+            elif col == "latest_inventory_date": width = 110
+            elif col in {"latest_inventory_qty", "latest_inventory_cost"}: width = 120
             self.base_data_tree.column(col, width=width, stretch=True)
 
         # 插入数据
@@ -11024,6 +11210,9 @@ class ExcelConverterGUI:
             "weight": "重量",
             "color": "颜色",
             "size_range": "尺码范围",
+            "latest_inventory_qty": "最新库存数量",
+            "latest_inventory_cost": "最新库存成本",
+            "latest_inventory_date": "最新库存日期",
             "contact_person": "联系人",
             "mobile": "手机",
             "phone": "电话",
@@ -11125,7 +11314,8 @@ class ExcelConverterGUI:
                     if col in ["exchange_rate", "pack_qty", "unit_conversion_denominator",
                                "unit_conversion_numerator", "in_price", "out_price",
                                "price_a", "price_b", "price_c", "length", "width",
-                               "height", "volume", "weight"]:
+                               "height", "volume", "weight", "latest_inventory_qty",
+                               "latest_inventory_cost"]:
                         try:
                             data[col] = float(value) if value else None
                         except ValueError:
@@ -11201,14 +11391,17 @@ class ExcelConverterGUI:
 
         # Base Data Dir
         ttk.Label(top_frame, text="基础资料目录:").grid(row=0, column=0, sticky="e", pady=5)
-        self.report_base_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "基础资料"))
+        self.report_base_dir_var = tk.StringVar(
+            value=resolve_resource_dir(REPORT_BASE_DIR_NAME, REPORT_BASE_DIR_NAME)
+        )
         ttk.Entry(top_frame, textvariable=self.report_base_dir_var, width=50).grid(row=0, column=1, columnspan=3, sticky="ew", padx=5)
         ttk.Button(top_frame, text="浏览...", command=self._select_report_base_dir).grid(row=0, column=4)
 
         # Template Path
         ttk.Label(top_frame, text="报告模板文件:").grid(row=1, column=0, sticky="e", pady=5)
-        default_template = "11月汇总结果_整理优化美化_含仪表盘_目标预算达成异常 (1).xlsx"
-        self.report_template_var = tk.StringVar(value=os.path.join(os.getcwd(), default_template))
+        self.report_template_var = tk.StringVar(
+            value=resolve_resource_file(DEFAULT_REPORT_TEMPLATE_FILE, DEFAULT_REPORT_TEMPLATE_FILE)
+        )
         ttk.Entry(top_frame, textvariable=self.report_template_var, width=50).grid(row=1, column=1, columnspan=3, sticky="ew", padx=5)
         ttk.Button(top_frame, text="浏览...", command=lambda: self._select_file(self.report_template_var)).grid(row=1, column=4)
 
@@ -11259,6 +11452,7 @@ class ExcelConverterGUI:
         param_frame = ttk.LabelFrame(report_frame, text="预警参数", padding=10)
         param_frame.pack(fill="x", padx=10, pady=(0, 10))
 
+        self.report_warning_manual_var = tk.BooleanVar(value=False)
         self.report_replenish_lead_var = tk.StringVar(value="30")
         self.report_replenish_safety_var = tk.StringVar(value="20")
         self.report_replenish_window_var = tk.StringVar(value="3")
@@ -11267,22 +11461,51 @@ class ExcelConverterGUI:
         self.report_cash_ccc_var = tk.StringVar(value="120")
         self.report_cash_cover_var = tk.StringVar(value="1.5")
 
-        ttk.Label(param_frame, text="补货：采购周期(天)").grid(row=0, column=0, sticky="e", pady=2)
-        ttk.Entry(param_frame, textvariable=self.report_replenish_lead_var, width=6).grid(row=0, column=1, sticky="w", padx=5)
-        ttk.Label(param_frame, text="安全库存(天)").grid(row=0, column=2, sticky="e", pady=2)
-        ttk.Entry(param_frame, textvariable=self.report_replenish_safety_var, width=6).grid(row=0, column=3, sticky="w", padx=5)
-        ttk.Label(param_frame, text="销量窗口(月)").grid(row=0, column=4, sticky="e", pady=2)
-        ttk.Entry(param_frame, textvariable=self.report_replenish_window_var, width=6).grid(row=0, column=5, sticky="w", padx=5)
+        ttk.Checkbutton(
+            param_frame,
+            text="手动填入预警参数",
+            variable=self.report_warning_manual_var,
+            command=self._toggle_report_warning_param_inputs,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(
+            param_frame,
+            text="未勾选时根据已导入库存、销售、货币资金/资产负债等数据自动分析",
+            foreground="#666666",
+        ).grid(row=0, column=2, columnspan=4, sticky="w", padx=5, pady=(0, 4))
 
-        ttk.Label(param_frame, text="资金链：DSO阈值(天)").grid(row=1, column=0, sticky="e", pady=2)
-        ttk.Entry(param_frame, textvariable=self.report_cash_dso_var, width=6).grid(row=1, column=1, sticky="w", padx=5)
-        ttk.Label(param_frame, text="DIO阈值(天)").grid(row=1, column=2, sticky="e", pady=2)
-        ttk.Entry(param_frame, textvariable=self.report_cash_dio_var, width=6).grid(row=1, column=3, sticky="w", padx=5)
-        ttk.Label(param_frame, text="CCC阈值(天)").grid(row=1, column=4, sticky="e", pady=2)
-        ttk.Entry(param_frame, textvariable=self.report_cash_ccc_var, width=6).grid(row=1, column=5, sticky="w", padx=5)
+        self._report_warning_param_inputs = []
 
-        ttk.Label(param_frame, text="现金覆盖(月)").grid(row=2, column=0, sticky="e", pady=2)
-        ttk.Entry(param_frame, textvariable=self.report_cash_cover_var, width=6).grid(row=2, column=1, sticky="w", padx=5)
+        ttk.Label(param_frame, text="补货：采购周期(天)").grid(row=1, column=0, sticky="e", pady=2)
+        entry = ttk.Entry(param_frame, textvariable=self.report_replenish_lead_var, width=6)
+        entry.grid(row=1, column=1, sticky="w", padx=5)
+        self._report_warning_param_inputs.append(entry)
+        ttk.Label(param_frame, text="安全库存(天)").grid(row=1, column=2, sticky="e", pady=2)
+        entry = ttk.Entry(param_frame, textvariable=self.report_replenish_safety_var, width=6)
+        entry.grid(row=1, column=3, sticky="w", padx=5)
+        self._report_warning_param_inputs.append(entry)
+        ttk.Label(param_frame, text="销量窗口(月)").grid(row=1, column=4, sticky="e", pady=2)
+        entry = ttk.Entry(param_frame, textvariable=self.report_replenish_window_var, width=6)
+        entry.grid(row=1, column=5, sticky="w", padx=5)
+        self._report_warning_param_inputs.append(entry)
+
+        ttk.Label(param_frame, text="资金链：DSO阈值(天)").grid(row=2, column=0, sticky="e", pady=2)
+        entry = ttk.Entry(param_frame, textvariable=self.report_cash_dso_var, width=6)
+        entry.grid(row=2, column=1, sticky="w", padx=5)
+        self._report_warning_param_inputs.append(entry)
+        ttk.Label(param_frame, text="DIO阈值(天)").grid(row=2, column=2, sticky="e", pady=2)
+        entry = ttk.Entry(param_frame, textvariable=self.report_cash_dio_var, width=6)
+        entry.grid(row=2, column=3, sticky="w", padx=5)
+        self._report_warning_param_inputs.append(entry)
+        ttk.Label(param_frame, text="CCC阈值(天)").grid(row=2, column=4, sticky="e", pady=2)
+        entry = ttk.Entry(param_frame, textvariable=self.report_cash_ccc_var, width=6)
+        entry.grid(row=2, column=5, sticky="w", padx=5)
+        self._report_warning_param_inputs.append(entry)
+
+        ttk.Label(param_frame, text="现金覆盖(月)").grid(row=3, column=0, sticky="e", pady=2)
+        entry = ttk.Entry(param_frame, textvariable=self.report_cash_cover_var, width=6)
+        entry.grid(row=3, column=1, sticky="w", padx=5)
+        self._report_warning_param_inputs.append(entry)
+        self._toggle_report_warning_param_inputs()
 
         for col in range(6):
             param_frame.columnconfigure(col, weight=0)
@@ -11315,7 +11538,10 @@ class ExcelConverterGUI:
     def _refresh_report_year_options(self):
         if not hasattr(self, "report_year_cb"):
             return
-        base_dir = self.report_base_dir_var.get().strip()
+        base_dir = resolve_resource_dir(
+            self.report_base_dir_var.get().strip(),
+            REPORT_BASE_DIR_NAME,
+        )
         if not base_dir or not os.path.isdir(base_dir):
             return
         if self._report_years_dir == base_dir:
@@ -11350,7 +11576,10 @@ class ExcelConverterGUI:
     def _refresh_report_month_options(self, generator=None):
         if not hasattr(self, "report_month_cb"):
             return
-        base_dir = self.report_base_dir_var.get().strip()
+        base_dir = resolve_resource_dir(
+            self.report_base_dir_var.get().strip(),
+            REPORT_BASE_DIR_NAME,
+        )
         if not base_dir or not os.path.isdir(base_dir):
             return
         if generator is None and ReportGenerator:
@@ -11394,6 +11623,15 @@ class ExcelConverterGUI:
         self.report_log_text.see("end")
         self.root.update_idletasks()
 
+    def _toggle_report_warning_param_inputs(self):
+        manual_var = getattr(self, "report_warning_manual_var", None)
+        state = "normal" if (manual_var is None or manual_var.get()) else "disabled"
+        for entry in getattr(self, "_report_warning_param_inputs", []):
+            try:
+                entry.configure(state=state)
+            except Exception:
+                pass
+
     def _generate_business_report(self, open_in_converter=False):
         if not ReportGenerator:
             messagebox.showerror("错误", "ReportGenerator 模块加载失败，请检查 report_generator.py")
@@ -11411,19 +11649,31 @@ class ExcelConverterGUI:
             except Exception:
                 return default
 
-        base_dir = self.report_base_dir_var.get()
-        template_path = self.report_template_var.get()
+        base_dir = resolve_resource_dir(
+            self.report_base_dir_var.get(),
+            REPORT_BASE_DIR_NAME,
+        )
+        template_path = resolve_resource_file(
+            self.report_template_var.get(),
+            DEFAULT_REPORT_TEMPLATE_FILE,
+        )
         target_year = self.report_year_var.get()
         target_month = self.report_month_var.get()
         scope_label = self.report_year_scope_var.get()
         year_scope = "all" if "历年" in scope_label else "current"
 
+        self.report_base_dir_var.set(base_dir)
+        self.report_template_var.set(template_path)
+
+        warning_manual = self.report_warning_manual_var.get()
         replenishment_params = {
+            "manual": warning_manual,
             "lead_days": _parse_int(self.report_replenish_lead_var.get(), 30),
             "safety_days": _parse_int(self.report_replenish_safety_var.get(), 20),
             "window_months": _parse_int(self.report_replenish_window_var.get(), 3),
         }
         cashflow_params = {
+            "manual": warning_manual,
             "dso_threshold": _parse_int(self.report_cash_dso_var.get(), 90),
             "dio_threshold": _parse_int(self.report_cash_dio_var.get(), 180),
             "ccc_threshold": _parse_int(self.report_cash_ccc_var.get(), 120),
@@ -11463,26 +11713,59 @@ class ExcelConverterGUI:
             self._log_report("正在加载基础数据...")
             generator.load_all_data()
 
-            quality_summary = (
-                generator.get_data_quality_summary()
-                if hasattr(generator, "get_data_quality_summary")
-                else {"ERROR": 0, "WARN": 0, "INFO": 0, "TOTAL": 0}
-            )
+            if hasattr(generator, "_get_data_quality_summary_for_scope"):
+                quality_summary = generator._get_data_quality_summary_for_scope(
+                    target_year,
+                    target_month,
+                    year_scope,
+                )
+            elif hasattr(generator, "get_data_quality_summary"):
+                quality_summary = generator.get_data_quality_summary()
+            else:
+                quality_summary = {"ERROR": 0, "WARN": 0, "INFO": 0, "TOTAL": 0}
+
+            if hasattr(generator, "format_data_quality_details"):
+                quality_details_full = generator.format_data_quality_details(
+                    target_year,
+                    target_month,
+                    year_scope,
+                    max_per_severity=None,
+                )
+                quality_details_dialog = generator.format_data_quality_details(
+                    target_year,
+                    target_month,
+                    year_scope,
+                    max_per_severity=10,
+                )
+            else:
+                quality_details_full = ""
+                quality_details_dialog = ""
+
             if quality_summary.get("ERROR", 0) > 0:
                 dq_msg = (
-                    f"检测到数据质量问题：ERROR={quality_summary.get('ERROR', 0)}，"
+                    f"检测到数据质量问题（{target_year}-{int(target_month):02d} 报告口径）："
+                    f"ERROR={quality_summary.get('ERROR', 0)}，"
                     f"WARN={quality_summary.get('WARN', 0)}，INFO={quality_summary.get('INFO', 0)}。\n"
                     "继续生成可能导致报表口径异常。"
                 )
                 self._log_report(dq_msg)
-                proceed = messagebox.askyesno("数据质量风险", dq_msg + "\n\n是否继续生成报告？")
+                if quality_details_full:
+                    self._log_report("数据质量问题明细：\n" + quality_details_full)
+                dialog_msg = dq_msg
+                if quality_details_dialog:
+                    dialog_msg += "\n\n问题明细：\n" + quality_details_dialog
+                    dialog_msg += "\n\n完整明细已输出到生成日志，并会写入报告的“数据质量检查”Sheet。"
+                proceed = messagebox.askyesno("数据质量风险", dialog_msg + "\n\n是否继续生成报告？")
                 if not proceed:
                     self._log_report("用户取消操作。")
                     return
             elif quality_summary.get("WARN", 0) > 0:
                 self._log_report(
-                    f"数据质量检查提示：WARN={quality_summary.get('WARN', 0)}，INFO={quality_summary.get('INFO', 0)}。"
+                    f"数据质量检查提示（{target_year}-{int(target_month):02d} 报告口径）："
+                    f"WARN={quality_summary.get('WARN', 0)}，INFO={quality_summary.get('INFO', 0)}。"
                 )
+                if quality_details_full:
+                    self._log_report("数据质量问题明细：\n" + quality_details_full)
              
             # Check data completeness
             self._log_report(f"正在检查 {target_year}年{target_month}月 的数据完整性...")
@@ -11502,6 +11785,7 @@ class ExcelConverterGUI:
             output_path = os.path.join(os.path.dirname(template_path), output_filename)
             
             self._log_report(f"正在生成报告到: {output_path}")
+            self._log_report("预警参数模式: 手动填入" if warning_manual else "预警参数模式: 自动分析")
             success = generator.generate_report(
                 template_path,
                 output_path,
@@ -11518,6 +11802,54 @@ class ExcelConverterGUI:
             
             if success:
                 self._log_report("✅ 报告生成成功！")
+
+                if self.base_data_mgr:
+                    try:
+                        snapshot = generator.get_latest_product_inventory_snapshot()
+                        sync_result = self.base_data_mgr.sync_product_inventory_snapshot(
+                            snapshot.get("records", []),
+                            snapshot.get("month_key"),
+                        )
+                        latest_month = sync_result.get("latest_month") or "未知月份"
+                        self._log_report(
+                            "基础数据同步完成: "
+                            f"月份={latest_month}, "
+                            f"更新={sync_result.get('updated', 0)}, "
+                            f"新增={sync_result.get('inserted', 0)}, "
+                            f"补空字段={sync_result.get('metadata_filled', 0)}, "
+                            f"未匹配={sync_result.get('unmatched', 0)}, "
+                            f"跳过旧月份={sync_result.get('skipped_older', 0)}"
+                        )
+                        if (
+                            hasattr(self, "current_table")
+                            and self.current_table.get() == "product"
+                        ):
+                            self._load_base_data_table()
+                    except Exception as sync_error:
+                        self._log_report(f"基础数据同步失败: {sync_error}")
+
+                    try:
+                        partner_snapshot = generator.get_latest_business_partner_snapshot()
+                        partner_sync_result = self.base_data_mgr.sync_business_partner_snapshot(
+                            partner_snapshot.get("records", []),
+                            partner_snapshot.get("month_key"),
+                        )
+                        latest_partner_month = partner_sync_result.get("latest_month") or "未知月份"
+                        self._log_report(
+                            "往来单位同步完成: "
+                            f"月份={latest_partner_month}, "
+                            f"更新={partner_sync_result.get('updated', 0)}, "
+                            f"新增={partner_sync_result.get('inserted', 0)}, "
+                            f"补空字段={partner_sync_result.get('metadata_filled', 0)}, "
+                            f"科目同步={partner_sync_result.get('account_subject_updated', 0)}"
+                        )
+                        if (
+                            hasattr(self, "current_table")
+                            and self.current_table.get() == "business_partner"
+                        ):
+                            self._load_base_data_table()
+                    except Exception as partner_sync_error:
+                        self._log_report(f"往来单位同步失败: {partner_sync_error}")
                 
                 if self.report_ai_analysis_var.get():
                     try:

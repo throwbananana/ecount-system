@@ -5,20 +5,62 @@
 """
 
 import os
+import re
+import sys
 import sqlite3
 import pandas as pd
 import difflib
 import json
 import hashlib
+from datetime import datetime
 from typing import Optional, List, Dict, Any
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _dedupe_abs_paths(paths):
+    unique_paths = []
+    for path in paths:
+        normalized = os.path.abspath(path)
+        if normalized not in unique_paths:
+            unique_paths.append(normalized)
+    return unique_paths
+
+
+def _get_resource_root_dirs():
+    dirs = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        dirs.extend([
+            exe_dir,
+            os.path.dirname(exe_dir),
+            os.path.dirname(os.path.dirname(exe_dir)),
+        ])
+    dirs.append(APP_DIR)
+    return _dedupe_abs_paths(dirs)
+
+
+def resolve_base_data_dir(base_data_dir: Optional[str] = None) -> str:
+    raw_path = str(base_data_dir or os.path.join("基础数据", "基础数据")).strip()
+    normalized_path = os.path.expanduser(raw_path)
+    if os.path.isabs(normalized_path):
+        return os.path.abspath(normalized_path)
+
+    for root_dir in _get_resource_root_dirs():
+        candidate = os.path.abspath(os.path.join(root_dir, normalized_path))
+        if os.path.isdir(candidate):
+            return candidate
+
+    return os.path.abspath(os.path.join(_get_resource_root_dirs()[0], normalized_path))
 
 
 class BaseDataManager:
     """基础数据管理器"""
 
-    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+    APP_DIR = APP_DIR
     DB_FILE = os.path.join(APP_DIR, "base_data.db")
-    BASE_DATA_DIR = os.path.join(APP_DIR, "基础数据", "基础数据")
+    BASE_DATA_DIR = resolve_base_data_dir()
 
     # 定义基础数据文件和对应的表名
     DATA_FILES = {
@@ -46,6 +88,14 @@ class BaseDataManager:
         # 本地缓存：标准化后的摘要 -> 科目编码（含别名）
         self._cache_lookup = {}
         self._init_database()
+        self._ensure_mapping_scheme_composite_column()
+        self._ensure_cache_extra_columns()
+        self._ensure_base_match_columns()
+        self._ensure_business_partner_local_code()
+        self._ensure_business_partner_account_subject()
+        self._ensure_product_inventory_columns()
+        self._init_default_rules()
+        self._load_cache_maps()
 
     def _init_database(self):
         """初始化数据库结构"""
@@ -129,6 +179,9 @@ class BaseDataManager:
                 weight REAL,
                 color TEXT,
                 size_range TEXT,
+                latest_inventory_qty REAL,
+                latest_inventory_cost REAL,
+                latest_inventory_date TEXT,
                 match_items TEXT    -- 额外映射匹配项（JSON 数组，支持多对一）
             )
         """)
@@ -148,6 +201,7 @@ class BaseDataManager:
                 tax_number TEXT,
                 bank_name TEXT,
                 bank_account TEXT,
+                account_subject TEXT,
                 local_code TEXT,    -- 当地系统编码 (用于对账)
                 match_items TEXT    -- 额外映射匹配项（JSON 数组，支持多对一）
             )
@@ -396,6 +450,8 @@ class BaseDataManager:
         self._ensure_cache_extra_columns()
         self._ensure_base_match_columns()
         self._ensure_business_partner_local_code()
+        self._ensure_business_partner_account_subject()
+        self._ensure_product_inventory_columns()
         self._init_default_rules()
         self._load_cache_maps()
         return {
@@ -427,6 +483,19 @@ class BaseDataManager:
                 print("已为 business_partner 补充 local_code 列")
             except Exception as e:
                 print(f"补充 local_code 列失败: {e}")
+
+    def _ensure_business_partner_account_subject(self):
+        """为往来单位表补充 account_subject 列"""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(business_partner)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "account_subject" not in columns:
+            try:
+                cursor.execute("ALTER TABLE business_partner ADD COLUMN account_subject TEXT")
+                self.conn.commit()
+                print("已为 business_partner 补充 account_subject 列")
+            except Exception as e:
+                print(f"补充 account_subject 列失败: {e}")
 
     def _ensure_mapping_scheme_composite_column(self):
         """为映射方案表补充 composite_json 列（向后兼容旧库）"""
@@ -624,6 +693,26 @@ class BaseDataManager:
                     print(f"已为 {table} 补充 match_items 列")
                 except Exception as e:
                     print(f"补充 {table}.match_items 列失败: {e}")
+
+    def _ensure_product_inventory_columns(self):
+        """为品目表补充经营报告同步字段（向后兼容）"""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(product)")
+        columns = [row[1] for row in cursor.fetchall()]
+        desired_columns = {
+            "latest_inventory_qty": "REAL",
+            "latest_inventory_cost": "REAL",
+            "latest_inventory_date": "TEXT",
+        }
+        for column_name, column_type in desired_columns.items():
+            if column_name in columns:
+                continue
+            try:
+                cursor.execute(f"ALTER TABLE product ADD COLUMN {column_name} {column_type}")
+                self.conn.commit()
+                print(f"已为 product 补充 {column_name} 列")
+            except Exception as e:
+                print(f"补充 product.{column_name} 列失败: {e}")
 
     def _load_cache_maps(self):
         """加载智能识别缓存到内存，避免高频全表扫描"""
@@ -943,7 +1032,7 @@ class BaseDataManager:
 
     def import_all_data(self, base_data_dir: Optional[str] = None) -> Dict[str, Any]:
         """导入所有基础数据"""
-        base_dir = base_data_dir or self.BASE_DATA_DIR
+        base_dir = resolve_base_data_dir(base_data_dir) if base_data_dir else self.BASE_DATA_DIR
 
         if not os.path.exists(base_dir):
             return {
@@ -1211,6 +1300,29 @@ class BaseDataManager:
                 df_result['weight'] = df.get('单件重量', 0)
                 df_result['color'] = df.get('COLOR', '')
                 df_result['size_range'] = df.get('No.TAMA.', '')
+                df_result['latest_inventory_qty'] = None
+                df_result['latest_inventory_cost'] = None
+                df_result['latest_inventory_date'] = None
+                try:
+                    existing_rows = self.query("product")
+                except Exception:
+                    existing_rows = []
+                if existing_rows:
+                    existing_map = {
+                        str(row.get("code") or "").strip(): row
+                        for row in existing_rows
+                        if str(row.get("code") or "").strip()
+                    }
+                    normalized_codes = df_result["code"].astype(str).str.strip()
+                    df_result["latest_inventory_qty"] = normalized_codes.map(
+                        lambda code: existing_map.get(code, {}).get("latest_inventory_qty")
+                    )
+                    df_result["latest_inventory_cost"] = normalized_codes.map(
+                        lambda code: existing_map.get(code, {}).get("latest_inventory_cost")
+                    )
+                    df_result["latest_inventory_date"] = normalized_codes.map(
+                        lambda code: existing_map.get(code, {}).get("latest_inventory_date")
+                    )
                 df_result['match_items'] = '[]'
                 return df_result
 
@@ -1229,7 +1341,35 @@ class BaseDataManager:
                 df_result['tax_number'] = df.get('税号', '')
                 df_result['bank_name'] = df.get('开户行', '')
                 df_result['bank_account'] = df.get('银行账号', '')
+                df_result['account_subject'] = df.get('科目名(会计科目)', df.get('科目编码', ''))
                 df_result['local_code'] = df.get('当地编码', '')
+                try:
+                    existing_rows = self.query("business_partner")
+                except Exception:
+                    existing_rows = []
+                if existing_rows:
+                    existing_by_code = {}
+                    existing_by_local = {}
+                    for row in existing_rows:
+                        code = str(row.get("code") or "").strip()
+                        local_code = str(row.get("local_code") or "").strip()
+                        if code:
+                            existing_by_code[code] = row
+                        if local_code:
+                            existing_by_local[local_code] = row
+
+                    def _preserve_partner_value(row):
+                        code = str(row.get("code") or "").strip()
+                        local_code = str(row.get("local_code") or "").strip()
+                        existing = existing_by_code.get(code) or existing_by_local.get(local_code)
+                        return existing.get("account_subject") if existing else None
+
+                    preserve_mask = df_result["account_subject"].isna() | (
+                        df_result["account_subject"].astype(str).str.strip() == ""
+                    )
+                    if preserve_mask.any():
+                        preserved = df_result.loc[preserve_mask, ["code", "local_code"]].apply(_preserve_partner_value, axis=1)
+                        df_result.loc[preserve_mask, "account_subject"] = preserved
                 df_result['match_items'] = '[]'
                 return df_result
 
@@ -1416,6 +1556,359 @@ class BaseDataManager:
                 "success": False,
                 "message": f"更新失败：{str(e)}"
             }
+
+    def _normalize_month_key(self, raw_value: Any) -> Optional[str]:
+        """将月份文本标准化为 YYYY-MM，非法值返回 None。"""
+        if raw_value is None:
+            return None
+        text = str(raw_value).strip()
+        if not text:
+            return None
+        text = text.replace("/", "-").replace(".", "-")
+        try:
+            parsed = datetime.strptime(text, "%Y-%m")
+        except ValueError:
+            return None
+        return parsed.strftime("%Y-%m")
+
+    def sync_product_inventory_snapshot(
+        self,
+        snapshot_records: List[Dict[str, Any]],
+        month_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        将经营报告提取的最新品目库存/成本快照回写到基础数据。
+
+        对已存在品目：库存字段按月份防回写，基础描述信息仅补空不覆盖。
+        对不存在品目：自动新增基础资料记录。
+        """
+        self._ensure_product_inventory_columns()
+        normalized_month = self._normalize_month_key(month_key)
+
+        def _normalize_text(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text or text.lower() == "nan":
+                return None
+            return text
+
+        def _is_blank(value: Any) -> bool:
+            return _normalize_text(value) is None
+
+        if not snapshot_records:
+            return {
+                "success": True,
+                "message": "没有可同步的品目库存数据",
+                "latest_month": normalized_month,
+                "updated": 0,
+                "inserted": 0,
+                "metadata_filled": 0,
+                "unmatched": 0,
+                "skipped_older": 0,
+                "skipped_empty": 0,
+            }
+
+        latest_by_code: Dict[str, Dict[str, Any]] = {}
+        for raw_record in snapshot_records:
+            code = str(raw_record.get("code") or "").strip()
+            if not code:
+                continue
+            latest_by_code[code] = {
+                "qty": raw_record.get("latest_inventory_qty"),
+                "cost": raw_record.get("latest_inventory_cost"),
+                "date": self._normalize_month_key(raw_record.get("latest_inventory_date")) or normalized_month,
+                "name": _normalize_text(raw_record.get("name") or raw_record.get("product_name")),
+                "product_type": _normalize_text(raw_record.get("product_type")),
+                "spec_info": _normalize_text(raw_record.get("spec_info")),
+                "specification": _normalize_text(raw_record.get("specification") or raw_record.get("spec_info")),
+            }
+
+        if not latest_by_code:
+            return {
+                "success": True,
+                "message": "没有有效的品目编码可同步",
+                "latest_month": normalized_month,
+                "updated": 0,
+                "inserted": 0,
+                "metadata_filled": 0,
+                "unmatched": 0,
+                "skipped_older": 0,
+                "skipped_empty": 0,
+            }
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, code, name, product_type, spec_info, specification, latest_inventory_date
+            FROM product
+            """,
+        )
+        product_rows = {
+            str(row[1]).strip(): {
+                "id": row[0],
+                "name": row[2],
+                "product_type": row[3],
+                "spec_info": row[4],
+                "specification": row[5],
+                "date": self._normalize_month_key(row[6]),
+            }
+            for row in cursor.fetchall()
+        }
+
+        updated = 0
+        inserted = 0
+        metadata_filled = 0
+        unmatched = 0
+        skipped_older = 0
+        skipped_empty = 0
+        with self.conn:
+            for code, record in latest_by_code.items():
+                product = product_rows.get(code)
+                has_qty = record.get("qty") is not None
+                has_cost = record.get("cost") is not None
+                has_meta = any(
+                    record.get(field) is not None
+                    for field in ("name", "product_type", "spec_info", "specification")
+                )
+                if not product:
+                    if not has_qty and not has_cost and not record.get("date") and not has_meta:
+                        skipped_empty += 1
+                        continue
+                    cursor.execute(
+                        """
+                        INSERT INTO product (
+                            code, name, product_type, spec_info, specification,
+                            latest_inventory_qty, latest_inventory_cost, latest_inventory_date, match_items
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            code,
+                            record.get("name"),
+                            record.get("product_type"),
+                            record.get("spec_info"),
+                            record.get("specification"),
+                            record.get("qty"),
+                            record.get("cost"),
+                            record.get("date"),
+                            "[]",
+                        ),
+                    )
+                    inserted += 1
+                    continue
+
+                update_fields = {}
+                incoming_date = record.get("date")
+                existing_date = product.get("date")
+                is_older_inventory = bool(incoming_date and existing_date and incoming_date < existing_date)
+                if is_older_inventory:
+                    skipped_older += 1
+                else:
+                    if has_qty or has_cost or incoming_date:
+                        update_fields["latest_inventory_qty"] = record.get("qty")
+                        update_fields["latest_inventory_cost"] = record.get("cost")
+                        update_fields["latest_inventory_date"] = incoming_date
+
+                for field in ("name", "product_type", "spec_info", "specification"):
+                    incoming = record.get(field)
+                    if incoming is None:
+                        continue
+                    if _is_blank(product.get(field)):
+                        update_fields[field] = incoming
+                        metadata_filled += 1
+
+                if not update_fields:
+                    if not has_qty and not has_cost and not incoming_date and not has_meta:
+                        skipped_empty += 1
+                    elif not product:
+                        unmatched += 1
+                    continue
+
+                set_clause = ", ".join(f"{field} = ?" for field in update_fields)
+                cursor.execute(
+                    f"UPDATE product SET {set_clause} WHERE id = ?",
+                    list(update_fields.values()) + [product["id"]],
+                )
+                updated += 1
+
+        return {
+            "success": True,
+            "message": f"已同步 {updated} 条、新增 {inserted} 条品目库存快照",
+            "latest_month": normalized_month,
+            "updated": updated,
+            "inserted": inserted,
+            "metadata_filled": metadata_filled,
+            "unmatched": unmatched,
+            "skipped_older": skipped_older,
+            "skipped_empty": skipped_empty,
+        }
+
+    def sync_business_partner_snapshot(
+        self,
+        snapshot_records: List[Dict[str, Any]],
+        month_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        将经营报告提取的往来单位快照回写到基础数据。
+
+        匹配优先级：code -> local_code。仅补空字段，不覆盖已有人工维护内容。
+        """
+        self._ensure_business_partner_account_subject()
+        normalized_month = self._normalize_month_key(month_key)
+
+        def _normalize_text(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text or text.lower() == "nan":
+                return None
+            return text
+
+        def _is_blank(value: Any) -> bool:
+            return _normalize_text(value) is None
+
+        def _normalize_subject_value(value: Any) -> Optional[str]:
+            text = _normalize_text(value)
+            if text is None:
+                return None
+            text = " ".join(text.split())
+            match = re.search(r'[\[\(]?\s*(\d{3,})\s*[\]\)]?', text)
+            if match:
+                return match.group(1)
+            return text.lower()
+
+        if not snapshot_records:
+            return {
+                "success": True,
+                "message": "没有可同步的往来单位数据",
+                "latest_month": normalized_month,
+                "updated": 0,
+                "inserted": 0,
+                "metadata_filled": 0,
+                "skipped_empty": 0,
+            }
+
+        latest_by_code: Dict[str, Dict[str, Any]] = {}
+        for raw_record in snapshot_records:
+            code = _normalize_text(raw_record.get("code"))
+            if not code:
+                continue
+            latest_by_code[code] = {
+                "code": code,
+                "name": _normalize_text(raw_record.get("name")),
+                "local_code": _normalize_text(raw_record.get("local_code")) or code,
+                "category": _normalize_text(raw_record.get("category")),
+                "account_subject": _normalize_text(raw_record.get("account_subject")),
+                "latest_seen_date": self._normalize_month_key(raw_record.get("latest_seen_date")) or normalized_month,
+            }
+
+        if not latest_by_code:
+            return {
+                "success": True,
+                "message": "没有有效的往来单位编码可同步",
+                "latest_month": normalized_month,
+                "updated": 0,
+                "inserted": 0,
+                "metadata_filled": 0,
+                "skipped_empty": 0,
+            }
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, code, name, category, local_code, account_subject
+            FROM business_partner
+            """
+        )
+        rows = cursor.fetchall()
+        partners_by_code = {}
+        partners_by_local_code = {}
+        for row in rows:
+            record = {
+                "id": row[0],
+                "code": _normalize_text(row[1]),
+                "name": row[2],
+                "category": row[3],
+                "local_code": _normalize_text(row[4]),
+                "account_subject": _normalize_text(row[5]) if len(row) > 5 else None,
+            }
+            if record["code"]:
+                partners_by_code[record["code"]] = record
+            if record["local_code"]:
+                partners_by_local_code[record["local_code"]] = record
+
+        updated = 0
+        inserted = 0
+        metadata_filled = 0
+        account_subject_updated = 0
+        skipped_empty = 0
+        with self.conn:
+            for code, record in latest_by_code.items():
+                partner = partners_by_code.get(code) or partners_by_local_code.get(record.get("local_code"))
+                has_meta = any(record.get(field) is not None for field in ("name", "category", "local_code", "account_subject"))
+                if not partner:
+                    if not has_meta:
+                        skipped_empty += 1
+                        continue
+                    cursor.execute(
+                        """
+                        INSERT INTO business_partner (code, name, category, local_code, account_subject, match_items)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            record.get("code"),
+                            record.get("name"),
+                            record.get("category"),
+                            record.get("local_code"),
+                            record.get("account_subject"),
+                            "[]",
+                        ),
+                    )
+                    if record.get("account_subject") is not None:
+                        account_subject_updated += 1
+                    inserted += 1
+                    continue
+
+                update_fields = {}
+                for field in ("name", "category", "local_code"):
+                    incoming = record.get(field)
+                    if incoming is None:
+                        continue
+                    if _is_blank(partner.get(field)):
+                        update_fields[field] = incoming
+                        metadata_filled += 1
+
+                incoming_subject = record.get("account_subject")
+                if incoming_subject is not None:
+                    existing_subject_norm = _normalize_subject_value(partner.get("account_subject"))
+                    incoming_subject_norm = _normalize_subject_value(incoming_subject)
+                    if existing_subject_norm != incoming_subject_norm:
+                        update_fields["account_subject"] = incoming_subject
+                        account_subject_updated += 1
+
+                if not update_fields:
+                    if not has_meta:
+                        skipped_empty += 1
+                    continue
+
+                set_clause = ", ".join(f"{field} = ?" for field in update_fields)
+                cursor.execute(
+                    f"UPDATE business_partner SET {set_clause} WHERE id = ?",
+                    list(update_fields.values()) + [partner["id"]],
+                )
+                updated += 1
+
+        return {
+            "success": True,
+            "message": f"已同步 {updated} 条、新增 {inserted} 条往来单位快照",
+            "latest_month": normalized_month,
+            "updated": updated,
+            "inserted": inserted,
+            "metadata_filled": metadata_filled,
+            "account_subject_updated": account_subject_updated,
+            "skipped_empty": skipped_empty,
+        }
 
     def delete_record(self, table_name: str, record_id: int) -> Dict[str, Any]:
         """删除记录"""

@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "local": {
+    "dff0cf923726ead1a3b3c29a121b0a005c96426b": {
+      "columns": [
+        "\u51ed\u8bc1\u65e5\u671f",
+        "\u5e8f\u53f7",
+        "Code",
+        "\u6458\u8981",
+        "\u501f\u65b9",
+        "\u8d37\u65b9",
+        "Balance",
+        "Source",
+        "\u5f80\u6765\u5355\u4f4d\u7f16\u7801"
+      ],
+      "mapping": {
+        "\u51ed\u8bc1\u65e5\u671f": "\u51ed\u8bc1\u65e5\u671f",
+        "\u5e8f\u53f7": "\u5e8f\u53f7",
+        "\u6458\u8981": "\u6458\u8981",
+        "\u5f80\u6765\u5355\u4f4d\u7f16\u7801": "\u5f80\u6765\u5355\u4f4d\u7f16\u7801",
+        "\u501f\u65b9": "\u501f\u65b9",
+        "\u8d37\u65b9": "\u8d37\u65b9"
+      }
+    },
+    "df690ce1138d2b598018e7d643d96a24171da46c": {
+      "columns": [
+        "\u65e5\u671f FECHA",
+        "\u6587\u4ef6 DOCUM",
+        "CUENTA",
+        "\u5185\u5bb9 DESCRIPCION",
+        "\u6536\u5165 INGRESO",
+        "\u652f\u4ed8 PAGAR",
+        "\u7ed3\u5b58 BALANCE"
+      ],
+      "mapping": {
+        "\u51ed\u8bc1\u65e5\u671f": "\u65e5\u671f FECHA",
+        "\u6458\u8981": "\u5185\u5bb9 DESCRIPCION",
+        "\u5f80\u6765\u5355\u4f4d\u7f16\u7801": "CUENTA",
+        "\u501f\u65b9": "\u6536\u5165 INGRESO",
+        "\u8d37\u65b9": "\u652f\u4ed8 PAGAR"
+      }
+    },
+    "d7351bd9d6cd9cd9dc879c744dddcac0dcff459f": {
+      "columns": [
+        "\u6458\u8981",
+        "\u65e5\u671f-\u53f7\u7801",
+        "\u503a\u6743\u503a\u52a1\u53f7\u7801",
+        "\u5916\u5e01\u501f\u65b9\u91d1\u989d",
+        "\u5916\u5e01\u8d37\u65b9\u91d1\u989d",
+        "\u5916\u5e01\u4f59\u989d",
+        "\u501f\u65b9\u91d1\u989d",
+        "\u8d37\u65b9\u91d1\u989d",
+        "\u4f59\u989d",
+        "\u90e8\u95e8\u540d"
+      ],
+      "mapping": {
+        "\u51ed\u8bc1\u65e5\u671f": "\u65e5\u671f-\u53f7\u7801",
+        "\u6458\u8981": "\u6458\u8981",
+        "\u5f80\u6765\u5355\u4f4d\u7f16\u7801": "\u6458\u8981",
+        "\u91d1\u989d": "\u5916\u5e01\u501f\u65b9\u91d1\u989d",
+        "\u501f\u65b9": "\u5916\u5e01\u501f\u65b9\u91d1\u989d",
+        "\u8d37\u65b9": "\u5916\u5e01\u8d37\u65b9\u91d1\u989d"
+      }
+    }
+  },
+  "yikan": {
+    "d7351bd9d6cd9cd9dc879c744dddcac0dcff459f": {
+      "columns": [
+        "\u6458\u8981",
+        "\u65e5\u671f-\u53f7\u7801",
+        "\u503a\u6743\u503a\u52a1\u53f7\u7801",
+        "\u5916\u5e01\u501f\u65b9\u91d1\u989d",
+        "\u5916\u5e01\u8d37\u65b9\u91d1\u989d",
+        "\u5916\u5e01\u4f59\u989d",
+        "\u501f\u65b9\u91d1\u989d",
+        "\u8d37\u65b9\u91d1\u989d",
+        "\u4f59\u989d",
+        "\u90e8\u95e8\u540d"
+      ],
+      "mapping": {
+        "\u51ed\u8bc1\u65e5\u671f": "\u65e5\u671f-\u53f7\u7801",
+        "\u5e8f\u53f7": "\u503a\u6743\u503a\u52a1\u53f7\u7801",
+        "\u6458\u8981": "\u6458\u8981",
+        "\u5f80\u6765\u5355\u4f4d\u7f16\u7801": "\u6458\u8981",
+        "\u91d1\u989d": "\u5916\u5e01\u501f\u65b9\u91d1\u989d",
+        "\u501f\u65b9": "\u5916\u5e01\u501f\u65b9\u91d1\u989d",
+        "\u8d37\u65b9": "\u5916\u5e01\u8d37\u65b9\u91d1\u989d"
+      }
+    },
+    "dff0cf923726ead1a3b3c29a121b0a005c96426b": {
+      "columns": [
+        "\u51ed\u8bc1\u65e5\u671f",
+        "\u5e8f\u53f7",
+        "Code",
+        "\u6458\u8981",
+        "\u501f\u65b9",
+        "\u8d37\u65b9",
+        "Balance",
+        "Source",
+        "\u5f80\u6765\u5355\u4f4d\u7f16\u7801"
+      ],
+      "mapping": {
+        "\u51ed\u8bc1\u65e5\u671f": "\u51ed\u8bc1\u65e5\u671f",
+        "\u5e8f\u53f7": "\u5e8f\u53f7",
+        "\u6458\u8981": "\u6458\u8981",
+        "\u5f80\u6765\u5355\u4f4d\u7f16\u7801": "\u5f80\u6765\u5355\u4f4d\u7f16\u7801",
+        "\u501f\u65b9": "\u501f\u65b9",
+        "\u8d37\u65b9": "\u8d37\u65b9"
+      }
+    },
+    "df690ce1138d2b598018e7d643d96a24171da46c": {
+      "columns": [
+        "\u65e5\u671f FECHA",
+        "\u6587\u4ef6 DOCUM",
+        "CUENTA",
+        "\u5185\u5bb9 DESCRIPCION",
+        "\u6536\u5165 INGRESO",
+        "\u652f\u4ed8 PAGAR",
+        "\u7ed3\u5b58 BALANCE"
+      ],
+      "mapping": {
+        "\u51ed\u8bc1\u65e5\u671f": "\u65e5\u671f FECHA",
+        "\u6458\u8981": "\u5185\u5bb9 DESCRIPCION",
+        "\u5f80\u6765\u5355\u4f4d\u7f16\u7801": "CUENTA",
+        "\u501f\u65b9": "\u6536\u5165 INGRESO",
+        "\u8d37\u65b9": "\u652f\u4ed8 PAGAR"
+      }
+    }
+  }
+}
