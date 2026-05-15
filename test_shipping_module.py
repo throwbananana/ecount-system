@@ -54,6 +54,16 @@ def _build_shipping_excel(path: Path):
             "说明": "汇率",
             "值": 7.0,
         },
+        {
+            "集装箱号": "TEST001",
+            "说明": "人民币货款",
+            "值": 1234.5,
+        },
+        {
+            "集装箱号": "TEST001",
+            "说明": "美元货款",
+            "值": 88.6,
+        },
     ])
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
@@ -149,8 +159,27 @@ def test_update_container_field_recalculates_allocations():
             db.conn.close()
 
 
+def test_import_container_payment_from_labeled_payment_rows():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        db = ShippingDB(str(tmp_path / "shipping.bd"))
+        try:
+            excel_path = tmp_path / "sample_ZKP2026999.xlsx"
+            _build_shipping_excel(excel_path)
+
+            db.import_excel(str(excel_path))
+            container = db.query_containers()[0]
+            payment = db.get_container_payment(container["id"])
+
+            assert math.isclose(float(payment["payment_rmb"]), 1234.5, rel_tol=0, abs_tol=1e-6)
+            assert math.isclose(float(payment["payment_usd"]), 88.6, rel_tol=0, abs_tol=1e-6)
+        finally:
+            db.conn.close()
+
+
 if __name__ == "__main__":
     test_repeat_import_replaces_existing_products()
     test_update_container_fees_keeps_allocations_in_sync()
     test_update_container_field_recalculates_allocations()
+    test_import_container_payment_from_labeled_payment_rows()
     print("test_shipping_module.py: all tests passed")

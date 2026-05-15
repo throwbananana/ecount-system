@@ -207,7 +207,7 @@ class ReportGenerator:
                 delta_cols[month_label.replace('/', '-')] = col
         return value_cols, rate_cols, delta_cols
 
-    def _select_expense_display_flags(self, flags, target_year=None, target_month=None):
+    def _select_expense_display_flags(self, flags, target_year=None, target_month=None, target_only=False):
         selected_by_pair = {}
         if not flags:
             return selected_by_pair
@@ -235,6 +235,9 @@ class ReportGenerator:
                         reverse=True,
                     )
                     chosen = target_flags[0]
+
+            if chosen is None and target_only:
+                continue
 
             if chosen is None:
                 pair_flags.sort(
@@ -471,8 +474,8 @@ class ReportGenerator:
 
         if path:
             try:
-                xl = pd.ExcelFile(path)
-                parts.extend([str(s) for s in xl.sheet_names])
+                with pd.ExcelFile(path) as xl:
+                    parts.extend([str(s) for s in xl.sheet_names])
             except Exception:
                 pass
 
@@ -573,6 +576,412 @@ class ReportGenerator:
             if isinstance(m, str) and len(m) >= 7 and m[:4].isdigit():
                 years.add(int(m[:4]))
         return sorted(years)
+
+    @staticmethod
+    def normalize_month_key(year, month):
+        """将年月参数标准化为 YYYY-MM。"""
+        year_int = int(str(year).strip())
+        month_int = int(str(month).strip())
+        if month_int < 1 or month_int > 12:
+            raise ValueError(f"月份必须在 1-12 之间: {month}")
+        return f"{year_int:04d}-{month_int:02d}"
+
+    @classmethod
+    def build_month_range(cls, start_year, start_month, end_year, end_month):
+        """返回起止年月之间的连续月份键列表，包含首尾。"""
+        start_key = cls.normalize_month_key(start_year, start_month)
+        end_key = cls.normalize_month_key(end_year, end_month)
+        if start_key > end_key:
+            raise ValueError("开始月份不能晚于结束月份")
+
+        year = int(start_key[:4])
+        month = int(start_key[-2:])
+        end_year_int = int(end_key[:4])
+        end_month_int = int(end_key[-2:])
+        month_keys = []
+        while (year, month) <= (end_year_int, end_month_int):
+            month_keys.append(f"{year:04d}-{month:02d}")
+            month += 1
+            if month > 12:
+                year += 1
+                month = 1
+        return month_keys
+
+    @staticmethod
+    def _category_label(category):
+        labels = {
+            "profit": "利润表",
+            "cost": "成本合计表",
+            "expense": "费用明细",
+            "asset": "资产负债表",
+            "sales": "销售出库",
+            "ar": "应收账款",
+            "ap": "应付账款",
+            "cash": "货币资金",
+        }
+        return labels.get(category, category or "未识别")
+
+    @staticmethod
+    def _is_valid_month_key(value):
+        if not isinstance(value, str) or not re.match(r"^20\d{2}-\d{2}$", value):
+            return False
+        month = int(value[-2:])
+        return 1 <= month <= 12
+
+    @classmethod
+    def _expand_month_key_range(cls, start_key, end_key):
+        if start_key > end_key:
+            start_key, end_key = end_key, start_key
+        return cls.build_month_range(start_key[:4], start_key[-2:], end_key[:4], end_key[-2:])
+
+    @classmethod
+    def _extract_month_keys_from_text(cls, text):
+        """从文件名/文本中提取单月或连续月份范围。"""
+        raw = str(text or "")
+        hits = []
+
+        def add_hit(pos, year, month):
+            try:
+                year_int = int(year)
+                month_int = int(month)
+            except Exception:
+                return
+            if 1 <= month_int <= 12:
+                hits.append((pos, f"{year_int:04d}-{month_int:02d}"))
+
+        for match in re.finditer(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", raw):
+            add_hit(match.start(), match.group(1), match.group(2))
+        for match in re.finditer(r"(20\d{2})[./-](\d{1,2})(?!\d)", raw):
+            add_hit(match.start(), match.group(1), match.group(2))
+        for match in re.finditer(r"(?<!\d)(20\d{2})(\d{2})(?:\d{2})?(?!\d)", raw):
+            add_hit(match.start(), match.group(1), match.group(2))
+
+        if not hits:
+            return []
+
+        hits.sort(key=lambda item: item[0])
+        ordered = []
+        for _, key in hits:
+            if key not in ordered:
+                ordered.append(key)
+        if len(ordered) >= 2:
+            return cls._expand_month_key_range(ordered[0], ordered[-1])
+        return ordered
+
+    def _determine_file_period_keys(self, path, filename, df_peek=None, category=None):
+        """识别文件覆盖的月份列表。范围文件返回范围内所有月份。"""
+        if df_peek is None:
+            try:
+                df_peek = pd.read_excel(path, header=None, nrows=1)
+            except Exception:
+                df_peek = None
+
+        header_keys = []
+        if df_peek is not None:
+            start_date, end_date = self._parse_header_date(df_peek)
+            if start_date and end_date:
+                header_keys = self._expand_month_key_range(
+                    f"{start_date.year:04d}-{start_date.month:02d}",
+                    f"{end_date.year:04d}-{end_date.month:02d}",
+                )
+
+        filename_keys = self._extract_month_keys_from_text(filename)
+        if category in {"profit", "asset", "cost"}:
+            if filename_keys:
+                return [filename_keys[-1]]
+            if header_keys:
+                return [header_keys[-1]]
+
+        if len(filename_keys) > len(header_keys):
+            return filename_keys
+        if header_keys:
+            return header_keys
+
+        month = self._determine_period_key(path, filename, df_peek)
+        if self._is_valid_month_key(month):
+            return [month]
+        return []
+
+    def inspect_data_folder(self, required_categories=None, expected_months=None):
+        """
+        检视基础资料目录中的数据文件。
+        返回文件识别、重复月份、缺失月份、可删除旧文件候选等信息。
+        """
+        required_categories = list(required_categories or ["profit", "cost", "expense", "asset", "sales", "ar"])
+        result = {
+            "base_dir": self.base_data_dir,
+            "files": [],
+            "duplicates": [],
+            "cleanup_candidates": [],
+            "manual_review": [],
+            "missing": [],
+            "unclassified": [],
+            "unreadable": [],
+            "expected_months": [],
+            "category_periods": {},
+        }
+
+        if not os.path.isdir(self.base_data_dir):
+            result["error"] = f"基础资料目录不存在: {self.base_data_dir}"
+            return result
+
+        try:
+            filenames = sorted(os.listdir(self.base_data_dir))
+        except Exception as exc:
+            result["error"] = f"读取基础资料目录失败: {exc}"
+            return result
+
+        excel_exts = (".xlsx", ".xls", ".xlsm")
+        for filename in filenames:
+            if str(filename).startswith("~$"):
+                continue
+            if not str(filename).lower().endswith(excel_exts):
+                continue
+
+            path = os.path.join(self.base_data_dir, filename)
+            meta = {
+                "filename": filename,
+                "path": os.path.abspath(path),
+                "category": None,
+                "category_label": "未识别",
+                "periods": [],
+                "mtime": None,
+                "mtime_text": "",
+                "size": None,
+                "error": "",
+            }
+
+            try:
+                stat = os.stat(path)
+                meta["mtime"] = stat.st_mtime
+                meta["mtime_text"] = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                meta["size"] = stat.st_size
+            except Exception as exc:
+                meta["error"] = f"读取文件属性失败: {exc}"
+
+            df_peek = None
+            try:
+                df_peek = pd.read_excel(path, header=None, nrows=1)
+            except Exception as exc:
+                meta["error"] = (meta["error"] + "; " if meta["error"] else "") + f"读取表头失败: {exc}"
+
+            try:
+                category = self._classify_source_file(filename, path, df_peek)
+                meta["category"] = category
+                meta["category_label"] = self._category_label(category)
+            except Exception as exc:
+                meta["error"] = (meta["error"] + "; " if meta["error"] else "") + f"识别类型失败: {exc}"
+
+            try:
+                meta["periods"] = self._determine_file_period_keys(path, filename, df_peek, meta.get("category"))
+            except Exception as exc:
+                meta["error"] = (meta["error"] + "; " if meta["error"] else "") + f"识别月份失败: {exc}"
+
+            result["files"].append(meta)
+            if meta["error"]:
+                result["unreadable"].append(meta)
+            elif not meta["category"]:
+                result["unclassified"].append(meta)
+
+        by_key = {}
+        category_periods = {}
+        for meta in result["files"]:
+            category = meta.get("category")
+            if not category:
+                continue
+            for period in meta.get("periods") or []:
+                if not self._is_valid_month_key(period):
+                    continue
+                by_key.setdefault((category, period), []).append(meta)
+                category_periods.setdefault(category, set()).add(period)
+
+        result["category_periods"] = {
+            category: sorted(periods) for category, periods in category_periods.items()
+        }
+
+        latest_by_key = {}
+        for (category, period), metas in by_key.items():
+            if not metas:
+                continue
+            ordered = sorted(
+                metas,
+                key=lambda item: (item.get("mtime") or 0, item.get("filename") or ""),
+                reverse=True,
+            )
+            latest = ordered[0]
+            latest_by_key[(category, period)] = latest
+            if len(ordered) > 1:
+                result["duplicates"].append({
+                    "category": category,
+                    "category_label": self._category_label(category),
+                    "period": period,
+                    "latest": latest,
+                    "files": ordered,
+                })
+
+        seen_candidate_paths = set()
+        for meta in result["files"]:
+            category = meta.get("category")
+            periods = [p for p in (meta.get("periods") or []) if self._is_valid_month_key(p)]
+            if not category or not periods:
+                continue
+
+            superseded_periods = []
+            blocking_periods = []
+            for period in periods:
+                group = by_key.get((category, period), [])
+                latest = latest_by_key.get((category, period))
+                if len(group) > 1 and latest and latest.get("path") != meta.get("path"):
+                    superseded_periods.append(period)
+                else:
+                    blocking_periods.append(period)
+
+            if not superseded_periods:
+                continue
+
+            item = dict(meta)
+            item["superseded_periods"] = superseded_periods
+            item["blocking_periods"] = blocking_periods
+            if not blocking_periods:
+                path_key = item.get("path")
+                if path_key not in seen_candidate_paths:
+                    item["reason"] = "覆盖月份均已有更新文件"
+                    result["cleanup_candidates"].append(item)
+                    seen_candidate_paths.add(path_key)
+            else:
+                item["reason"] = "仅部分月份有更新文件，需人工判断"
+                result["manual_review"].append(item)
+
+        result["duplicates"].sort(key=lambda item: (item["category"], item["period"]))
+        result["cleanup_candidates"].sort(key=lambda item: (item.get("category") or "", item.get("filename") or ""))
+        result["manual_review"].sort(key=lambda item: (item.get("category") or "", item.get("filename") or ""))
+
+        if expected_months is None:
+            scope_months = set()
+            for category in ("profit", "cost", "asset"):
+                scope_months.update(category_periods.get(category, set()))
+            if not scope_months:
+                for category in required_categories:
+                    scope_months.update(category_periods.get(category, set()))
+            expected_months = self._expand_month_key_range(min(scope_months), max(scope_months)) if scope_months else []
+        else:
+            expected_months = [
+                self.normalize_month_key(str(month)[:4], str(month)[-2:])
+                for month in expected_months
+                if self._is_valid_month_key(str(month))
+            ]
+
+        result["expected_months"] = expected_months
+        for period in expected_months:
+            missing_categories = [
+                category for category in required_categories
+                if period not in category_periods.get(category, set())
+            ]
+            if missing_categories:
+                result["missing"].append({
+                    "period": period,
+                    "missing_categories": missing_categories,
+                    "missing_labels": [self._category_label(cat) for cat in missing_categories],
+                })
+
+        return result
+
+    def format_data_folder_inspection(self, inspection, max_items=80):
+        """将数据文件夹检视结果格式化为日志文本。"""
+        if not inspection:
+            return "未生成检视结果。"
+        if inspection.get("error"):
+            return inspection["error"]
+
+        files = inspection.get("files") or []
+        duplicates = inspection.get("duplicates") or []
+        candidates = inspection.get("cleanup_candidates") or []
+        missing = inspection.get("missing") or []
+        unclassified = inspection.get("unclassified") or []
+        unreadable = inspection.get("unreadable") or []
+        manual_review = inspection.get("manual_review") or []
+        expected_months = inspection.get("expected_months") or []
+
+        lines = [
+            "数据检视结果:",
+            f"- 数据目录: {inspection.get('base_dir')}",
+            f"- Excel文件: {len(files)} 个；重复月份: {len(duplicates)} 组；可删除旧文件: {len(candidates)} 个；缺失月份: {len(missing)} 个",
+        ]
+        if expected_months:
+            lines.append(f"- 检视月份范围: {expected_months[0]} 至 {expected_months[-1]}")
+        if unreadable:
+            lines.append(f"- 读取异常文件: {len(unreadable)} 个")
+        if unclassified:
+            lines.append(f"- 未识别类型文件: {len(unclassified)} 个")
+        if manual_review:
+            lines.append(f"- 部分重叠需人工判断: {len(manual_review)} 个")
+
+        shown = 0
+        if missing:
+            lines.append("")
+            lines.append("缺失数据:")
+            for item in missing[:max_items]:
+                lines.append(f"- {item['period']}: 缺少 {'、'.join(item.get('missing_labels') or [])}")
+                shown += 1
+            if len(missing) > max_items:
+                lines.append(f"- ... 还有 {len(missing) - max_items} 条缺失记录未显示")
+
+        if duplicates:
+            lines.append("")
+            lines.append("重复数据:")
+            remaining = max(0, max_items - shown)
+            for item in duplicates[:remaining or max_items]:
+                file_names = "；".join(meta.get("filename", "") for meta in item.get("files", [])[:4])
+                if len(item.get("files", [])) > 4:
+                    file_names += f"；... 共{len(item.get('files', []))}个"
+                latest_name = (item.get("latest") or {}).get("filename", "")
+                lines.append(f"- {item['period']} {item['category_label']}: 最新 {latest_name}；重复文件 {file_names}")
+            if len(duplicates) > (remaining or max_items):
+                lines.append(f"- ... 还有 {len(duplicates) - (remaining or max_items)} 组重复记录未显示")
+
+        if candidates:
+            lines.append("")
+            lines.append("可删除旧文件候选:")
+            for item in candidates[:max_items]:
+                periods = ",".join(item.get("superseded_periods") or item.get("periods") or [])
+                lines.append(f"- {item.get('category_label')} {periods}: {item.get('filename')} ({item.get('mtime_text')})")
+            if len(candidates) > max_items:
+                lines.append(f"- ... 还有 {len(candidates) - max_items} 个候选文件未显示")
+
+        if manual_review:
+            lines.append("")
+            lines.append("需人工判断的部分重叠文件:")
+            for item in manual_review[:max_items]:
+                sup = ",".join(item.get("superseded_periods") or [])
+                keep = ",".join(item.get("blocking_periods") or [])
+                lines.append(f"- {item.get('filename')}: 重复月份 {sup}；仍需保留月份 {keep}")
+            if len(manual_review) > max_items:
+                lines.append(f"- ... 还有 {len(manual_review) - max_items} 个文件未显示")
+
+        return "\n".join(lines)
+
+    def delete_data_files(self, file_paths):
+        """删除基础资料目录内指定 Excel 文件，返回删除结果。"""
+        base_abs = os.path.abspath(self.base_data_dir)
+        deleted = []
+        failed = []
+        for path in file_paths or []:
+            try:
+                abs_path = os.path.abspath(path)
+                try:
+                    if os.path.commonpath([base_abs, abs_path]) != base_abs:
+                        raise ValueError("文件不在当前基础资料目录内")
+                except ValueError:
+                    raise ValueError("文件不在当前基础资料目录内")
+                if not os.path.isfile(abs_path):
+                    raise FileNotFoundError("文件不存在")
+                if not abs_path.lower().endswith((".xlsx", ".xls", ".xlsm")):
+                    raise ValueError("只允许删除Excel数据文件")
+                os.remove(abs_path)
+                deleted.append(abs_path)
+            except Exception as exc:
+                failed.append({"path": path, "error": str(exc)})
+        return {"deleted": deleted, "failed": failed}
 
     def _extract_month_from_filename(self, filename):
         """从文件名提取月份 (e.g., '成本1月.xlsx' -> '2025-01')"""
@@ -693,6 +1102,20 @@ class ReportGenerator:
 
     def _load_expense_data(self, path, filename):
         try:
+            def store_monthly_expense(month_key, data_frame):
+                if not month_key or data_frame is None:
+                    return
+                incoming = data_frame.copy()
+                existing = self.data['expense'].get(month_key)
+                if existing is not None and not existing.empty:
+                    self.data['expense'][month_key] = pd.concat(
+                        [existing, incoming],
+                        ignore_index=True,
+                        sort=False,
+                    )
+                else:
+                    self.data['expense'][month_key] = incoming
+
             date_col, df, header_row = None, None, 0
             for h_row in [0, 1]:
                 temp_df = pd.read_excel(path, header=h_row)
@@ -749,12 +1172,12 @@ class ReportGenerator:
                     df = df[content.any(axis=1)].copy()
                 df['MonthStr'] = df['ParsedDate'].dt.strftime('%Y-%m')
                 for m, group in df.groupby('MonthStr'):
-                    self.data['expense'][m] = group
+                    store_monthly_expense(m, group)
             else:
                 df_peek = pd.read_excel(path, header=None, nrows=1)
                 header_date_range = self._parse_header_date(df_peek)
                 month = f"{header_date_range[1].year}-{header_date_range[1].month:02d}" if header_date_range[1] else self._extract_month_from_filename(filename)
-                self.data['expense'][month] = pd.read_excel(path, header=0)
+                store_monthly_expense(month, pd.read_excel(path, header=0))
         except Exception as e:
             print(f"加载费用数据失败 {filename}: {e}")
 
@@ -1890,7 +2313,199 @@ class ReportGenerator:
                 ws.cell(row=delta_row, column=dest_col).value = metric["delta_formula"]
         return True
 
-    def _repair_template_dashboard_formulas(self, ws):
+    def _dashboard_budget_header_row(self, wb):
+        if wb is None or "目标_预算" not in wb.sheetnames:
+            return 10
+        ws = wb["目标_预算"]
+        for r in range(1, min(ws.max_row, 50) + 1):
+            if str(ws.cell(row=r, column=1).value).strip() == "月份":
+                return r
+        return 10
+
+    def _dashboard_row_contains(self, ws, text, start_row=1, end_row=None):
+        end_row = end_row or ws.max_row
+        for r in range(start_row, end_row + 1):
+            val = ws.cell(row=r, column=1).value
+            if isinstance(val, str) and text in val:
+                return r
+        return None
+
+    def _ensure_dashboard_financial_rate_table_row(self, ws):
+        header_row = self._find_header_row_by_keyword(ws, "指标", max_row=80)
+        if not header_row:
+            return None
+        search_end = min(ws.max_row, header_row + 20)
+        existing = self._dashboard_row_contains(ws, "财务费用率", header_row + 1, search_end)
+        if existing:
+            return existing
+
+        admin_row = self._dashboard_row_contains(ws, "管理费用率", header_row + 1, search_end)
+        if not admin_row:
+            return None
+        insert_row = admin_row + 1
+        self._insert_rows_preserve_merges(ws, insert_row, 1)
+        self._copy_row_style(ws, admin_row, insert_row, max_col=max(ws.max_column, 8))
+        ws.cell(row=insert_row, column=1).value = "财务费用率"
+        for col in range(2, 9):
+            ws.cell(row=insert_row, column=col).value = None
+        return insert_row
+
+    def _repair_dashboard_target_table_formulas(self, ws, budget_header_row=10):
+        header_row = self._find_header_row_by_keyword(ws, "指标", max_row=80)
+        if not header_row:
+            return False
+
+        self._ensure_dashboard_financial_rate_table_row(ws)
+        search_end = min(ws.max_row, header_row + 20)
+
+        prev_month_expr = 'TEXT(DATE(LEFT($B$3,4),RIGHT($B$3,2),1)-1,"yyyy/mm")'
+
+        def metric_curr(col_letter):
+            return f"INDEX('经营指标'!${col_letter}:${col_letter}, MATCH($B$3, '经营指标'!$A:$A, 0))"
+
+        def metric_prev(col_letter):
+            return f"INDEX('经营指标'!${col_letter}:${col_letter}, MATCH({prev_month_expr}, '经营指标'!$A:$A, 0))"
+
+        def metric_curr_by_header(header):
+            return (
+                f'INDEX(\'经营指标\'!$A:$ZZ, MATCH($B$3, \'经营指标\'!$A:$A, 0), '
+                f'MATCH("{header}", \'经营指标\'!$1:$1, 0))'
+            )
+
+        def metric_prev_by_header(header):
+            return (
+                f'INDEX(\'经营指标\'!$A:$ZZ, MATCH({prev_month_expr}, \'经营指标\'!$A:$A, 0), '
+                f'MATCH("{header}", \'经营指标\'!$1:$1, 0))'
+            )
+
+        def budget_target(header):
+            return (
+                f'INDEX(\'目标_预算\'!$A:$ZZ, MATCH($B$3, \'目标_预算\'!$A:$A, 0), '
+                f'MATCH("{header}", \'目标_预算\'!${budget_header_row}:${budget_header_row}, 0))'
+            )
+
+        net_curr = "INDEX('利润表'!$C:$N, MATCH(\"*净利润*\", '利润表'!$A:$A, 0), MATCH($B$3, '利润表'!$C$1:$N$1, 0))"
+        net_prev = f"INDEX('利润表'!$C:$N, MATCH(\"*净利润*\", '利润表'!$A:$A, 0), MATCH({prev_month_expr}, '利润表'!$C$1:$N$1, 0))"
+
+        def row_for(label_part):
+            return self._dashboard_row_contains(ws, label_part, header_row + 1, search_end)
+
+        def set_target_row(label_part, actual_expr, target_header, prev_expr, compare_kind):
+            r = row_for(label_part)
+            if not r:
+                return
+            ws.cell(row=r, column=2).value = f'=IFERROR({actual_expr},"")'
+            ws.cell(row=r, column=3).value = f'=IFERROR({budget_target(target_header)},"")'
+            ws.cell(row=r, column=4).value = f'=IF(OR(C{r}="",C{r}=0),"",B{r}/C{r})'
+            ws.cell(row=r, column=5).value = f'=IF(C{r}="","",B{r}-C{r})'
+
+            if compare_kind == "ratio":
+                ws.cell(row=r, column=6).value = f'=IFERROR(IF({prev_expr}=0,"",B{r}/{prev_expr}-1),"")'
+                ws.cell(row=r, column=7).value = (
+                    f'=IF(F{r}="","",IF(ABS(F{r})>目标_预算!$B$7,'
+                    f'"⚠ 环比"&IF(F{r}>0,"上升","下降")&TEXT(ABS(F{r}),"0.0%"),""))'
+                )
+            elif compare_kind == "rate":
+                ws.cell(row=r, column=6).value = f'=IFERROR(B{r}-{prev_expr},"")'
+                ws.cell(row=r, column=7).value = (
+                    f'=IF(F{r}="","",IF(ABS(F{r})>目标_预算!$C$7,'
+                    f'"⚠ 环比"&IF(F{r}>0,"上升","下降")&TEXT(ABS(F{r}),"0.00%")&"pp",""))'
+                )
+            elif compare_kind == "days":
+                ws.cell(row=r, column=6).value = f'=IFERROR(B{r}-{prev_expr},"")'
+                ws.cell(row=r, column=7).value = (
+                    f'=IF(F{r}="","",IF(ABS(F{r})>目标_预算!$D$7,'
+                    f'"⚠ 环比"&IF(F{r}>0,"增加","减少")&TEXT(ABS(F{r}),"0")&"天",""))'
+                )
+
+        set_target_row("主营业务收入", metric_curr("C"), "主营业务收入目标", metric_prev("C"), "ratio")
+        set_target_row("净利润（元）", net_curr, "营业利润目标", net_prev, "ratio")
+        set_target_row("净利润率", f"({net_curr}/{metric_curr('C')})", "营业利润率目标", f"({net_prev}/{metric_prev('C')})", "rate")
+        set_target_row("成本率", metric_curr("K"), "成本率目标", metric_prev("K"), "rate")
+        set_target_row("销售费用率", metric_curr("L"), "销售费用率目标", metric_prev("L"), "rate")
+        set_target_row("管理费用率", metric_curr("M"), "管理费用率目标", metric_prev("M"), "rate")
+        set_target_row(
+            "财务费用率",
+            metric_curr_by_header("财务费用率"),
+            "财务费用率目标",
+            metric_prev_by_header("财务费用率"),
+            "rate",
+        )
+        set_target_row("应收账款余额", metric_curr("H"), "应收账款余额目标", metric_prev("H"), "ratio")
+        set_target_row("存货期末余额", metric_curr("I"), "存货期末余额目标", metric_prev("I"), "ratio")
+        set_target_row("存货周转天数", metric_curr("O"), "存货周转天数目标", metric_prev("O"), "days")
+        return True
+
+    def _ensure_dashboard_financial_rate_chart_series(self, wb):
+        if "仪表盘" not in wb.sheetnames or "经营指标" not in wb.sheetnames:
+            return False
+
+        dash_ws = wb["仪表盘"]
+        metric_ws = wb["经营指标"]
+        header_map = self._get_header_map(metric_ws, 1)
+        month_col = header_map.get("月份")
+        financial_col = header_map.get("财务费用率")
+        if not month_col or not financial_col:
+            return False
+
+        required_cols = [
+            header_map.get("成本率") or header_map.get("主营业务成本成本率"),
+            header_map.get("销售费用率"),
+            header_map.get("管理费用率"),
+        ]
+        required_cols = [c for c in required_cols if c]
+        if len(required_cols) < 2:
+            return False
+
+        data_start, data_end = self._find_month_data_bounds(metric_ws, month_col, 2)
+        if data_end < data_start:
+            return False
+
+        for chart in dash_ws._charts:
+            value_cols = set()
+            for series in chart.series:
+                val_formula = None
+                try:
+                    val_formula = series.val.numRef.f if series.val and series.val.numRef else None
+                except Exception:
+                    val_formula = None
+                parsed = self._parse_chart_range_formula(val_formula)
+                if not parsed:
+                    continue
+                sheet_name, min_col, _, max_col, _ = parsed
+                if sheet_name == "经营指标" and min_col == max_col:
+                    value_cols.add(min_col)
+
+            if financial_col in value_cols:
+                return False
+            if not all(col in value_cols for col in required_cols):
+                continue
+
+            data_ref = Reference(
+                metric_ws,
+                min_col=financial_col,
+                max_col=financial_col,
+                min_row=1,
+                max_row=data_end,
+            )
+            chart.add_data(data_ref, titles_from_data=True)
+            cats_ref = self._chart_category_reference(metric_ws, month_col, data_start, data_end)
+            chart.set_categories(cats_ref)
+            return True
+        return False
+
+    def _ensure_dashboard_financial_expense_rate(self, wb):
+        if "仪表盘" not in wb.sheetnames:
+            return False
+        changed = False
+        row = self._ensure_dashboard_financial_rate_table_row(wb["仪表盘"])
+        if row:
+            changed = True
+        if self._ensure_dashboard_financial_rate_chart_series(wb):
+            changed = True
+        return changed
+
+    def _repair_template_dashboard_formulas(self, ws, budget_header_row=10):
         # 模板中原有“环比/较上月”大量采用 MATCH-1 取上月行，在月份倒序时会失效。
         prev_month_expr = 'TEXT(DATE(LEFT($B$3,4),RIGHT($B$3,2),1)-1,"yyyy/mm")'
 
@@ -1965,6 +2580,7 @@ class ReportGenerator:
 
         ws["B13"].value = f'=IFERROR({days_curr},"")'
         ws["D13"].value = f'=IFERROR(B13-({days_prev}),"")'
+        self._repair_dashboard_target_table_formulas(ws, budget_header_row=budget_header_row)
 
         # 仪表盘比较口径统一为“较上月”，避免模板残留“较上一年/较上年”文案误导。
         for r in range(1, min(ws.max_row, 80) + 1):
@@ -2511,8 +3127,9 @@ class ReportGenerator:
         for sheet_name in ["本量利分析", "目标_预算", "经营指标"]:
             if sheet_name in wb.sheetnames:
                 self._hide_out_of_scope_month_rows(wb[sheet_name], target_year, target_month)
-        if "经营指标" in wb.sheetnames:
-            self._hide_rows_before_first_month(wb["经营指标"], header_keyword="月份", month_col=1)
+        for sheet_name in ["经营指标", "费用对比"]:
+            if sheet_name in wb.sheetnames:
+                self._hide_rows_before_first_month(wb[sheet_name], header_keyword="月份", month_col=1)
 
     def _hide_out_of_scope_month_columns_simple(self, ws, target_year, target_month, header_row=1):
         for col in range(1, ws.max_column + 1):
@@ -3389,6 +4006,87 @@ class ReportGenerator:
             count = len(ws._charts)
             print(f"图表检查: {ws.title} = {count}")
 
+    def _chart_title_text(self, chart):
+        try:
+            return chart.title.tx.rich.p[0].r[0].t
+        except Exception:
+            return ""
+
+    def _worksheet_has_chart_title(self, ws, title_part):
+        for chart in getattr(ws, "_charts", []):
+            if title_part in self._chart_title_text(chart):
+                return True
+        return False
+
+    def _chart_first_value_formula(self, chart):
+        for series in getattr(chart, "series", []) or []:
+            if series.val is not None and series.val.numRef is not None and series.val.numRef.f:
+                return series.val.numRef.f
+        return None
+
+    def _infer_chart_category_reference(self, wb, chart):
+        value_formula = self._chart_first_value_formula(chart)
+        parsed = self._parse_chart_range_formula(value_formula)
+        if not parsed:
+            return None
+        sheet_name, min_col, min_row, _max_col, max_row = parsed
+        if sheet_name not in wb.sheetnames:
+            return None
+        ws = wb[sheet_name]
+        header_row = max(1, min_row - 1)
+        header_map = self._get_header_map(ws, header_row)
+
+        preferred_headers = [
+            "月份",
+            "客户",
+            "往来单位名",
+            "产品",
+            "产品名称",
+            "品类",
+            "供应商/对象",
+            "科目/对象",
+            "主体",
+            "职员",
+        ]
+        for header in preferred_headers:
+            col = header_map.get(header)
+            if not col or col == min_col:
+                continue
+            values = [ws.cell(row=r, column=col).value for r in range(min_row, max_row + 1)]
+            if any(v is not None and str(v).strip() != "" for v in values):
+                return Reference(ws, min_col=col, min_row=min_row, max_row=max_row)
+
+        # Most helper chart tables use the column immediately before the first series as labels.
+        if min_col > 1:
+            prev_values = [ws.cell(row=r, column=min_col - 1).value for r in range(min_row, max_row + 1)]
+            if any(v is not None and str(v).strip() != "" for v in prev_values):
+                return Reference(ws, min_col=min_col - 1, min_row=min_row, max_row=max_row)
+
+        first_values = [ws.cell(row=r, column=1).value for r in range(min_row, max_row + 1)]
+        if min_col != 1 and any(v is not None and str(v).strip() != "" for v in first_values):
+            return Reference(ws, min_col=1, min_row=min_row, max_row=max_row)
+        return None
+
+    def _repair_missing_chart_categories(self, wb):
+        repaired = 0
+        for ws in wb.worksheets:
+            for chart in getattr(ws, "_charts", []) or []:
+                if isinstance(chart, ScatterChart):
+                    continue
+                if self._chart_category_formula(chart):
+                    continue
+                ref = self._infer_chart_category_reference(wb, chart)
+                if ref is None:
+                    continue
+                chart.set_categories(ref)
+                for sub_chart in getattr(chart, "_charts", []) or []:
+                    if not isinstance(sub_chart, ScatterChart):
+                        sub_chart.set_categories(ref)
+                repaired += 1
+        if repaired:
+            print(f"已修复图表分类轴: {repaired}")
+        return repaired
+
     def _get_header_map(self, ws, header_row=1):
         header_map = {}
         for col in range(1, ws.max_column + 1):
@@ -3414,6 +4112,20 @@ class ReportGenerator:
             if value is not None and str(value).strip() != "":
                 last = r
         return last
+
+    def _find_month_data_bounds(self, ws, col, start_row):
+        first = None
+        last = start_row - 1
+        for r in range(start_row, ws.max_row + 1):
+            value = ws.cell(row=r, column=col).value
+            if self._month_label_exact_to_key(value):
+                if first is None:
+                    first = r
+                last = r
+                continue
+            if first is not None:
+                break
+        return (first or start_row), last
 
     def _copy_cell_style(self, src, dst):
         if not src or not dst:
@@ -3570,6 +4282,14 @@ class ReportGenerator:
             scoped = scoped[scoped['科目名'] != '科目名']
 
         debit_col, credit_col, amount_col = self._pick_expense_amount_cols(scoped)
+        if debit_col:
+            scoped['DebitAmount'] = scoped[debit_col].apply(self._to_float)
+        else:
+            scoped['DebitAmount'] = None
+        if credit_col:
+            scoped['CreditAmount'] = scoped[credit_col].apply(self._to_float)
+        else:
+            scoped['CreditAmount'] = None
         if debit_col and credit_col:
             scoped['Amount'] = scoped[debit_col].apply(self._to_float).fillna(0) - scoped[credit_col].apply(self._to_float).fillna(0)
         elif debit_col:
@@ -4160,6 +4880,48 @@ class ReportGenerator:
             cell.comment = data["comment"]
             if data["hyperlink"]:
                 self._apply_hyperlink(cell, data["hyperlink"])
+
+    def _snapshot_column(self, ws, col_idx, max_row):
+        cells = []
+        for r in range(1, max_row + 1):
+            cell = ws.cell(row=r, column=col_idx)
+            cells.append({
+                "value": cell.value,
+                "font": copy.copy(cell.font),
+                "border": copy.copy(cell.border),
+                "fill": copy.copy(cell.fill),
+                "number_format": cell.number_format,
+                "protection": copy.copy(cell.protection),
+                "alignment": copy.copy(cell.alignment),
+                "comment": copy.copy(cell.comment) if cell.comment else None,
+                "hyperlink": cell.hyperlink,
+            })
+        letter = get_column_letter(col_idx)
+        dimension = ws.column_dimensions[letter]
+        return {
+            "width": dimension.width,
+            "hidden": dimension.hidden,
+            "cells": cells,
+        }
+
+    def _restore_column(self, ws, col_idx, snapshot, max_row):
+        letter = get_column_letter(col_idx)
+        dimension = ws.column_dimensions[letter]
+        dimension.width = snapshot.get("width")
+        dimension.hidden = bool(snapshot.get("hidden"))
+        for r in range(1, max_row + 1):
+            data = snapshot["cells"][r - 1]
+            cell = ws.cell(row=r, column=col_idx)
+            cell.value = data["value"]
+            cell.font = data["font"]
+            cell.border = data["border"]
+            cell.fill = data["fill"]
+            cell.number_format = data["number_format"]
+            cell.protection = data["protection"]
+            cell.alignment = data["alignment"]
+            cell.comment = data["comment"]
+            if data["hyperlink"]:
+                self._apply_hyperlink(cell, data["hyperlink"])
             else:
                 cell.hyperlink = None
 
@@ -4282,7 +5044,9 @@ class ReportGenerator:
 
     def _write_table(self, ws, start_row, start_col, headers, rows):
         for idx, header in enumerate(headers):
-            ws.cell(row=start_row, column=start_col + idx).value = header
+            cell = ws.cell(row=start_row, column=start_col + idx)
+            if not isinstance(cell, MergedCell):
+                cell.value = self._sanitize_excel_text(header)
         
         # Apply standard header style
         self._apply_header_style(
@@ -4294,7 +5058,9 @@ class ReportGenerator:
 
         for r_idx, row in enumerate(rows, start=1):
             for c_idx, value in enumerate(row):
-                ws.cell(row=start_row + r_idx, column=start_col + c_idx).value = value
+                cell = ws.cell(row=start_row + r_idx, column=start_col + c_idx)
+                if not isinstance(cell, MergedCell):
+                    cell.value = self._sanitize_excel_text(value)
 
     def _add_line_chart_by_columns(
         self,
@@ -4345,6 +5111,22 @@ class ReportGenerator:
         ws.add_chart(chart, anchor)
         return True
 
+    def _add_bar_chart_by_columns(self, ws, cat_col, data_cols, header_row, data_start, data_end, title, anchor):
+        if not data_cols or data_end < data_start:
+            return False
+        chart = BarChart()
+        chart.type = "col"
+        chart.title = title
+        cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
+        for col in data_cols:
+            data_ref = Reference(ws, min_col=col, max_col=col, min_row=header_row, max_row=data_end)
+            chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
+        chart.height = 10
+        chart.width = 18
+        ws.add_chart(chart, anchor)
+        return True
+
     def _add_combo_chart(self, ws, cat_col, bar_cols, line_cols, header_row, data_start, data_end, title, anchor):
         """
         创建一个组合图表：柱状图(主轴) + 折线图(次轴)
@@ -4358,11 +5140,12 @@ class ReportGenerator:
         bar_chart.x_axis.title = "月份"
         
         cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
-        bar_chart.set_categories(cats_ref)
 
         for col in bar_cols:
             data_ref = Reference(ws, min_col=col, max_col=col, min_row=header_row, max_row=data_end)
             bar_chart.add_data(data_ref, titles_from_data=True)
+        if bar_cols:
+            bar_chart.set_categories(cats_ref)
 
         # 2. Create Line Chart (Secondary)
         line_chart = LineChart()
@@ -4374,6 +5157,8 @@ class ReportGenerator:
         for col in line_cols:
             data_ref = Reference(ws, min_col=col, max_col=col, min_row=header_row, max_row=data_end)
             line_chart.add_data(data_ref, titles_from_data=True)
+        if line_cols:
+            line_chart.set_categories(cats_ref)
 
         # 3. Combine
         bar_chart.y_axis.crosses = "min"
@@ -4393,16 +5178,22 @@ class ReportGenerator:
         chart.title = title
         
         cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
-        chart.set_categories(cats_ref)
 
         for col in data_cols:
             data_ref = Reference(ws, min_col=col, max_col=col, min_row=header_row, max_row=data_end)
             chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
 
         chart.height = 10
         chart.width = 18
         ws.add_chart(chart, anchor)
         return True
+
+    def _short_chart_label(self, value, max_len=24):
+        text = "" if value is None else str(value).strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max(1, max_len - 3)] + "..."
 
     def _add_doughnut_chart(self, ws, label_col, data_col, header_row, data_start, data_end, title, anchor):
         from openpyxl.chart import DoughnutChart
@@ -4715,7 +5506,7 @@ class ReportGenerator:
         if not cat_col:
             return False
         data_start = header_row + 1
-        data_end = self._find_last_row_by_column(ws, cat_col, data_start)
+        data_start, data_end = self._find_month_data_bounds(ws, cat_col, data_start)
         if data_end < data_start:
             return False
         
@@ -4756,7 +5547,7 @@ class ReportGenerator:
         if not cat_col:
             return False
         data_start = header_row + 1
-        data_end = self._find_last_row_by_column(ws, cat_col, data_start)
+        data_start, data_end = self._find_month_data_bounds(ws, cat_col, data_start)
         if data_end < data_start:
             return False
         preferred = ["主营业务成本占比", "销售费用占比", "管理费用占比", "财务费用占比"]
@@ -4789,59 +5580,74 @@ class ReportGenerator:
         if not cat_col:
             return False
         data_start = header_row + 1
-        data_end = self._find_last_row_by_column(ws, cat_col, data_start)
+        data_start, data_end = self._find_month_data_bounds(ws, cat_col, data_start)
         if data_end < data_start:
             return False
-        preferred = ["销售收入", "总成本", "固定成本", "盈亏平衡点"]
-        series_cols = self._pick_existing_columns(header_map, preferred)
-        if not series_cols:
-            return False
+
         anchor_col = ws.max_column + 2
-        anchor = f"{get_column_letter(anchor_col)}2"
-        added = self._add_line_chart_by_columns(
-            ws,
-            cat_col,
-            series_cols,
-            header_row,
-            data_start,
-            data_end,
-            "本量利趋势",
-            anchor,
+        added = False
+
+        amount_cols = self._pick_existing_columns(
+            header_map,
+            ["销售收入", "变动成本", "固定成本", "总成本", "盈亏平衡点"],
         )
-        
-        # Add Safety Margin Analysis (Area Chart)
-        anchor_area = f"{get_column_letter(anchor_col)}18"
-        area_chart = LineChart() # Using LineChart with grouping='standard' can mimic Area if filled, but simpler to use Line for now or specific AreaChart class if imported. Let's stick to a clear Line comparison for Margin.
-        # Actually, let's try to make a specific visual for Margin.
-        # Let's use a Combo Chart: Revenue (Area) vs Break-even (Line) if possible, or just two Lines with a clear title.
-        # A simple comparison line chart is good.
-        
-        margin_chart = LineChart()
-        margin_chart.title = "安全边际分析 (实际销售 vs 盈亏平衡)"
-        margin_chart.y_axis.title = "金额"
-        margin_chart.x_axis.title = "月份"
-        
-        cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
-        margin_chart.set_categories(cats_ref)
-        
-        # Add Revenue
-        rev_col = header_map.get("销售收入")
-        if rev_col:
-            rev_ref = Reference(ws, min_col=rev_col, max_col=rev_col, min_row=header_row, max_row=data_end)
-            margin_chart.add_data(rev_ref, titles_from_data=True)
-            
-        # Add Break-even
-        be_col = header_map.get("盈亏平衡点")
-        if be_col:
-            be_ref = Reference(ws, min_col=be_col, max_col=be_col, min_row=header_row, max_row=data_end)
-            margin_chart.add_data(be_ref, titles_from_data=True)
-            
-        margin_chart.height = 10
-        margin_chart.width = 18
-        ws.add_chart(margin_chart, anchor_area)
+        if amount_cols:
+            added = self._add_line_chart_by_columns(
+                ws,
+                cat_col,
+                amount_cols,
+                header_row,
+                data_start,
+                data_end,
+                "本量利金额趋势",
+                f"{get_column_letter(anchor_col)}2",
+            ) or added
+
+        margin_series_cols = self._pick_existing_columns(
+            header_map,
+            ["销售收入", "盈亏平衡点", "安全边际"],
+        )
+        if margin_series_cols:
+            margin_chart = LineChart()
+            margin_chart.title = "盈亏平衡与安全边际"
+            margin_chart.y_axis.title = "金额"
+            margin_chart.x_axis.title = "月份"
+            for col in margin_series_cols:
+                data_ref = Reference(ws, min_col=col, max_col=col, min_row=header_row, max_row=data_end)
+                margin_chart.add_data(data_ref, titles_from_data=True)
+            cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
+            margin_chart.set_categories(cats_ref)
+            margin_chart.height = 10
+            margin_chart.width = 18
+            ws.add_chart(margin_chart, f"{get_column_letter(anchor_col)}18")
+            added = True
+
+        rate_cols = self._pick_existing_columns(
+            header_map,
+            ["贡献毛利率", "安全边际率"],
+        )
+        if rate_cols:
+            rate_chart = LineChart()
+            rate_chart.title = "贡献毛利率/安全边际率趋势"
+            rate_chart.y_axis.title = "比率"
+            rate_chart.x_axis.title = "月份"
+            for col in rate_cols:
+                data_ref = Reference(ws, min_col=col, max_col=col, min_row=header_row, max_row=data_end)
+                rate_chart.add_data(data_ref, titles_from_data=True)
+            cats_ref = self._chart_category_reference(ws, cat_col, data_start, data_end)
+            rate_chart.set_categories(cats_ref)
+            rate_chart.height = 10
+            rate_chart.width = 18
+            ws.add_chart(rate_chart, f"{get_column_letter(anchor_col)}34")
+            added = True
 
         if added:
-            self._write_chart_note(ws, anchor_col, 1, "图表说明：上图为本量利趋势；下图为安全边际分析(收入与盈亏点差距)。")
+            self._write_chart_note(
+                ws,
+                anchor_col,
+                1,
+                "图表说明：图表不含合计行；依次展示金额趋势、盈亏平衡/安全边际、贡献毛利率与安全边际率。",
+            )
         return added
 
     def _add_chart_budget(self, ws):
@@ -4853,7 +5659,7 @@ class ReportGenerator:
         if not cat_col:
             return False
         data_start = header_row + 1
-        data_end = self._find_last_row_by_column(ws, cat_col, data_start)
+        data_start, data_end = self._find_month_data_bounds(ws, cat_col, data_start)
         if data_end < data_start:
             return False
         preferred = [
@@ -5113,37 +5919,213 @@ class ReportGenerator:
         header_row = 1
         header_map = self._get_header_map(ws, header_row)
         name_col = header_map.get("产品名称") or header_map.get("品目名规格")
-        value_col = header_map.get("年销售收入合计") or header_map.get("当前库存金额")
-        if not name_col or not value_col:
+        if not name_col:
             return False
-        items = []
+
+        revenue_col = header_map.get("年销售收入合计")
+        profit_col = header_map.get("年销售利润合计")
+        margin_col = header_map.get("年毛利率平均")
+        inventory_col = (
+            header_map.get("当前库存金额")
+            or header_map.get("年末存货金额")
+            or header_map.get("期末库存金额")
+        )
+        turnover_days_col = header_map.get("存货周转天数")
+        qty_col = header_map.get("年销售数量合计")
+
+        products = []
+        total_row = None
         for r in range(header_row + 1, ws.max_row + 1):
             name = ws.cell(row=r, column=name_col).value
-            value = self._to_float(ws.cell(row=r, column=value_col).value)
-            if not name or value is None:
+            if not name:
                 continue
-            if isinstance(name, str) and "合计" in name:
+            name_text = str(name).strip()
+            if not name_text:
                 continue
-            items.append((str(name), value))
-        if not items:
+            if "合计" in name_text or name_text.upper() == "TOTAL":
+                if total_row is None:
+                    total_row = r
+                continue
+
+            item = {
+                "name": name_text,
+                "label": self._short_chart_label(name_text, 18),
+                "revenue": self._to_float(ws.cell(row=r, column=revenue_col).value) if revenue_col else None,
+                "profit": self._to_float(ws.cell(row=r, column=profit_col).value) if profit_col else None,
+                "margin": self._to_float(ws.cell(row=r, column=margin_col).value) if margin_col else None,
+                "inventory": self._to_float(ws.cell(row=r, column=inventory_col).value) if inventory_col else None,
+                "turnover_days": self._to_float(ws.cell(row=r, column=turnover_days_col).value) if turnover_days_col else None,
+                "qty": self._to_float(ws.cell(row=r, column=qty_col).value) if qty_col else None,
+            }
+            if any(item.get(key) is not None for key in ("revenue", "profit", "margin", "inventory", "turnover_days", "qty")):
+                products.append(item)
+        if not products:
             return False
-        top_items = sorted(items, key=lambda x: abs(x[1]), reverse=True)[:10]
+
         start_col = ws.max_column + 2
-        headers = ["产品", "金额"]
-        rows = [[name, value] for name, value in top_items]
-        self._write_table(ws, 1, start_col, headers, rows)
-        anchor_col = start_col + len(headers) + 2
-        anchor = f"{get_column_letter(anchor_col)}2"
-        added = self._add_bar_chart_from_table(
-            ws,
-            1,
-            start_col,
-            1 + len(rows),
-            "产品Top",
-            anchor,
-        )
-        if added:
-            self._write_chart_note(ws, anchor_col, 1, "图表说明：Top产品的年销售收入/库存金额分布。")
+        anchor_col = start_col + 6
+        row_cursor = 1
+        added = False
+
+        def has_series_value(rows, index):
+            return any(row[index] is not None for row in rows)
+
+        def advance(rows):
+            return max(len(rows) + 4, 22)
+
+        top_revenue = [
+            p for p in products
+            if p.get("revenue") is not None or p.get("profit") is not None or p.get("margin") is not None
+        ]
+        top_revenue = sorted(top_revenue, key=lambda p: abs(p.get("revenue") or 0), reverse=True)[:10]
+        if top_revenue and not self._worksheet_has_chart_title(ws, "产品收入/毛利Top"):
+            rows = [[p["label"], p.get("revenue"), p.get("profit"), p.get("margin")] for p in top_revenue]
+            self._write_table(ws, row_cursor, start_col, ["产品", "销售收入", "毛利润", "毛利率"], rows)
+            for rr in range(row_cursor + 1, row_cursor + 1 + len(rows)):
+                ws.cell(row=rr, column=start_col + 3).number_format = "0.00%"
+            bar_cols = [start_col + idx for idx in (1, 2) if has_series_value(rows, idx)]
+            line_cols = [start_col + 3] if has_series_value(rows, 3) else []
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            if bar_cols and line_cols:
+                chart_added = self._add_combo_chart(
+                    ws, start_col, bar_cols, line_cols, row_cursor,
+                    row_cursor + 1, row_cursor + len(rows), "产品收入/毛利Top", anchor
+                )
+            else:
+                chart_added = self._add_bar_chart_by_columns(
+                    ws, start_col, bar_cols or line_cols, row_cursor,
+                    row_cursor + 1, row_cursor + len(rows), "产品收入/毛利Top", anchor
+                )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：头部产品收入、毛利润与毛利率联动。")
+            row_cursor += advance(rows)
+
+        top_inventory = [p for p in products if p.get("inventory") is not None]
+        top_inventory = sorted(top_inventory, key=lambda p: abs(p.get("inventory") or 0), reverse=True)[:10]
+        if top_inventory and not self._worksheet_has_chart_title(ws, "产品库存占用与周转Top"):
+            rows = [[p["label"], p.get("inventory"), p.get("turnover_days")] for p in top_inventory]
+            self._write_table(ws, row_cursor, start_col, ["产品", "库存金额", "周转天数"], rows)
+            bar_cols = [start_col + 1] if has_series_value(rows, 1) else []
+            line_cols = [start_col + 2] if has_series_value(rows, 2) else []
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            if bar_cols and line_cols:
+                chart_added = self._add_combo_chart(
+                    ws, start_col, bar_cols, line_cols, row_cursor,
+                    row_cursor + 1, row_cursor + len(rows), "产品库存占用与周转Top", anchor
+                )
+            else:
+                chart_added = self._add_bar_chart_by_columns(
+                    ws, start_col, bar_cols or line_cols, row_cursor,
+                    row_cursor + 1, row_cursor + len(rows), "产品库存占用与周转Top", anchor
+                )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：库存占用大的产品及其周转天数。")
+            row_cursor += advance(rows)
+
+        low_margin = [p for p in products if p.get("margin") is not None and (p.get("revenue") or 0) > 0]
+        low_margin = sorted(low_margin, key=lambda p: p.get("margin"))[:10]
+        if low_margin and not self._worksheet_has_chart_title(ws, "低毛利产品Top"):
+            rows = [[p["label"], p.get("margin")] for p in low_margin]
+            self._write_table(ws, row_cursor, start_col, ["产品", "毛利率"], rows)
+            for rr in range(row_cursor + 1, row_cursor + 1 + len(rows)):
+                ws.cell(row=rr, column=start_col + 1).number_format = "0.00%"
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            chart_added = self._add_bar_chart_from_table(
+                ws, row_cursor, start_col, row_cursor + len(rows), "低毛利产品Top", anchor
+            )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：优先复核低毛利或负毛利产品的定价与成本。")
+            row_cursor += advance(rows)
+
+        matrix_rows = [
+            p for p in products
+            if p.get("revenue") is not None and p.get("margin") is not None
+        ]
+        matrix_rows = sorted(matrix_rows, key=lambda p: abs(p.get("revenue") or 0), reverse=True)[:30]
+        if len(matrix_rows) >= 2 and not self._worksheet_has_chart_title(ws, "产品收入 vs 毛利率矩阵"):
+            rows = [[p["label"], p.get("revenue"), p.get("margin"), p.get("inventory")] for p in matrix_rows]
+            self._write_table(ws, row_cursor, start_col, ["产品", "销售收入", "毛利率", "库存金额"], rows)
+            for rr in range(row_cursor + 1, row_cursor + 1 + len(rows)):
+                ws.cell(row=rr, column=start_col + 2).number_format = "0.00%"
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            chart_added = self._add_scatter_chart(
+                ws,
+                start_col + 1,
+                start_col + 2,
+                row_cursor,
+                row_cursor + 1,
+                row_cursor + len(rows),
+                "产品收入 vs 毛利率矩阵",
+                anchor,
+                x_title="销售收入",
+                y_title="毛利率",
+            )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：识别高收入低毛利、低收入高毛利等产品组合。")
+            row_cursor += advance(rows)
+
+        month_metric_cols = {}
+        for header, col in header_map.items():
+            m = re.match(r"(20\d{2})\s*[./-]\s*(\d{1,2})\s*月?_(.+)", str(header))
+            if not m:
+                continue
+            month_key = f"{m.group(1)}-{int(m.group(2)):02d}"
+            month_label = f"{m.group(1)}/{int(m.group(2)):02d}"
+            suffix = m.group(3)
+            metric = None
+            if "销售收入" in suffix:
+                metric = "revenue"
+            elif "销售利润" in suffix or "毛利润" in suffix:
+                metric = "profit"
+            elif "期末库存金额" in suffix:
+                metric = "inventory"
+            if metric:
+                month_metric_cols.setdefault(month_key, {"label": month_label})[metric] = col
+
+        trend_rows = []
+        for month_key in sorted(month_metric_cols.keys()):
+            cols = month_metric_cols[month_key]
+            row = [cols["label"]]
+            for metric in ("revenue", "profit", "inventory"):
+                col = cols.get(metric)
+                if not col:
+                    row.append(None)
+                elif total_row:
+                    row.append(self._to_float(ws.cell(row=total_row, column=col).value))
+                else:
+                    row.append(self._safe_sum([
+                        self._to_float(ws.cell(row=r, column=col).value)
+                        for r in range(header_row + 1, ws.max_row + 1)
+                        if ws.cell(row=r, column=name_col).value
+                        and "合计" not in str(ws.cell(row=r, column=name_col).value)
+                    ]))
+            if any(v is not None for v in row[1:]):
+                trend_rows.append(row)
+        if len(trend_rows) >= 2 and not self._worksheet_has_chart_title(ws, "产品销售/库存月度趋势"):
+            self._write_table(ws, row_cursor, start_col, ["月份", "销售收入", "销售利润", "期末库存金额"], trend_rows)
+            series_cols = [
+                start_col + idx
+                for idx in (1, 2, 3)
+                if any(row[idx] is not None for row in trend_rows)
+            ]
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            chart_added = self._add_line_chart_by_columns(
+                ws,
+                start_col,
+                series_cols,
+                row_cursor,
+                row_cursor + 1,
+                row_cursor + len(trend_rows),
+                "产品销售/库存月度趋势",
+                anchor,
+            )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：合计口径下销售、毛利与期末库存金额趋势。")
         return added
 
     def _add_chart_sales_inventory_detail(self, ws):
@@ -5153,45 +6135,232 @@ class ReportGenerator:
         if not cat_col:
             return False
 
-        # Prefer sales amount; if the whole column is empty, fallback to ending inventory amount.
-        totals = {}
-        for value_col in (header_map.get("销售收入"), header_map.get("期末金额")):
-            if not value_col:
+        revenue_col = header_map.get("销售收入")
+        inventory_col = header_map.get("期末金额")
+        qty_col = header_map.get("销售数量")
+        product_col = header_map.get("产品名称") or header_map.get("品目名规格") or header_map.get("品目编码")
+        profit_col = header_map.get("毛利润") or header_map.get("销售利润")
+        margin_col = header_map.get("毛利率")
+
+        records = []
+        cat_totals = {}
+
+        def add_total(cat, key, value):
+            if value is None:
+                return
+            bucket = cat_totals.setdefault(cat, {})
+            bucket[key] = bucket.get(key, 0) + value
+            bucket[f"{key}_has"] = True
+
+        for r in range(header_row + 1, ws.max_row + 1):
+            cat = ws.cell(row=r, column=cat_col).value
+            if not cat:
                 continue
-            candidate_totals = {}
-            for r in range(header_row + 1, ws.max_row + 1):
-                cat = ws.cell(row=r, column=cat_col).value
-                value = self._to_float(ws.cell(row=r, column=value_col).value)
-                if not cat or value is None:
-                    continue
-                cat = str(cat).strip()
-                candidate_totals[cat] = candidate_totals.get(cat, 0) + value
-            if candidate_totals:
-                totals = candidate_totals
-                break
-        if not totals:
+            cat = str(cat).strip()
+            if not cat:
+                continue
+            product = ws.cell(row=r, column=product_col).value if product_col else cat
+            product_label = self._short_chart_label(product or cat, 18)
+            revenue = self._to_float(ws.cell(row=r, column=revenue_col).value) if revenue_col else None
+            inventory = self._to_float(ws.cell(row=r, column=inventory_col).value) if inventory_col else None
+            qty = self._to_float(ws.cell(row=r, column=qty_col).value) if qty_col else None
+            profit = self._to_float(ws.cell(row=r, column=profit_col).value) if profit_col else None
+            margin = self._to_float(ws.cell(row=r, column=margin_col).value) if margin_col else None
+            if profit is None and revenue is not None:
+                cost_col = header_map.get("销售成本")
+                cost = self._to_float(ws.cell(row=r, column=cost_col).value) if cost_col else None
+                if cost is not None:
+                    profit = revenue - cost
+            if margin is None and revenue not in (None, 0) and profit is not None:
+                margin = profit / revenue
+
+            add_total(cat, "revenue", revenue)
+            add_total(cat, "inventory", inventory)
+            add_total(cat, "qty", qty)
+            add_total(cat, "profit", profit)
+
+            if any(v is not None for v in (revenue, inventory, qty, profit, margin)):
+                records.append({
+                    "category": cat,
+                    "product": product_label,
+                    "revenue": revenue,
+                    "inventory": inventory,
+                    "qty": qty,
+                    "profit": profit,
+                    "margin": margin,
+                })
+
+        if not records and not cat_totals:
             return False
-        top_items = sorted(totals.items(), key=lambda x: abs(x[1]), reverse=True)[:8]
+
+        def total_value(bucket, key):
+            return bucket.get(key) if bucket.get(f"{key}_has") else None
+
         # Keep a stable helper range so chart references do not drift right across regenerations.
         start_col = 28  # AB
-        for r in range(header_row + 1, ws.max_row + 1):
-            self._safe_set_cell_value(ws, r, start_col, None)
-            self._safe_set_cell_value(ws, r, start_col + 1, None)
-        headers = ["品类", "金额"]
-        rows = [[name, value] for name, value in top_items]
-        self._write_table(ws, 1, start_col, headers, rows)
-        anchor_col = start_col + len(headers) + 2
-        anchor = f"{get_column_letter(anchor_col)}2"
-        added = self._add_bar_chart_from_table(
-            ws,
-            1,
-            start_col,
-            1 + len(rows),
-            "销售/库存Top",
-            anchor,
-        )
-        if added:
-            self._write_chart_note(ws, anchor_col, 1, "图表说明：按品类汇总的销售收入/期末金额。")
+        helper_end_col = start_col + 8
+        for r in range(1, ws.max_row + 1):
+            for c in range(start_col, helper_end_col + 1):
+                self._safe_set_cell_value(ws, r, c, None)
+
+        anchor_col = start_col + 4
+        row_cursor = 1
+        added = False
+
+        def has_series_value(rows, index):
+            return any(row[index] is not None for row in rows)
+
+        def advance(rows):
+            return max(len(rows) + 4, 22)
+
+        cat_rows = []
+        has_revenue = any(bucket.get("revenue_has") for bucket in cat_totals.values())
+        amount_key = "revenue" if has_revenue else "inventory"
+        for cat, bucket in cat_totals.items():
+            value = total_value(bucket, amount_key)
+            if value is not None:
+                cat_rows.append([cat, value])
+        top_items = sorted(cat_rows, key=lambda x: abs(x[1]), reverse=True)[:8]
+        if top_items:
+            self._write_table(ws, row_cursor, start_col, ["品类", "金额"], top_items)
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            chart_added = self._add_bar_chart_from_table(
+                ws,
+                row_cursor,
+                start_col,
+                row_cursor + len(top_items),
+                "销售/库存Top",
+                anchor,
+            )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：按品类汇总的销售收入/期末金额。")
+            row_cursor += advance(top_items)
+
+        compare_rows = []
+        for cat, bucket in cat_totals.items():
+            revenue = total_value(bucket, "revenue")
+            inventory = total_value(bucket, "inventory")
+            profit = total_value(bucket, "profit")
+            if any(v is not None for v in (revenue, inventory, profit)):
+                compare_rows.append([cat, revenue, inventory, profit])
+        compare_rows = sorted(
+            compare_rows,
+            key=lambda row: max(abs(row[1] or 0), abs(row[2] or 0), abs(row[3] or 0)),
+            reverse=True,
+        )[:10]
+        if compare_rows:
+            self._write_table(ws, row_cursor, start_col, ["品类", "销售收入", "期末库存金额", "毛利润"], compare_rows)
+            series_cols = [start_col + idx for idx in (1, 2, 3) if has_series_value(compare_rows, idx)]
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            chart_added = self._add_bar_chart_by_columns(
+                ws,
+                start_col,
+                series_cols,
+                row_cursor,
+                row_cursor + 1,
+                row_cursor + len(compare_rows),
+                "品类销售/库存/毛利对比",
+                anchor,
+            )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：比较品类销售收入、库存占用与毛利润。")
+            row_cursor += advance(compare_rows)
+
+        inventory_rows = [
+            [r["product"], r.get("inventory")]
+            for r in records
+            if r.get("inventory") is not None
+        ]
+        inventory_rows = sorted(inventory_rows, key=lambda row: abs(row[1] or 0), reverse=True)[:10]
+        if inventory_rows:
+            self._write_table(ws, row_cursor, start_col, ["产品", "期末库存金额"], inventory_rows)
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            chart_added = self._add_bar_chart_from_table(
+                ws,
+                row_cursor,
+                start_col,
+                row_cursor + len(inventory_rows),
+                "产品库存金额Top",
+                anchor,
+            )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：库存金额最高的产品，优先检查周转与备货策略。")
+            row_cursor += advance(inventory_rows)
+
+        risk_candidates = []
+        for r in records:
+            inventory = r.get("inventory")
+            revenue = r.get("revenue")
+            if inventory is None or inventory <= 0:
+                continue
+            ratio = inventory / revenue if revenue and revenue > 0 else None
+            risk_score = ratio if ratio is not None else 1e9
+            risk_candidates.append((risk_score, [r["product"], inventory, revenue, ratio]))
+        risk_rows = [row for _, row in sorted(risk_candidates, key=lambda item: item[0], reverse=True)[:10]]
+        if risk_rows:
+            self._write_table(ws, row_cursor, start_col, ["产品", "期末库存金额", "销售收入", "库存收入比"], risk_rows)
+            for rr in range(row_cursor + 1, row_cursor + 1 + len(risk_rows)):
+                ws.cell(row=rr, column=start_col + 3).number_format = "0.00%"
+            bar_cols = [start_col + idx for idx in (1, 2) if has_series_value(risk_rows, idx)]
+            line_cols = [start_col + 3] if has_series_value(risk_rows, 3) else []
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            if bar_cols and line_cols:
+                chart_added = self._add_combo_chart(
+                    ws,
+                    start_col,
+                    bar_cols,
+                    line_cols,
+                    row_cursor,
+                    row_cursor + 1,
+                    row_cursor + len(risk_rows),
+                    "高库存低销售风险Top",
+                    anchor,
+                )
+            else:
+                chart_added = self._add_bar_chart_by_columns(
+                    ws,
+                    start_col,
+                    bar_cols,
+                    row_cursor,
+                    row_cursor + 1,
+                    row_cursor + len(risk_rows),
+                    "高库存低销售风险Top",
+                    anchor,
+                )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：库存金额高但销售收入低的产品存在滞销或备货过量风险。")
+            row_cursor += advance(risk_rows)
+
+        matrix_records = [
+            r for r in records
+            if r.get("revenue") is not None and r.get("margin") is not None
+        ]
+        matrix_records = sorted(matrix_records, key=lambda r: abs(r.get("revenue") or 0), reverse=True)[:30]
+        if len(matrix_records) >= 2:
+            matrix_rows = [[r["product"], r.get("revenue"), r.get("margin")] for r in matrix_records]
+            self._write_table(ws, row_cursor, start_col, ["产品", "销售收入", "毛利率"], matrix_rows)
+            for rr in range(row_cursor + 1, row_cursor + 1 + len(matrix_rows)):
+                ws.cell(row=rr, column=start_col + 2).number_format = "0.00%"
+            anchor = f"{get_column_letter(anchor_col)}{row_cursor + 1}"
+            chart_added = self._add_scatter_chart(
+                ws,
+                start_col + 1,
+                start_col + 2,
+                row_cursor,
+                row_cursor + 1,
+                row_cursor + len(matrix_rows),
+                "产品销售收入 vs 毛利率矩阵",
+                anchor,
+                x_title="销售收入",
+                y_title="毛利率",
+            )
+            if chart_added:
+                added = True
+                self._write_chart_note(ws, anchor_col, row_cursor, "图表说明：识别高收入低毛利产品，辅助定价和成本复盘。")
         return added
 
     def _add_chart_wide_sheet(self, ws, preferred_labels, title, note):
@@ -5315,7 +6484,22 @@ class ReportGenerator:
         for ws in wb.worksheets:
             if ws.title in skip:
                 continue
-            force_rebuild = ws.title == "明细_销售与库存"
+            force_rebuild = ws.title in {"明细_销售与库存", "本量利分析", "经营指标"}
+            if ws.title == "按产品汇总_含合计" and len(ws._charts) > 0:
+                required_titles = (
+                    "产品收入/毛利Top",
+                    "产品库存占用与周转Top",
+                    "产品收入 vs 毛利率矩阵",
+                )
+                if any(not self._worksheet_has_chart_title(ws, title) for title in required_titles):
+                    if self._add_chart_product_summary(ws):
+                        print(f"已自动补充图表: {ws.title}")
+                continue
+            if ws.title == "按品类汇总(按月)" and len(ws._charts) > 0:
+                if not self._worksheet_has_chart_title(ws, "品类毛利润趋势"):
+                    if self._add_chart_category_month(ws):
+                        print(f"已自动补充图表: {ws.title}")
+                continue
             if len(ws._charts) > 0 and not force_rebuild:
                 continue
             if force_rebuild and len(ws._charts) > 0:
@@ -5407,7 +6591,9 @@ class ReportGenerator:
     def _write_rows(self, ws, start_row, start_col, rows):
         for r_idx, row in enumerate(rows, start=0):
             for c_idx, value in enumerate(row, start=0):
-                ws.cell(row=start_row + r_idx, column=start_col + c_idx).value = value
+                cell = ws.cell(row=start_row + r_idx, column=start_col + c_idx)
+                if not isinstance(cell, MergedCell):
+                    cell.value = self._sanitize_excel_text(value)
 
     def _write_data_quality_sheet(self, wb):
         ws = self._prepare_sheet(wb, "数据质量检查", insert_after="目录")
@@ -5645,7 +6831,12 @@ class ReportGenerator:
                     self._log_audit("模板仪表盘已补充营业利润/营业利润率。")
                 else:
                     self._log_audit("检测到模板仪表盘公式，跳过自动重建仪表盘。")
-                self._repair_template_dashboard_formulas(existing)
+                if self._ensure_dashboard_financial_expense_rate(wb):
+                    self._log_audit("模板仪表盘已补充财务费用率表格/图表。")
+                self._repair_template_dashboard_formulas(
+                    existing,
+                    budget_header_row=self._dashboard_budget_header_row(wb),
+                )
                 return
         ws = self._prepare_sheet(wb, "仪表盘", insert_after="目录")
         
@@ -6184,6 +7375,26 @@ class ReportGenerator:
         total_revenue = self._sum_numeric_or_none(df.get('Revenue'))
         total_cost = self._sum_numeric_or_none(df.get('Cost'))
         total_profit = (total_revenue - total_cost) if (total_revenue is not None and total_cost is not None) else None
+        inventory_map = {}
+        cost_month_keys = self._filter_month_keys(self.data.get('cost', {}).keys(), target_year, target_month, year_scope)
+        if cost_month_keys:
+            last_cost_key = cost_month_keys[-1]
+            inventory_map = self._build_cost_inventory_map(self.data['cost'].get(last_cost_key), last_cost_key)
+
+        def product_risk_label(qty, revenue, profit, margin, inv_qty, inv_amt):
+            if profit is not None and profit < 0:
+                return "负毛利"
+            if inv_qty not in (None, 0) and (qty is None or qty == 0):
+                return "有库存无销量"
+            inventory_revenue_ratio = inv_amt / revenue if (inv_amt is not None and revenue not in (None, 0)) else None
+            if inventory_revenue_ratio is not None and inventory_revenue_ratio >= 1 and (margin is None or margin < 0.1):
+                return "高库存低毛利"
+            if inventory_revenue_ratio is not None and inventory_revenue_ratio >= 2:
+                return "高库存"
+            if margin is not None and margin < 0.05:
+                return "低毛利"
+            return "正常"
+
         rows = []
         for code, group in df.groupby('品目编码'):
             metrics = self._calc_sales_metrics_from_group(group)
@@ -6200,8 +7411,14 @@ class ReportGenerator:
                 category = group.get('品目组合1名').dropna().iloc[0]
             avg_price = revenue / qty if (revenue is not None and qty not in (None, 0)) else None
             avg_cost = cost / qty if (cost is not None and qty not in (None, 0)) else None
+            code_text = str(code).strip()
+            inv_snapshot = inventory_map.get(code_text, {})
+            inv_qty = inv_snapshot.get('qty_end')
+            inv_amt = inv_snapshot.get('amt_end')
+            inventory_revenue_ratio = inv_amt / revenue if (inv_amt is not None and revenue not in (None, 0)) else None
+            risk_label = product_risk_label(qty, revenue, profit, margin, inv_qty, inv_amt)
             rows.append([
-                str(code).strip(),
+                code_text,
                 name,
                 category,
                 qty,
@@ -6213,11 +7430,16 @@ class ReportGenerator:
                 (profit / total_profit) if (profit is not None and total_profit not in (None, 0)) else None,
                 avg_price,
                 avg_cost,
+                inv_qty,
+                inv_amt,
+                inventory_revenue_ratio,
+                risk_label,
             ])
 
         headers = [
             "品目编码", "产品名称", "品类", "销量", "销售收入", "销售成本", "毛利润",
-            "毛利率", "收入占比", "利润占比", "平均售价", "平均成本"
+            "毛利率", "收入占比", "利润占比", "平均售价", "平均成本",
+            "期末库存数量", "期末库存金额", "库存收入比", "风险标签"
         ]
         rows = sorted(rows, key=lambda x: x[6] if x[6] is not None else 0, reverse=True)
         self._write_table(ws, 1, 1, headers, rows)
@@ -6228,25 +7450,78 @@ class ReportGenerator:
             chart_rows = [[r[1] or r[0], r[6]] for r in top_rows]
             self._write_table(ws, 1, start_col, ["产品", "毛利润"], chart_rows)
             anchor = f"{get_column_letter(start_col + 3)}2"
-        added = self._add_bar_chart_from_table(ws, 1, start_col, 1 + len(chart_rows), "产品毛利润Top", anchor)
-        
-        # Add Product Portfolio Matrix (Scatter)
-        # Revenue is Col 5, Margin % is Col 8
-        anchor_scatter = f"{get_column_letter(start_col + 3)}18"
-        self._add_scatter_chart(
-            ws, 
-            5, # X: Revenue
-            8, # Y: Margin %
-            1, 
-            2, 
-            1 + len(rows), 
-            "产品波士顿矩阵 (收入 vs 毛利率)",
-            anchor_scatter,
-            x_title="销售收入",
-            y_title="毛利率"
-        )
+            self._add_bar_chart_from_table(ws, 1, start_col, 1 + len(chart_rows), "产品毛利润Top", anchor)
 
-        self._write_chart_note(ws, start_col + 3, 1, "图表说明：产品毛利润Top分布及产品矩阵分析。")
+            low_margin_rows = []
+            for r in sorted(rows, key=lambda x: x[6] if x[6] is not None else 0):
+                if r[6] is None:
+                    continue
+                if r[6] < 0 or (r[7] is not None and r[7] < 0.05):
+                    low_margin_rows.append([r[1] or r[0], r[6]])
+                if len(low_margin_rows) >= 10:
+                    break
+            if low_margin_rows:
+                low_start_col = start_col
+                low_start_row = 14
+                self._write_table(ws, low_start_row, low_start_col, ["低毛利/负毛利产品", "毛利润"], low_margin_rows)
+                self._add_bar_chart_from_table(
+                    ws,
+                    low_start_row,
+                    low_start_col,
+                    low_start_row + len(low_margin_rows),
+                    "低毛利/负毛利产品Top",
+                    f"{get_column_letter(low_start_col + 3)}{low_start_row}",
+                )
+
+            inventory_risk_rows = []
+            for r in sorted(rows, key=lambda x: abs(x[13] or 0), reverse=True):
+                if r[15] == "正常" or r[13] is None:
+                    continue
+                inventory_risk_rows.append([r[1] or r[0], r[13]])
+                if len(inventory_risk_rows) >= 10:
+                    break
+            if inventory_risk_rows:
+                risk_start_col = start_col
+                risk_start_row = 27
+                self._write_table(ws, risk_start_row, risk_start_col, ["库存风险产品", "期末库存金额"], inventory_risk_rows)
+                self._add_bar_chart_from_table(
+                    ws,
+                    risk_start_row,
+                    risk_start_col,
+                    risk_start_row + len(inventory_risk_rows),
+                    "高库存风险产品Top",
+                    f"{get_column_letter(risk_start_col + 3)}{risk_start_row}",
+                )
+
+            # Add Product Portfolio Matrix (Scatter)
+            anchor_scatter = f"{get_column_letter(start_col + 8)}2"
+            self._add_scatter_chart(
+                ws,
+                5, # X: Revenue
+                8, # Y: Margin %
+                1,
+                2,
+                1 + len(rows),
+                "产品矩阵：收入 vs 毛利率",
+                anchor_scatter,
+                x_title="销售收入",
+                y_title="毛利率"
+            )
+            if inventory_map:
+                self._add_scatter_chart(
+                    ws,
+                    14, # X: Ending inventory amount
+                    8,  # Y: Margin %
+                    1,
+                    2,
+                    1 + len(rows),
+                    "产品矩阵：库存金额 vs 毛利率",
+                    f"{get_column_letter(start_col + 8)}20",
+                    x_title="期末库存金额",
+                    y_title="毛利率",
+                )
+
+            self._write_chart_note(ws, start_col + 3, 1, "图表说明：产品毛利、低毛利、库存风险和产品矩阵联动分析。")
 
     def _update_category_contribution_sheet(self, wb, target_year, target_month, year_scope=None):
         merged_into_month_sheet = "按品类汇总(按月)" in wb.sheetnames
@@ -6324,11 +7599,35 @@ class ReportGenerator:
             table_row = 4
             self._write_table(ws, table_row, merge_start_col, headers, rows)
             top_rows = rows[:10]
+            helper_rows_used = len(top_rows) if top_rows else 0
             if top_rows:
                 start_col = merge_start_col + len(headers) + 2
                 chart_rows = [[r[0], r[4]] for r in top_rows]
                 self._write_table(ws, table_row, start_col, ["品类", "毛利润"], chart_rows)
-            note_row = table_row + max(len(rows), len(top_rows) if top_rows else 0) + 2
+                self._add_bar_chart_from_table(
+                    ws,
+                    table_row,
+                    start_col,
+                    table_row + len(chart_rows),
+                    "品类毛利润Top",
+                    f"{get_column_letter(start_col + 3)}{table_row}",
+                )
+                share_rows = [[r[0], r[6]] for r in top_rows if r[6] is not None]
+                if share_rows:
+                    share_row = table_row + len(chart_rows) + 3
+                    self._write_table(ws, share_row, start_col, ["品类", "收入占比"], share_rows)
+                    self._add_doughnut_chart(
+                        ws,
+                        start_col,
+                        start_col + 1,
+                        share_row,
+                        share_row + 1,
+                        share_row + len(share_rows),
+                        "品类收入占比",
+                        f"{get_column_letter(start_col + 3)}{share_row}",
+                    )
+                    helper_rows_used = max(helper_rows_used, len(chart_rows) + len(share_rows) + 3)
+            note_row = table_row + max(len(rows), helper_rows_used) + 2
             self._write_chart_note(ws, merge_start_col, note_row, "说明：本区与左侧“按品类汇总(按月)”共享同一销售数据源。")
         else:
             self._write_table(ws, 1, 1, headers, rows)
@@ -6339,6 +7638,20 @@ class ReportGenerator:
                 self._write_table(ws, 1, start_col, ["品类", "毛利润"], chart_rows)
                 anchor = f"{get_column_letter(start_col + 3)}2"
                 self._add_bar_chart_from_table(ws, 1, start_col, 1 + len(chart_rows), "品类毛利润Top", anchor)
+                share_rows = [[r[0], r[6]] for r in top_rows if r[6] is not None]
+                if share_rows:
+                    share_row = len(chart_rows) + 4
+                    self._write_table(ws, share_row, start_col, ["品类", "收入占比"], share_rows)
+                    self._add_doughnut_chart(
+                        ws,
+                        start_col,
+                        start_col + 1,
+                        share_row,
+                        share_row + 1,
+                        share_row + len(share_rows),
+                        "品类收入占比",
+                        f"{get_column_letter(start_col + 3)}{share_row}",
+                    )
                 self._write_chart_note(ws, start_col + 3, 1, "图表说明：品类毛利润Top分布。")
 
     def _get_ar_balance_by_customer(self, target_year, target_month):
@@ -6628,6 +7941,11 @@ class ReportGenerator:
 
         sales_df["Qty"] = pd.to_numeric(sales_df.get("数量"), errors="coerce")
         sales_df = sales_df[sales_df["Qty"].notna()].copy()
+        sales_df["品目编码"] = sales_df["品目编码"].astype(str).str.strip()
+        sales_df = sales_df[
+            (sales_df["品目编码"] != "")
+            & (sales_df["品目编码"].str.lower() != "nan")
+        ].copy()
         sales_df = self._filter_df_by_scope(sales_df, target_year, target_month, year_scope)
         if sales_df.empty:
             return params, "自动分析当前口径下无销售数据，沿用默认补货参数"
@@ -6697,6 +8015,193 @@ class ReportGenerator:
         if not notes:
             notes.append("自动分析未取得有效库存覆盖样本，沿用默认补货参数")
         return params, "；".join(notes)
+
+    def _cost_quantity_history_by_code(self, target_year, target_month, year_scope=None, sales_qty_by_month=None):
+        """按品目编码整理成本表中的期初、入库/增加、减少、期末数量历史。"""
+        history = {}
+        month_keys = self._filter_month_keys(
+            self.data.get("cost", {}).keys(),
+            target_year,
+            target_month,
+            year_scope,
+        )
+        for m_key in month_keys:
+            cost_df = self.data.get("cost", {}).get(m_key)
+            if cost_df is None or cost_df.empty:
+                continue
+            code_col = self._find_cost_col_contains(cost_df, "品目编码")
+            q_start_col = self._find_cost_col_suffix(cost_df, "期初")
+            q_in_col = (
+                self._find_cost_col_suffix(cost_df, "增加")
+                or self._find_cost_col_suffix(cost_df, "入库")
+                or self._find_cost_col_contains(cost_df, "入库")
+            )
+            q_out_col = self._find_cost_col_suffix(cost_df, "减少")
+            q_end_col = self._find_cost_col_suffix(cost_df, "期末")
+            if not code_col:
+                continue
+
+            for _, row in cost_df.iterrows():
+                raw_code = row.get(code_col)
+                if raw_code is None or pd.isna(raw_code):
+                    continue
+                code = str(raw_code).strip()
+                if (
+                    not code
+                    or code == "品目编码"
+                    or code.lower() == "nan"
+                    or self._is_summary_or_footer_label(code)
+                ):
+                    continue
+
+                qty_start = self._to_float(row.get(q_start_col)) if q_start_col else None
+                qty_in = self._to_float(row.get(q_in_col)) if q_in_col else None
+                qty_out = self._to_float(row.get(q_out_col)) if q_out_col else None
+                qty_end = self._to_float(row.get(q_end_col)) if q_end_col else None
+                effective_in = qty_in
+                if effective_in is None and qty_start is not None and qty_end is not None:
+                    sold_qty = (sales_qty_by_month or {}).get((code, m_key))
+                    if sold_qty is not None:
+                        effective_in = max(0, qty_end - qty_start + sold_qty)
+
+                history.setdefault(code, []).append({
+                    "month": m_key,
+                    "qty_start": qty_start,
+                    "qty_in": qty_in,
+                    "qty_in_effective": effective_in,
+                    "qty_out": qty_out,
+                    "qty_end": qty_end,
+                })
+
+        for code in history:
+            history[code] = sorted(history[code], key=lambda item: item.get("month") or "")
+        return history
+
+    def _month_gap_days(self, month_keys):
+        periods = []
+        for m_key in sorted(set(str(m) for m in month_keys if m)):
+            try:
+                periods.append(pd.Period(m_key, freq="M"))
+            except Exception:
+                continue
+        gaps = []
+        for idx in range(1, len(periods)):
+            gaps.append((periods[idx].start_time - periods[idx - 1].start_time).days)
+        return gaps
+
+    def _infer_replenishment_params_by_product(
+        self,
+        sales_df,
+        target_year,
+        target_month,
+        year_scope=None,
+        fallback=None,
+    ):
+        """为每个品目单独推导采购/生产周期和安全库存天数。"""
+        fallback = fallback or {}
+        base_lead = self._clamp_int_param(fallback.get("lead_days"), 30, 1, 365)
+        base_safety = self._clamp_int_param(fallback.get("safety_days"), 20, 0, 180)
+        window_months = self._clamp_int_param(fallback.get("window_months"), 3, 1, 12)
+        if sales_df is None or sales_df.empty or "品目编码" not in sales_df.columns:
+            return {}
+
+        work = sales_df.copy()
+        if "Qty" not in work.columns:
+            work["Qty"] = pd.to_numeric(work.get("数量"), errors="coerce")
+        work["品目编码"] = work["品目编码"].astype(str).str.strip()
+        work = work[
+            work["Qty"].notna()
+            & (work["品目编码"] != "")
+            & (work["品目编码"].str.lower() != "nan")
+        ].copy()
+        if work.empty or "MonthStr" not in work.columns:
+            return {}
+
+        all_months = sorted(work["MonthStr"].dropna().astype(str).unique())
+        if target_year and target_month:
+            recent_months = [
+                m for m in self._last_n_month_keys(target_year, target_month, window_months)
+                if m in all_months
+            ]
+        else:
+            recent_months = all_months[-window_months:]
+        if not recent_months:
+            recent_months = all_months[-window_months:]
+
+        sales_qty_by_month = (
+            work.groupby(["品目编码", "MonthStr"])["Qty"]
+            .sum()
+            .to_dict()
+        )
+        cost_history = self._cost_quantity_history_by_code(
+            target_year,
+            target_month,
+            year_scope,
+            sales_qty_by_month=sales_qty_by_month,
+        )
+        codes = sorted(set(work["品目编码"].unique()) | set(cost_history.keys()))
+        result = {}
+
+        for code in codes:
+            monthly_qty = [self._to_float(sales_qty_by_month.get((code, m), 0)) or 0 for m in recent_months]
+            mean_qty = (sum(monthly_qty) / len(monthly_qty)) if monthly_qty else None
+            sales_cv = None
+            if mean_qty and mean_qty > 0 and len(monthly_qty) > 1:
+                sales_cv = float(pd.Series(monthly_qty, dtype="float64").std(ddof=0) / mean_qty)
+
+            lead_days = base_lead
+            safety_days = base_safety
+            history_rows = cost_history.get(code, [])
+            receipt_months = [
+                row.get("month") for row in history_rows
+                if (row.get("qty_in_effective") is not None and row.get("qty_in_effective") > 0)
+            ]
+            receipt_gaps = self._month_gap_days(receipt_months)
+
+            if receipt_gaps:
+                lead_days = self._clamp_int_param(
+                    self._percentile_or_none(receipt_gaps, 0.5),
+                    base_lead,
+                    15,
+                    120,
+                )
+            elif recent_months and mean_qty and mean_qty > 0 and history_rows:
+                latest_inventory = None
+                for row in reversed(history_rows):
+                    if row.get("qty_end") is not None:
+                        latest_inventory = row.get("qty_end")
+                        break
+                if latest_inventory is not None:
+                    total_days = sum(self._month_days(m) for m in recent_months) or 30 * len(recent_months)
+                    total_qty = sum(monthly_qty)
+                    avg_daily = total_qty / total_days if total_days else None
+                    coverage_days = latest_inventory / avg_daily if avg_daily else None
+                    if coverage_days is not None:
+                        lead_days = self._clamp_int_param(coverage_days * 0.2, base_lead, 15, 90)
+
+            if sales_cv is not None:
+                safety_days = self._clamp_int_param(10 + sales_cv * 20, base_safety, 7, 60)
+
+            if len(receipt_gaps) > 1:
+                mean_gap = sum(receipt_gaps) / len(receipt_gaps)
+                if mean_gap:
+                    receipt_cv = float(pd.Series(receipt_gaps, dtype="float64").std(ddof=0) / mean_gap)
+                    if receipt_cv >= 0.1:
+                        safety_days = self._clamp_int_param(
+                            safety_days + min(15, receipt_cv * 10),
+                            safety_days,
+                            7,
+                            75,
+                        )
+            elif history_rows and not receipt_months and mean_qty and mean_qty > 0:
+                safety_days = self._clamp_int_param(safety_days + 5, safety_days, 7, 75)
+
+            result[code] = {
+                "lead_days": lead_days,
+                "safety_days": safety_days,
+            }
+
+        return result
 
     def _cashflow_indicator_history(self, metrics_by_month, target_year, target_month, year_scope=None):
         month_keys = self._filter_month_keys(metrics_by_month.keys(), target_year, target_month, year_scope)
@@ -6955,6 +8460,7 @@ class ReportGenerator:
         safety_days=20,
         window_months=3,
         param_source_note=None,
+        use_product_params=False,
     ):
         ws = self._prepare_sheet(wb, "补货预警", insert_after="存货健康度")
         if not target_year or not target_month:
@@ -7011,6 +8517,11 @@ class ReportGenerator:
 
         sales_df['Qty'] = pd.to_numeric(sales_df.get('数量'), errors='coerce')
         sales_df = sales_df[sales_df['Qty'].notna()]
+        sales_df['品目编码'] = sales_df['品目编码'].astype(str).str.strip()
+        sales_df = sales_df[
+            (sales_df['品目编码'] != '')
+            & (sales_df['品目编码'].str.lower() != 'nan')
+        ].copy()
         sales_df = self._filter_df_by_scope(sales_df, target_year, target_month, year_scope)
         if sales_df.empty:
             self._write_table(ws, 1, 1, ["提示"], [["当前口径下无销售数据"]])
@@ -7024,6 +8535,20 @@ class ReportGenerator:
         if not window_keys:
             self._write_table(ws, 1, 1, ["提示"], [["无有效月份数据"]])
             return
+
+        product_params = {}
+        if use_product_params:
+            product_params = self._infer_replenishment_params_by_product(
+                sales_df,
+                target_year,
+                target_month,
+                year_scope,
+                fallback={
+                    "lead_days": lead_days,
+                    "safety_days": safety_days,
+                    "window_months": window_months,
+                },
+            )
 
         total_days = sum(self._month_days(m) for m in window_keys)
         if total_days <= 0:
@@ -7071,7 +8596,7 @@ class ReportGenerator:
             "品目名称",
             "类别",
             "期末库存数量",
-            "近3月日均销量",
+            f"近{len(window_keys)}个月日均销量",
             "库存覆盖天数",
             "采购/生产周期(天)",
             "安全库存天数",
@@ -7079,7 +8604,6 @@ class ReportGenerator:
             "风险等级",
         ]
         rows = []
-        need_days = lead_days + safety_days
 
         for _, row in cost_df.iterrows():
             code = row.get(code_col)
@@ -7105,11 +8629,15 @@ class ReportGenerator:
             if coverage_days is None:
                 continue
 
+            row_params = product_params.get(code, {}) if product_params else {}
+            row_lead_days = row_params.get("lead_days", lead_days)
+            row_safety_days = row_params.get("safety_days", safety_days)
+            need_days = row_lead_days + row_safety_days
             if coverage_days >= need_days:
                 continue
 
             reorder_qty = max(0, avg_daily * need_days - inv_qty)
-            risk = "高" if coverage_days < safety_days else "中"
+            risk = "高" if coverage_days < row_safety_days else "中"
             name_spec = row.get(name_col) if name_col else None
             resolved_name = name_map.get(code) or name_spec
             category_hint = row.get(cost_category_col) if cost_category_col else None
@@ -7124,8 +8652,8 @@ class ReportGenerator:
                 inv_qty,
                 avg_daily,
                 coverage_days,
-                lead_days,
-                safety_days,
+                row_lead_days,
+                row_safety_days,
                 reorder_qty,
                 risk,
             ])
@@ -7140,7 +8668,13 @@ class ReportGenerator:
             ws,
             1,
             len(rows) + 3,
-            f"说明：覆盖天数 < 采购周期({lead_days})+安全库存({safety_days}) 列为需补货。"
+            (
+                f"说明：覆盖天数 < 每个品目的采购/生产周期+安全库存天数列为需补货。"
+                f" 自动模式下按品目历史销售、库存覆盖和入库节奏单独计算，"
+                f"缺少历史时使用全局兜底({lead_days}+{safety_days}天)。"
+                if use_product_params else
+                f"说明：覆盖天数 < 采购周期({lead_days})+安全库存({safety_days}) 列为需补货。"
+            )
             + (f" {param_source_note}" if param_source_note else ""),
         )
 
@@ -7243,20 +8777,45 @@ class ReportGenerator:
 
     def _update_expense_structure_sheet(self, wb, metrics_by_month, target_year, target_month, year_scope=None):
         ws = self._prepare_sheet(wb, "费用结构与弹性", insert_after="费用明细环比分析")
-        var_by_month, fixed_by_month = self._calculate_expense_keyword_totals(target_year, target_month, year_scope)
-        month_keys = set(var_by_month.keys()) | set(fixed_by_month.keys()) | set(metrics_by_month.keys())
+        behavior_totals = self._calculate_expense_behavior_totals(target_year, target_month, year_scope)
+        var_by_month = behavior_totals.get("variable", {})
+        fixed_by_month = behavior_totals.get("fixed", {})
+        finance_by_month = behavior_totals.get("financial_adjustment", {})
+        inventory_by_month = behavior_totals.get("inventory_adjustment", {})
+        other_by_month = behavior_totals.get("unclassified", {})
+        total_by_month = behavior_totals.get("total", {})
+        month_keys = (
+            set(total_by_month.keys())
+            | set(var_by_month.keys())
+            | set(fixed_by_month.keys())
+            | set(finance_by_month.keys())
+            | set(inventory_by_month.keys())
+            | set(other_by_month.keys())
+            | set(metrics_by_month.keys())
+        )
         month_keys = self._filter_month_keys(month_keys, target_year, target_month, year_scope)
-        headers = ["月份", "变动费用", "固定费用", "费用合计", "变动占比", "固定占比", "收入", "费用率", "费用弹性"]
+        headers = [
+            "月份", "变动费用", "固定费用", "财务/汇兑调整", "库存/盘点调整", "未分类费用",
+            "费用合计", "分类差异", "变动占比", "固定占比", "库存调整占比", "收入", "费用率", "费用弹性"
+        ]
         rows = []
         prev_total = None
         prev_revenue = None
         for m_key in month_keys:
             var_cost = var_by_month.get(m_key) or 0
             fixed_cost = fixed_by_month.get(m_key) or 0
-            total = var_cost + fixed_cost
+            finance_cost = finance_by_month.get(m_key) or 0
+            inventory_cost = inventory_by_month.get(m_key) or 0
+            other_cost = other_by_month.get(m_key) or 0
+            classified_total = var_cost + fixed_cost + finance_cost + inventory_cost + other_cost
+            total = total_by_month.get(m_key)
+            if total is None:
+                total = classified_total
+            classify_gap = total - classified_total if total is not None else None
             revenue = metrics_by_month.get(m_key, {}).get("revenue") if metrics_by_month.get(m_key) else None
             var_ratio = var_cost / total if total else None
             fixed_ratio = fixed_cost / total if total else None
+            inventory_ratio = inventory_cost / total if total else None
             expense_rate = total / revenue if revenue else None
             elasticity = None
             if prev_total and prev_revenue and revenue:
@@ -7268,9 +8827,14 @@ class ReportGenerator:
                 self._month_key_to_label(m_key),
                 var_cost,
                 fixed_cost,
+                finance_cost,
+                inventory_cost,
+                other_cost,
                 total,
+                classify_gap,
                 var_ratio,
                 fixed_ratio,
+                inventory_ratio,
                 revenue,
                 expense_rate,
                 elasticity,
@@ -7284,13 +8848,13 @@ class ReportGenerator:
         
         # 1. Trend Line Chart (Total Expense & Revenue)
         anchor1 = f"{get_column_letter(len(headers) + 2)}2"
-        self._add_line_chart_by_columns(ws, 1, [4, 7], 1, 2, 1 + len(rows), "费用总额与收入趋势", anchor1)
+        self._add_line_chart_by_columns(ws, 1, [7, 12], 1, 2, 1 + len(rows), "费用总额与收入趋势", anchor1)
         
         # 2. Stacked Bar Chart (Structure %)
         anchor2 = f"{get_column_letter(len(headers) + 2)}18"
-        self._add_stacked_bar_chart(ws, 1, [5, 6], 1, 2, 1 + len(rows), "费用结构占比趋势", anchor2, percent=True)
+        self._add_stacked_bar_chart(ws, 1, [2, 3, 4, 5, 6], 1, 2, 1 + len(rows), "费用结构占比趋势", anchor2, percent=True)
         
-        self._write_chart_note(ws, len(headers) + 2, 1, "图表说明：费用总额趋势及变动/固定费用结构占比。")
+        self._write_chart_note(ws, len(headers) + 2, 1, "图表说明：费用总额趋势及变动/固定/财务/库存调整/未分类结构占比。")
 
         self._reorder_month_rows_desc(ws)
 
@@ -7377,6 +8941,221 @@ class ReportGenerator:
 
         self._reorder_month_rows_desc(ws)
 
+    def _add_expense_diagnostic_charts(
+        self,
+        ws,
+        rows_a,
+        top_rows,
+        dept_rows,
+        finance_rows,
+        matrix_rows=None,
+        subject_compare_rows=None,
+    ):
+        chart_col = max(ws.max_column + 2, 15)
+        anchor_col = chart_col + 6
+
+        def has_label(label):
+            return label not in (None, "", "-")
+
+        trend_rows = []
+        for row in rows_a or []:
+            if len(row) < 13 or not has_label(row[0]):
+                continue
+            total = self._to_float(row[6])
+            revenue = self._to_float(row[11])
+            rate = self._to_float(row[12])
+            if total is None and revenue is None and rate is None:
+                continue
+            trend_rows.append([row[0], total, revenue, rate])
+        if trend_rows:
+            start_row = 1
+            self._write_table(ws, start_row, chart_col, ["月份", "费用合计", "收入", "费用率"], trend_rows)
+            self._add_combo_chart(
+                ws,
+                chart_col,
+                [chart_col + 1, chart_col + 2],
+                [chart_col + 3],
+                start_row,
+                start_row + 1,
+                start_row + len(trend_rows),
+                "费用合计、收入与费用率趋势",
+                f"{get_column_letter(anchor_col)}{start_row}",
+            )
+
+        structure_rows = []
+        for row in rows_a or []:
+            if len(row) < 6 or not has_label(row[0]):
+                continue
+            values = [self._to_float(row[i]) for i in range(1, 6)]
+            if not any(v is not None and v != 0 for v in values):
+                continue
+            structure_rows.append([row[0]] + values)
+        if structure_rows:
+            start_row = 18
+            self._write_table(
+                ws,
+                start_row,
+                chart_col,
+                ["月份", "变动费用", "固定费用", "财务/汇兑调整", "库存/盘点调整", "未分类费用"],
+                structure_rows,
+            )
+            self._add_stacked_bar_chart(
+                ws,
+                chart_col,
+                [chart_col + 1, chart_col + 2, chart_col + 3, chart_col + 4, chart_col + 5],
+                start_row,
+                start_row + 1,
+                start_row + len(structure_rows),
+                "费用结构占比趋势",
+                f"{get_column_letter(anchor_col)}{start_row}",
+                percent=True,
+            )
+
+        anomaly_rows = []
+        for row in top_rows or []:
+            if len(row) < 10 or not has_label(row[1]):
+                continue
+            score = self._to_float(row[9])
+            if score is None:
+                delta = self._to_float(row[5])
+                amount = self._to_float(row[3])
+                score = abs(delta if delta is not None else (amount or 0))
+            label = f"{row[1]}-{row[2]}" if row[2] else row[1]
+            anomaly_rows.append([self._short_chart_label(label), score])
+            if len(anomaly_rows) >= 12:
+                break
+        if not anomaly_rows:
+            for row in matrix_rows or []:
+                if len(row) < 7 or not has_label(row[0]):
+                    continue
+                score = self._to_float(row[6])
+                if score is None:
+                    delta = self._to_float(row[4])
+                    amount = self._to_float(row[2])
+                    score = abs(delta if delta is not None else (amount or 0))
+                if score is None:
+                    continue
+                label = f"{row[0]}-{row[1]}" if row[1] else row[0]
+                anomaly_rows.append([self._short_chart_label(label), score])
+                if len(anomaly_rows) >= 12:
+                    break
+        if anomaly_rows:
+            start_row = 35
+            self._write_table(ws, start_row, chart_col, ["异常项目", "异常评分"], anomaly_rows)
+            self._add_bar_chart_from_table(
+                ws,
+                start_row,
+                chart_col,
+                start_row + len(anomaly_rows),
+                "费用异常评分Top",
+                f"{get_column_letter(anchor_col)}{start_row}",
+            )
+
+        def build_subject_change_rows(delta_idx, rate_idx):
+            rows = []
+            source_rows = subject_compare_rows or []
+            for row in source_rows:
+                if len(row) <= max(delta_idx, rate_idx) or not has_label(row[0]):
+                    continue
+                delta = self._to_float(row[delta_idx])
+                rate = self._to_float(row[rate_idx])
+                if delta is None and rate is None:
+                    continue
+                label = f"{row[0]}-{row[1]}" if row[1] else row[0]
+                rows.append([self._short_chart_label(label, 22), delta, rate])
+            rows.sort(key=lambda x: abs(x[1] or 0), reverse=True)
+            return rows[:12]
+
+        mom_change_rows = build_subject_change_rows(4, 5)
+        if mom_change_rows:
+            start_row = 52
+            self._write_table(ws, start_row, chart_col, ["费用科目", "环比增量", "环比增速"], mom_change_rows)
+            for rr in range(start_row + 1, start_row + 1 + len(mom_change_rows)):
+                ws.cell(row=rr, column=chart_col + 2).number_format = "0.00%"
+            self._add_combo_chart(
+                ws,
+                chart_col,
+                [chart_col + 1],
+                [chart_col + 2],
+                start_row,
+                start_row + 1,
+                start_row + len(mom_change_rows),
+                "费用科目环比变动Top",
+                f"{get_column_letter(anchor_col)}{start_row}",
+            )
+
+        yoy_change_rows = build_subject_change_rows(7, 8)
+        if yoy_change_rows:
+            start_row = 69
+            self._write_table(ws, start_row, chart_col, ["费用科目", "同比增量", "同比增速"], yoy_change_rows)
+            for rr in range(start_row + 1, start_row + 1 + len(yoy_change_rows)):
+                ws.cell(row=rr, column=chart_col + 2).number_format = "0.00%"
+            self._add_combo_chart(
+                ws,
+                chart_col,
+                [chart_col + 1],
+                [chart_col + 2],
+                start_row,
+                start_row + 1,
+                start_row + len(yoy_change_rows),
+                "费用科目同比变动Top",
+                f"{get_column_letter(anchor_col)}{start_row}",
+            )
+
+        dept_chart_rows = []
+        for row in dept_rows or []:
+            if len(row) < 5 or not has_label(row[0]):
+                continue
+            values = [self._to_float(row[i]) for i in range(1, 5)]
+            if not any(v is not None and v != 0 for v in values):
+                continue
+            dept_chart_rows.append([self._short_chart_label(row[0], 18)] + values)
+            if len(dept_chart_rows) >= 10:
+                break
+        if dept_chart_rows:
+            start_row = 86
+            self._write_table(
+                ws,
+                start_row,
+                chart_col,
+                ["部门", "销售费用", "管理费用", "财务费用", "其他费用"],
+                dept_chart_rows,
+            )
+            self._add_stacked_bar_chart(
+                ws,
+                chart_col,
+                [chart_col + 1, chart_col + 2, chart_col + 3, chart_col + 4],
+                start_row,
+                start_row + 1,
+                start_row + len(dept_chart_rows),
+                "目标月部门费用构成",
+                f"{get_column_letter(anchor_col)}{start_row}",
+            )
+
+        finance_chart_rows = []
+        for row in finance_rows or []:
+            if len(row) < 4 or not has_label(row[0]):
+                continue
+            net_amount = self._to_float(row[3])
+            if net_amount is None:
+                continue
+            finance_chart_rows.append([self._short_chart_label(row[0], 18), net_amount])
+            if len(finance_chart_rows) >= 10:
+                break
+        if finance_chart_rows:
+            start_row = 103
+            self._write_table(ws, start_row, chart_col, ["财务费用子科目", "净额"], finance_chart_rows)
+            self._add_bar_chart_from_table(
+                ws,
+                start_row,
+                chart_col,
+                start_row + len(finance_chart_rows),
+                "财务费用净额拆解",
+                f"{get_column_letter(anchor_col)}{start_row}",
+            )
+
+        self._write_chart_note(ws, chart_col, 118, "图表说明：右侧集中展示费用趋势、结构、异常、科目环比/同比、部门贡献与财务费用拆解。")
+
     def _update_expense_diagnostic_center(
         self,
         wb,
@@ -7424,20 +9203,45 @@ class ReportGenerator:
         ws.cell(row=row_cursor, column=1).font = Font(name="微软雅黑", bold=True, color="1F4E79")
         row_cursor += 1
 
-        var_by_month, fixed_by_month = self._calculate_expense_keyword_totals(target_year, target_month, year_scope)
-        month_keys = set(var_by_month.keys()) | set(fixed_by_month.keys()) | set(metrics_by_month.keys())
+        behavior_totals = self._calculate_expense_behavior_totals(target_year, target_month, year_scope)
+        var_by_month = behavior_totals.get("variable", {})
+        fixed_by_month = behavior_totals.get("fixed", {})
+        finance_by_month = behavior_totals.get("financial_adjustment", {})
+        inventory_by_month = behavior_totals.get("inventory_adjustment", {})
+        other_by_month = behavior_totals.get("unclassified", {})
+        total_by_month = behavior_totals.get("total", {})
+        month_keys = (
+            set(total_by_month.keys())
+            | set(var_by_month.keys())
+            | set(fixed_by_month.keys())
+            | set(finance_by_month.keys())
+            | set(inventory_by_month.keys())
+            | set(other_by_month.keys())
+            | set(metrics_by_month.keys())
+        )
         month_keys = self._filter_month_keys(month_keys, target_year, target_month, year_scope)
-        headers_a = ["月份", "变动费用", "固定费用", "费用合计", "变动占比", "固定占比", "收入", "费用率", "费用弹性"]
+        headers_a = [
+            "月份", "变动费用", "固定费用", "财务/汇兑调整", "库存/盘点调整", "未分类费用",
+            "费用合计", "分类差异", "变动占比", "固定占比", "库存调整占比", "收入", "费用率", "费用弹性"
+        ]
         rows_a = []
         prev_total = None
         prev_revenue = None
         for m_key in month_keys:
             var_cost = var_by_month.get(m_key) or 0
             fixed_cost = fixed_by_month.get(m_key) or 0
-            total = var_cost + fixed_cost
+            finance_cost = finance_by_month.get(m_key) or 0
+            inventory_cost = inventory_by_month.get(m_key) or 0
+            other_cost = other_by_month.get(m_key) or 0
+            classified_total = var_cost + fixed_cost + finance_cost + inventory_cost + other_cost
+            total = total_by_month.get(m_key)
+            if total is None:
+                total = classified_total
+            classify_gap = total - classified_total if total is not None else None
             revenue = metrics_by_month.get(m_key, {}).get("revenue") if metrics_by_month.get(m_key) else None
             var_ratio = var_cost / total if total else None
             fixed_ratio = fixed_cost / total if total else None
+            inventory_ratio = inventory_cost / total if total else None
             expense_rate = total / revenue if revenue else None
             elasticity = None
             if prev_total and prev_revenue and revenue:
@@ -7449,9 +9253,14 @@ class ReportGenerator:
                 self._month_key_to_label(m_key),
                 var_cost,
                 fixed_cost,
+                finance_cost,
+                inventory_cost,
+                other_cost,
                 total,
+                classify_gap,
                 var_ratio,
                 fixed_ratio,
+                inventory_ratio,
                 revenue,
                 expense_rate,
                 elasticity,
@@ -7474,6 +9283,14 @@ class ReportGenerator:
             .sum()
             .reset_index()
         )
+        comparison_df = self._prepare_expense_analysis_df(raw_df, target_year, target_month, "all")
+        if comparison_df is None or comparison_df.empty:
+            comparison_df = df
+        comparison_summary = (
+            comparison_df.groupby(['Category', 'Subcategory', 'MonthStr'])['Amount']
+            .sum()
+            .reset_index()
+        )
         detail_count_map = (
             df.groupby(['MonthStr', 'Category', 'Subcategory'])['Amount']
             .size()
@@ -7490,13 +9307,48 @@ class ReportGenerator:
             ),
             reverse=True,
         )
-        selected_by_pair = self._select_expense_display_flags(flags, target_year, target_month)
-
         target_key = f"{target_year}-{int(target_month):02d}" if target_year and target_month else None
         if not target_key:
             all_keys = sorted(df['MonthStr'].dropna().astype(str).unique().tolist()) if 'MonthStr' in df.columns else []
             target_key = all_keys[-1] if all_keys else None
         prev_key = month_shift(target_key, -1) if target_key else None
+        yoy_key = month_shift(target_key, -12) if target_key else None
+        selected_by_pair = self._select_expense_display_flags(
+            flags,
+            target_year,
+            target_month,
+            target_only=bool(target_key),
+        )
+        target_df = df[df['MonthStr'] == target_key].copy() if target_key else df.copy()
+
+        subject_compare_rows = []
+        for (cat, sub), g in comparison_summary.groupby(['Category', 'Subcategory']):
+            month_map = {row['MonthStr']: row['Amount'] for _, row in g.iterrows()}
+            curr = month_map.get(target_key) if target_key else None
+            if curr is None:
+                continue
+            prev = month_map.get(prev_key) if prev_key else None
+            yoy = month_map.get(yoy_key) if yoy_key else None
+            mom_delta, mom_rate = delta_rate(curr, prev)
+            yoy_delta, yoy_rate = delta_rate(curr, yoy)
+            if mom_delta is None and yoy_delta is None:
+                continue
+            subject_compare_rows.append([
+                cat,
+                sub,
+                curr,
+                prev,
+                mom_delta,
+                mom_rate,
+                yoy,
+                yoy_delta,
+                yoy_rate,
+            ])
+        subject_compare_rows = sorted(
+            subject_compare_rows,
+            key=lambda x: max(abs(x[4] or 0), abs(x[7] or 0), abs(x[2] or 0)),
+            reverse=True,
+        )
 
         matrix_headers = ["费用类别", "子科目", "本期金额", "上期金额", "环比增量", "环比增速", "异常评分", "异常标签", "明细笔数", "明细键"]
         matrix_rows = []
@@ -7540,12 +9392,13 @@ class ReportGenerator:
         matrix_key_col = 1 + matrix_headers.index("明细键")
         row_cursor += len(matrix_rows) + 2
 
-        # C) 异常Top（综合评分）
-        ws.cell(row=row_cursor, column=1).value = "C. 异常Top（综合评分）"
+        # C) 目标月异常Top（综合评分）
+        ws.cell(row=row_cursor, column=1).value = "C. 异常Top（目标月综合评分）"
         ws.cell(row=row_cursor, column=1).font = Font(name="微软雅黑", bold=True, color="1F4E79")
         row_cursor += 1
 
-        top_flags = flags[:anomaly_top_n]
+        target_flags = [f for f in flags if not target_key or f.get("MonthStr") == target_key]
+        top_flags = target_flags[:anomaly_top_n]
         top_headers = [
             "月份", "费用类别", "子科目", "本期金额", "上期金额",
             "环比增量", "环比增速", "同比增量", "同比增速",
@@ -7615,15 +9468,155 @@ class ReportGenerator:
         self._write_table(ws, detail_header_row, 1, detail_headers, detail_rows)
         row_cursor += len(detail_rows) + 2
 
-        # E) 经营指标预警（预算阈值）
-        ws.cell(row=row_cursor, column=1).value = "E. 经营指标预警（预算阈值）"
+        # E) 目标月部门费用贡献
+        ws.cell(row=row_cursor, column=1).value = "E. 目标月部门费用贡献"
         ws.cell(row=row_cursor, column=1).font = Font(name="微软雅黑", bold=True, color="1F4E79")
         row_cursor += 1
+        dept_headers = ["部门", "销售费用", "管理费用", "财务费用", "其他费用", "费用合计", "占本月费用比", "费用率", "最大费用类别"]
+        dept_rows = []
+        if target_df is not None and not target_df.empty:
+            dept_df = target_df.copy()
+            dept_df["Department"] = dept_df["Department"].fillna("未填部门").astype(str).replace({"": "未填部门", "nan": "未填部门"})
+            revenue_target = metrics_by_month.get(target_key, {}).get("revenue") if target_key and metrics_by_month.get(target_key) else None
+            month_total = dept_df["Amount"].sum()
+            for dept, group in dept_df.groupby("Department"):
+                cat_map = group.groupby("Category")["Amount"].sum().to_dict()
+                sales_amt = cat_map.get("销售费用") or 0
+                admin_amt = cat_map.get("管理费用") or 0
+                financial_amt = cat_map.get("财务费用") or 0
+                total_amt = group["Amount"].sum()
+                other_amt = total_amt - sales_amt - admin_amt - financial_amt
+                dominant = None
+                if cat_map:
+                    dominant = max(cat_map.items(), key=lambda kv: abs(kv[1] or 0))[0]
+                dept_rows.append([
+                    dept,
+                    sales_amt,
+                    admin_amt,
+                    financial_amt,
+                    other_amt,
+                    total_amt,
+                    total_amt / month_total if month_total else None,
+                    total_amt / revenue_target if revenue_target else None,
+                    dominant,
+                ])
+        dept_rows = sorted(dept_rows, key=lambda x: abs(x[5] or 0), reverse=True)
+        if not dept_rows:
+            dept_rows = [["-", None, None, None, None, None, None, None, None]]
+        self._write_table(ws, row_cursor, 1, dept_headers, dept_rows)
+        row_cursor += len(dept_rows) + 2
 
-        _, _, (ratio_threshold, pp_threshold, days_threshold) = self._read_budget_targets(wb)
+        # F) 财务费用拆解
+        ws.cell(row=row_cursor, column=1).value = "F. 财务费用拆解"
+        ws.cell(row=row_cursor, column=1).font = Font(name="微软雅黑", bold=True, color="1F4E79")
+        row_cursor += 1
+        finance_headers = ["子科目", "借方发生", "贷方发生", "净额", "占财务费用比", "明细笔数", "主要摘要"]
+        finance_rows = []
+        if target_df is not None and not target_df.empty:
+            finance_df = target_df[target_df["Category"] == "财务费用"].copy()
+            finance_total = finance_df["Amount"].sum() if not finance_df.empty else 0
+            if not finance_df.empty:
+                finance_df["Subcategory"] = finance_df["Subcategory"].fillna("未填子科目").astype(str).replace({"": "未填子科目", "nan": "未填子科目"})
+                for sub, group in finance_df.groupby("Subcategory"):
+                    debit_sum = group.get("DebitAmount", pd.Series(dtype="float64")).apply(self._to_float).fillna(0).sum()
+                    credit_sum = group.get("CreditAmount", pd.Series(dtype="float64")).apply(self._to_float).fillna(0).sum()
+                    net_amount = group["Amount"].sum()
+                    top_summary = None
+                    top_group = group.sort_values(by="AmountAbs", ascending=False)
+                    if not top_group.empty:
+                        raw_summary = top_group.iloc[0].get("Summary")
+                        if raw_summary is not None and not pd.isna(raw_summary):
+                            top_summary = str(raw_summary)
+                    finance_rows.append([
+                        sub,
+                        debit_sum,
+                        credit_sum,
+                        net_amount,
+                        net_amount / finance_total if finance_total else None,
+                        len(group),
+                        top_summary,
+                    ])
+        finance_rows = sorted(finance_rows, key=lambda x: abs(x[3] or 0), reverse=True)
+        if not finance_rows:
+            finance_rows = [["-", None, None, None, None, None, None]]
+        self._write_table(ws, row_cursor, 1, finance_headers, finance_rows)
+        row_cursor += len(finance_rows) + 2
+
+        # G) 年度异常回顾Top
+        ws.cell(row=row_cursor, column=1).value = "G. 年度异常回顾Top（非目标月）"
+        ws.cell(row=row_cursor, column=1).font = Font(name="微软雅黑", bold=True, color="1F4E79")
+        row_cursor += 1
+        history_headers = [
+            "月份", "费用类别", "子科目", "本期金额", "上期金额",
+            "环比增量", "环比增速", "异常评分", "异常标签", "明细键"
+        ]
+        history_rows = []
+        history_flags = [f for f in flags if not target_key or f.get("MonthStr") != target_key][:min(anomaly_top_n, 30)]
+        for f in history_flags:
+            history_rows.append([
+                self._month_key_to_label(f.get("MonthStr")),
+                f.get("Category"),
+                f.get("Subcategory"),
+                f.get("Amount"),
+                f.get("PrevAmount"),
+                f.get("Delta"),
+                f.get("Rate"),
+                f.get("AnomalyScore"),
+                "、".join(f.get("ReasonTags") or []),
+                f.get("AnomalyKey"),
+            ])
+        if not history_rows:
+            history_rows = [["-", None, None, None, None, None, None, None, None, None]]
+        self._write_table(ws, row_cursor, 1, history_headers, history_rows)
+        row_cursor += len(history_rows) + 2
+
+        budget_targets, _, (ratio_threshold, pp_threshold, days_threshold) = self._read_budget_targets(wb)
+        month_keys_warn = self._filter_month_keys(metrics_by_month.keys(), target_year, target_month, year_scope)
+
+        # H) 费用预算偏差
+        ws.cell(row=row_cursor, column=1).value = "H. 费用预算偏差"
+        ws.cell(row=row_cursor, column=1).font = Font(name="微软雅黑", bold=True, color="1F4E79")
+        row_cursor += 1
+        budget_headers = ["月份", "指标", "目标值", "实际值", "偏差", "偏差率", "建议"]
+        budget_rows = []
+        for m_key in month_keys_warn:
+            data = metrics_by_month.get(m_key, {})
+            revenue = data.get("revenue")
+            sales_expense = data.get("sales_expense")
+            admin_expense = data.get("admin_expense")
+            financial_expense = data.get("financial_expense")
+            metric_items = [
+                ("销售费用率", "sales_rate", sales_expense / revenue if (sales_expense is not None and revenue not in (None, 0)) else None),
+                ("管理费用率", "admin_rate", admin_expense / revenue if (admin_expense is not None and revenue not in (None, 0)) else None),
+                ("财务费用率", "financial_rate", financial_expense / revenue if (financial_expense is not None and revenue not in (None, 0)) else None),
+            ]
+            for label, key, actual in metric_items:
+                target = budget_targets.get(m_key, {}).get(key)
+                if target is None and actual is None:
+                    continue
+                variance = actual - target if (actual is not None and target is not None) else None
+                variance_rate = variance / target if (variance is not None and target not in (None, 0)) else None
+                suggestion = "按费用率偏差追踪责任部门和主要科目" if variance is not None and variance > 0 else ""
+                budget_rows.append([
+                    self._month_key_to_label(m_key),
+                    label,
+                    target,
+                    actual,
+                    variance,
+                    variance_rate,
+                    suggestion,
+                ])
+        if not budget_rows:
+            budget_rows = [["-", "无预算目标", None, None, None, None, "请在目标_预算中维护费用率目标"]]
+        self._write_table(ws, row_cursor, 1, budget_headers, budget_rows)
+        row_cursor += len(budget_rows) + 2
+
+        # I) 经营指标预警（预算阈值）
+        ws.cell(row=row_cursor, column=1).value = "I. 经营指标预警（预算阈值）"
+        ws.cell(row=row_cursor, column=1).font = Font(name="微软雅黑", bold=True, color="1F4E79")
+        row_cursor += 1
         metric_warn_headers = ["月份", "指标", "本期值", "上期值", "变化值", "变化率/差值", "阈值", "级别", "建议"]
         metric_warn_rows = []
-        month_keys_warn = self._filter_month_keys(metrics_by_month.keys(), target_year, target_month, year_scope)
         prev_data = None
         for m_key in month_keys_warn:
             data = metrics_by_month.get(m_key, {})
@@ -7697,6 +9690,15 @@ class ReportGenerator:
         if not metric_warn_rows:
             metric_warn_rows = [["-", "无异常", None, None, None, None, None, "低", ""]]
         self._write_table(ws, row_cursor, 1, metric_warn_headers, metric_warn_rows)
+        self._add_expense_diagnostic_charts(
+            ws,
+            rows_a,
+            top_rows,
+            dept_rows,
+            finance_rows,
+            matrix_rows=matrix_rows,
+            subject_compare_rows=subject_compare_rows,
+        )
 
         # 将“明细键”在 B/C 区域链接到 D 区域对应明细行。
         if key_to_detail_row:
@@ -7986,6 +9988,10 @@ class ReportGenerator:
         self._update_channel_profit_sheet(wb, target_year, target_month, self.year_scope)
         self._update_inventory_health_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
         self._update_slow_moving_inventory_sheet(wb, target_year, target_month)
+        repl_auto_by_product = not self._bool_param(
+            (self.report_params or {}).get("replenishment", {}).get("manual", True),
+            default=True,
+        )
         repl_params, cash_params, warning_notes = self._resolve_warning_params(
             metrics_by_month_scoped,
             target_year,
@@ -7998,6 +10004,7 @@ class ReportGenerator:
             target_month,
             self.year_scope,
             param_source_note=warning_notes.get("replenishment"),
+            use_product_params=repl_auto_by_product,
             **repl_params,
         )
         self._update_expense_structure_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
@@ -8489,64 +10496,181 @@ class ReportGenerator:
         all_df.columns = [str(c).strip().rstrip('\t') for c in all_df.columns]
         return all_df
 
-    def _calculate_expense_keyword_totals(self, target_year=None, target_month=None, year_scope=None):
-        df = self._get_expense_df()
-        df = self._filter_df_by_scope(df, target_year, target_month, year_scope)
-        if df is None or df.empty:
-            return {}, {}
+    def _classify_expense_behavior(self, row):
+        category = "" if pd.isna(row.get('Category')) else str(row.get('Category') or "")
+        subcategory = "" if pd.isna(row.get('Subcategory')) else str(row.get('Subcategory') or "")
+        fields = [category, subcategory, row.get('Summary'), row.get('科目名'), row.get('摘要')]
+        text = "".join("" if pd.isna(v) else str(v) for v in fields)
+        text_lower = text.lower()
 
-        # Clean header repeats
-        if '科目名' in df.columns:
-            df = df[df['科目名'].notna()]
-            df = df[df['科目名'] != '科目名']
+        if any(k in text for k in ["存货盘亏", "存货盘盈", "盘亏", "盘盈", "盘点", "库存调整"]):
+            return "inventory_adjustment"
+        if any(k in text for k in ["汇兑损益", "期末调汇", "汇率", "调汇"]):
+            return "financial_adjustment"
+        bank_terms = ["U盾", "u盾", "网银", "银行费用", "银行手续费", "账户管理", "转账手续费", "电汇手续费"]
+        if (
+            any(k in text for k in bank_terms)
+            or ("手续费" in text and ("财务费用" in category or "银行" in text))
+            or ("bank" in text_lower and "fee" in text_lower)
+        ):
+            return "financial_adjustment"
 
-        if 'MonthStr' not in df.columns:
-            date_col = next((c for c in df.columns if '日期' in c), None)
-            if date_col:
-                df['ParsedDate'] = pd.to_datetime(df[date_col], errors='coerce')
-                df['MonthStr'] = df['ParsedDate'].dt.strftime('%Y-%m')
+        entertainment_terms = ["交际应酬", "招待", "宴请", "客户吃饭", "厂家吃饭", "红包", "舞狮"]
+        if any(k in text for k in entertainment_terms):
+            return "variable" if "销售" in category else "fixed"
 
-        if 'MonthStr' not in df.columns:
-            return {}, {}
+        personnel_document_terms = ["签证", "健康证", "照片", "居留", "证照", "认证", "无犯罪记录", "海牙"]
+        if any(k in text for k in personnel_document_terms):
+            return "fixed"
 
-        def pick_amount_col(keyword):
-            if keyword in df.columns:
-                return keyword
-            for c in df.columns:
-                if keyword in c and '外币' not in c:
-                    return c
-            for c in df.columns:
-                if keyword in c:
-                    return c
+        professional_terms = ["律师", "法律", "咨询", "顾问", "审计", "年账", "做年账"]
+        if any(k in text for k in professional_terms):
+            return "fixed"
+
+        maintenance_terms = ["维修", "修理", "电线", "断路器", "插板", "插座", "耗材", "工具", "清洁用品"]
+        if any(k in text for k in maintenance_terms):
+            return "fixed"
+
+        if any(k in text for k in ["佣金", "运费", "运输", "物流", "车费", "快递", "提成", "市场", "广告", "推广", "手续费", "文件费", "装卸", "报关", "代理", "验货", "包装"]):
+            return "variable"
+        if any(k in text for k in ["工资", "房租", "物业", "水电", "折旧", "办公", "福利", "保险", "生活", "车辆", "差旅", "利息", "自由港", "通讯"]):
+            return "fixed"
+        return "unclassified"
+
+    def _expense_behavior_history_key(self, row):
+        def clean(value):
+            if value is None or pd.isna(value):
+                return ""
+            return str(value).strip().replace("\u3000", " ")
+
+        category = clean(row.get('Category'))
+        subcategory = clean(row.get('Subcategory'))
+        if not category or not subcategory:
             return None
 
-        debit_col = pick_amount_col('借方金额')
-        credit_col = pick_amount_col('贷方金额')
-        if not debit_col or not credit_col:
-            return {}, {}
+        generic_subcategories = {"其他", "其它", "未填子科目", "nan", "None"}
+        if subcategory in generic_subcategories:
+            summary = clean(row.get('Summary') or row.get('摘要'))
+            if not summary:
+                return None
+            normalized_summary = re.sub(r"\s+", "", summary)
+            normalized_summary = re.sub(r"\d+(?:\.\d+)?", "#", normalized_summary)
+            return (category, subcategory, normalized_summary[:24])
 
-        variable_keywords = ["佣金", "运", "快递", "提成", "市场", "广告", "推广", "手续费", "汇兑损益"]
-        fixed_keywords = ["工资", "房租", "物业", "水电", "折旧", "办公", "福利", "保险", "生活", "车辆", "差旅", "利息", "自由港"]
+        return (category, subcategory)
 
-        var_by_month = {}
-        fixed_by_month = {}
+    def _build_expense_behavior_history_profiles(self, df):
+        profiles = {}
+        if df is None or df.empty:
+            return profiles
 
         for _, row in df.iterrows():
+            key = self._expense_behavior_history_key(row)
+            if not key:
+                continue
+            amount = row.get('Amount')
             month_key = row.get('MonthStr')
-            if not month_key:
+            if not month_key or amount is None or pd.isna(amount) or amount == 0:
                 continue
-            debit = self._to_float(row.get(debit_col)) or 0
-            credit = self._to_float(row.get(credit_col)) or 0
-            amount = debit - credit
-            if amount == 0:
-                continue
-            text = f"{row.get('科目名', '')}{row.get('摘要', '')}"
-            if any(k in text for k in variable_keywords):
-                var_by_month[month_key] = var_by_month.get(month_key, 0) + amount
-            elif any(k in text for k in fixed_keywords):
-                fixed_by_month[month_key] = fixed_by_month.get(month_key, 0) + amount
 
-        return var_by_month, fixed_by_month
+            bucket = row.get('_RuleBehavior')
+            if not bucket:
+                bucket = self._classify_expense_behavior(row)
+
+            profile = profiles.setdefault(key, {
+                "bucket_abs": {},
+                "bucket_count": {},
+                "monthly_amount": {},
+                "category": key[0],
+            })
+            profile["monthly_amount"][month_key] = profile["monthly_amount"].get(month_key, 0) + amount
+            if bucket and bucket != "unclassified":
+                profile["bucket_abs"][bucket] = profile["bucket_abs"].get(bucket, 0) + abs(amount)
+                profile["bucket_count"][bucket] = profile["bucket_count"].get(bucket, 0) + 1
+        return profiles
+
+    def _infer_expense_behavior_from_history(self, row, profiles):
+        key = self._expense_behavior_history_key(row)
+        if not key:
+            return None
+        profile = profiles.get(key)
+        if not profile:
+            return None
+
+        bucket_abs = profile.get("bucket_abs") or {}
+        if bucket_abs:
+            ranked = sorted(bucket_abs.items(), key=lambda x: x[1], reverse=True)
+            top_bucket, top_abs = ranked[0]
+            total_abs = sum(bucket_abs.values())
+            top_count = (profile.get("bucket_count") or {}).get(top_bucket, 0)
+            if total_abs and top_abs / total_abs >= 0.7 and top_count >= 1:
+                return top_bucket
+
+        monthly_values = [
+            abs(v)
+            for v in (profile.get("monthly_amount") or {}).values()
+            if v is not None and abs(v) > 0
+        ]
+        if len(monthly_values) < 3:
+            return None
+
+        mean_value = sum(monthly_values) / len(monthly_values)
+        if not mean_value:
+            return None
+        variance = sum((v - mean_value) ** 2 for v in monthly_values) / len(monthly_values)
+        coefficient_of_variation = (variance ** 0.5) / mean_value
+        category = str(profile.get("category") or "")
+
+        if coefficient_of_variation <= 0.75:
+            return "fixed"
+        if "财务费用" in category:
+            return "financial_adjustment"
+        if "销售费用" in category and coefficient_of_variation >= 1.0:
+            return "variable"
+        return None
+
+    def _calculate_expense_behavior_totals(self, target_year=None, target_month=None, year_scope=None):
+        raw_df = self._get_expense_df()
+        df = self._prepare_expense_analysis_df(raw_df, target_year, target_month, year_scope)
+        if df is None or df.empty:
+            return {
+                "variable": {},
+                "fixed": {},
+                "financial_adjustment": {},
+                "inventory_adjustment": {},
+                "unclassified": {},
+                "total": {},
+            }
+
+        df = df.copy()
+        df["_RuleBehavior"] = df.apply(self._classify_expense_behavior, axis=1)
+        history_profiles = self._build_expense_behavior_history_profiles(df)
+
+        totals = {
+            "variable": {},
+            "fixed": {},
+            "financial_adjustment": {},
+            "inventory_adjustment": {},
+            "unclassified": {},
+            "total": {},
+        }
+        for _, row in df.iterrows():
+            month_key = row.get('MonthStr')
+            amount = row.get('Amount')
+            if not month_key or amount is None or pd.isna(amount) or amount == 0:
+                continue
+            bucket = row.get("_RuleBehavior") or self._classify_expense_behavior(row)
+            if bucket == "unclassified":
+                bucket = self._infer_expense_behavior_from_history(row, history_profiles) or "unclassified"
+            if bucket not in totals:
+                bucket = "unclassified"
+            totals[bucket][month_key] = totals[bucket].get(month_key, 0) + amount
+            totals["total"][month_key] = totals["total"].get(month_key, 0) + amount
+        return totals
+
+    def _calculate_expense_keyword_totals(self, target_year=None, target_month=None, year_scope=None):
+        totals = self._calculate_expense_behavior_totals(target_year, target_month, year_scope)
+        return totals.get("variable", {}), totals.get("fixed", {})
 
     def _update_expense_mom_sheet(self, ws, target_year, target_month, year_scope=None):
         raw_df = self._get_expense_df()
@@ -8693,11 +10817,42 @@ class ReportGenerator:
             delta_threshold=10000,
         )
 
+    def _apply_cvp_sheet_format(self, ws):
+        widths = {
+            1: 10,
+            2: 8,
+            3: 14,
+            4: 14,
+            5: 14,
+            6: 12,
+            7: 14,
+            8: 14,
+            9: 16,
+            10: 14,
+            11: 12,
+        }
+        for col_idx, width in widths.items():
+            letter = get_column_letter(col_idx)
+            current = ws.column_dimensions[letter].width or 0
+            ws.column_dimensions[letter].width = max(current, width)
+
+        amount_cols = (3, 4, 5, 7, 8, 9, 10)
+        percent_cols = (6, 11)
+        for r in range(2, ws.max_row + 1):
+            label = ws.cell(row=r, column=1).value
+            if label is None or str(label).strip() == "":
+                continue
+            for c in amount_cols:
+                ws.cell(row=r, column=c).number_format = '#,##0.00'
+            for c in percent_cols:
+                ws.cell(row=r, column=c).number_format = '0.0%'
+
     def _update_cvp_sheet(self, ws, metrics_by_month, target_year, target_month, year_scope=None):
         var_by_month, fixed_by_month = self._calculate_expense_keyword_totals(target_year, target_month, year_scope)
-        limit_key = None
-        if target_year and target_month:
-            limit_key = f"{target_year}-{int(target_month):02d}"
+        min_margin_ratio = 0.01
+
+        def _valid_margin_ratio(value):
+            return value is not None and not pd.isna(value) and value >= min_margin_ratio
 
         # Write Headers
         headers = ["月份", "合计", "销售收入", "变动成本", "贡献毛利", "贡献毛利率", "固定成本", "总成本", "盈亏平衡点", "安全边际", "安全边际率"]
@@ -8731,6 +10886,8 @@ class ReportGenerator:
             variable_cost = None
             if revenue is not None:
                 base = base_cost or 0
+                if isinstance(base, float) and pd.isna(base):
+                    base = 0
                 var_extra = var_by_month.get(month_key, 0)
                 if isinstance(var_extra, float) and pd.isna(var_extra):
                     var_extra = 0
@@ -8739,19 +10896,19 @@ class ReportGenerator:
             contribution = revenue - variable_cost if revenue is not None and variable_cost is not None else None
             ratio = contribution / revenue if (contribution is not None and revenue not in (None, 0)) else None
             fixed_cost = fixed_by_month.get(month_key, 0) if revenue is not None else None
-            if isinstance(fixed_cost, float) and pd.isna(fixed_cost):
+            if fixed_cost is None or (isinstance(fixed_cost, float) and pd.isna(fixed_cost)):
                 fixed_cost = 0
             
             total_cost = (variable_cost or 0) + (fixed_cost or 0) if revenue is not None else None
 
-            if ratio and ratio > 0:
+            if _valid_margin_ratio(ratio):
                 break_even = fixed_cost / ratio
                 margin = revenue - break_even
                 margin_ratio = margin / revenue if (margin is not None and revenue not in (None, 0)) else None
             else:
-                break_even = 0
-                margin = 0
-                margin_ratio = 0
+                break_even = None
+                margin = None
+                margin_ratio = None
 
             ws.cell(row=r, column=2).value = '合计'
             ws.cell(row=r, column=3).value = revenue
@@ -8775,14 +10932,14 @@ class ReportGenerator:
             total_contribution = total_revenue - total_variable
             total_ratio = total_contribution / total_revenue if total_revenue else None
             total_cost_sum = total_variable + total_fixed
-            if total_ratio and total_ratio > 0:
+            if _valid_margin_ratio(total_ratio):
                 total_break_even = total_fixed / total_ratio
                 total_margin = total_revenue - total_break_even
                 total_margin_ratio = total_margin / total_revenue if total_revenue else None
             else:
-                total_break_even = 0
-                total_margin = 0
-                total_margin_ratio = 0
+                total_break_even = None
+                total_margin = None
+                total_margin_ratio = None
 
             ws.cell(row=total_row, column=3).value = total_revenue
             ws.cell(row=total_row, column=4).value = total_variable
@@ -8795,6 +10952,7 @@ class ReportGenerator:
             ws.cell(row=total_row, column=11).value = total_margin_ratio
 
         self._reorder_month_rows_desc(ws)
+        self._apply_cvp_sheet_format(ws)
 
     def _update_sales_inventory_detail_sheet(self, ws, target_year, target_month):
         if not target_year or not target_month:
@@ -8970,14 +11128,38 @@ class ReportGenerator:
         if header_row is None:
             return
 
+        header_map = self._get_header_map(ws, header_row)
+        if "财务费用率目标" not in header_map:
+            src_col = header_map.get("管理费用率目标") or header_map.get("存货周转天数目标") or ws.max_column
+            financial_col = self._ensure_header_column(ws, "财务费用率目标", header_row=header_row)
+            if src_col and src_col != financial_col:
+                self._copy_column_style(ws, src_col, financial_col, max_row=ws.max_row)
+            ws.cell(row=header_row, column=financial_col).value = "财务费用率目标"
+            self._apply_header_style(ws, header_row, start_col=financial_col, max_col=financial_col)
+            header_map = self._get_header_map(ws, header_row)
+
+        target_columns = {
+            "revenue": header_map.get("主营业务收入目标"),
+            "profit": header_map.get("营业利润目标"),
+            "profit_rate": header_map.get("营业利润率目标"),
+            "cost_rate": header_map.get("成本率目标"),
+            "sales_rate": header_map.get("销售费用率目标"),
+            "admin_rate": header_map.get("管理费用率目标"),
+            "financial_rate": header_map.get("财务费用率目标"),
+            "ar_balance": header_map.get("应收账款余额目标"),
+            "inventory_end": header_map.get("存货期末余额目标"),
+            "inventory_days": header_map.get("存货周转天数目标"),
+        }
+
         for r in range(header_row + 1, ws.max_row + 1):
             label = ws.cell(row=r, column=1).value
             if not label:
                 continue
             month_key = self._label_to_month_key(label)
             if not self._month_key_in_scope(month_key, target_year, target_month, year_scope):
-                for c in range(2, 11):
-                    self._safe_set_cell_value(ws, r, c, None)
+                for c in target_columns.values():
+                    if c:
+                        self._safe_set_cell_value(ws, r, c, None)
                 continue
             data = metrics_by_month.get(month_key)
             if not data:
@@ -8987,6 +11169,7 @@ class ReportGenerator:
             cost = data.get('cost')
             sales_exp = data.get('sales_expense')
             admin_exp = data.get('admin_expense')
+            financial_exp = data.get('financial_expense')
             ar_balance = data.get('ar_balance')
             inv_end = data.get('inventory_end')
             inv_start = data.get('inventory_start')
@@ -8995,6 +11178,7 @@ class ReportGenerator:
             cost_rate = cost / revenue if (cost is not None and revenue not in (None, 0)) else None
             sales_rate = sales_exp / revenue if (sales_exp is not None and revenue not in (None, 0)) else None
             admin_rate = admin_exp / revenue if (admin_exp is not None and revenue not in (None, 0)) else None
+            financial_rate = financial_exp / revenue if (financial_exp is not None and revenue not in (None, 0)) else None
 
             avg_inv = None
             if inv_start is not None and inv_end is not None:
@@ -9003,15 +11187,22 @@ class ReportGenerator:
                 avg_inv = inv_end
             inv_days = (avg_inv / cost * 365) if avg_inv is not None and cost else None
 
-            ws.cell(row=r, column=2).value = revenue
-            ws.cell(row=r, column=3).value = profit
-            ws.cell(row=r, column=4).value = profit_rate
-            ws.cell(row=r, column=5).value = cost_rate
-            ws.cell(row=r, column=6).value = sales_rate
-            ws.cell(row=r, column=7).value = admin_rate
-            ws.cell(row=r, column=8).value = ar_balance
-            ws.cell(row=r, column=9).value = inv_end
-            ws.cell(row=r, column=10).value = inv_days
+            values = {
+                "revenue": revenue,
+                "profit": profit,
+                "profit_rate": profit_rate,
+                "cost_rate": cost_rate,
+                "sales_rate": sales_rate,
+                "admin_rate": admin_rate,
+                "financial_rate": financial_rate,
+                "ar_balance": ar_balance,
+                "inventory_end": inv_end,
+                "inventory_days": inv_days,
+            }
+            for key, value in values.items():
+                col = target_columns.get(key)
+                if col:
+                    ws.cell(row=r, column=col).value = value
 
         self._reorder_month_rows_desc(ws)
 
@@ -9039,6 +11230,30 @@ class ReportGenerator:
                 return c
         return None
 
+    def _is_summary_or_footer_label(self, value):
+        if value is None:
+            return False
+        text = re.sub(r'\s+', '', str(value).strip())
+        if not text:
+            return False
+        upper = text.upper()
+        if upper in {
+            "合计",
+            "总计",
+            "總計",
+            "小计",
+            "小計",
+            "累计",
+            "累計",
+            "商品合计",
+            "商品总计",
+            "商品總計",
+            "TOTAL",
+            "SUBTOTAL",
+        }:
+            return True
+        return bool(re.match(r'^20\d{2}[/.-]\d{1,2}[/.-]\d{1,2}', text))
+
     def _get_unit_cost_map_for_month(self, month_key):
         cost_df = self.data['cost'].get(month_key)
         if cost_df is None or cost_df.empty:
@@ -9059,6 +11274,7 @@ class ReportGenerator:
         df = cost_df[[code_col, unit_col]].copy()
         df = df[df[code_col].notna()]
         df = df[df[code_col].astype(str).str.strip() != '品目编码']
+        df = df[~df[code_col].apply(self._is_summary_or_footer_label)]
         df = df[~df[unit_col].astype(str).str.strip().isin(['单价', '数量', '金额'])]
         df['UnitCost'] = pd.to_numeric(df[unit_col], errors='coerce')
         df = df[df['UnitCost'].notna()]
@@ -9086,7 +11302,7 @@ class ReportGenerator:
             if raw_code is None or pd.isna(raw_code):
                 continue
             code = str(raw_code).strip()
-            if not code or code == "品目编码":
+            if not code or code == "品目编码" or self._is_summary_or_footer_label(code):
                 continue
 
             qty_end = self._to_float(row.get(qty_end_col))
@@ -9671,8 +11887,9 @@ class ReportGenerator:
     def _fill_product_summary_total(self, ws, target_year, target_month, year_scope=None):
         sales_df = self._get_sales_df()
         if sales_df is None or sales_df.empty:
-            return
-        sales_df = sales_df.copy()
+            sales_df = pd.DataFrame(columns=['MonthStr', '品目编码', '品目名', '品目组合1名', '数量'])
+        else:
+            sales_df = sales_df.copy()
         if 'MonthStr' not in sales_df.columns:
             if 'ParsedDate' in sales_df.columns:
                 sales_df['MonthStr'] = pd.to_datetime(sales_df['ParsedDate'], errors='coerce').dt.strftime('%Y-%m')
@@ -9683,14 +11900,16 @@ class ReportGenerator:
                     sales_df['MonthStr'] = parsed.dt.strftime('%Y-%m')
         display_sales_df = self._filter_df_by_scope(sales_df.copy(), target_year, target_month, year_scope)
         annual_sales_df = self._filter_df_by_scope(sales_df.copy(), target_year, target_month, "current")
-        if (display_sales_df is None or display_sales_df.empty) and (annual_sales_df is None or annual_sales_df.empty):
-            return
 
         cost_df = None
         if target_year and target_month:
             cost_df = self.data['cost'].get(f"{target_year}-{int(target_month):02d}")
         if cost_df is None and self.data['cost']:
             cost_df = self.data['cost'][sorted(self.data['cost'].keys())[-1]]
+        has_cost_data = cost_df is not None and not cost_df.empty
+
+        if (display_sales_df is None or display_sales_df.empty) and (annual_sales_df is None or annual_sales_df.empty) and not has_cost_data:
+            return
 
         header_map = {}
         for col in range(1, ws.max_column + 1):
@@ -9702,11 +11921,91 @@ class ReportGenerator:
         if not code_col:
             return
 
-        def _is_total_label(v):
-            if v is None:
+        def _refresh_header_map():
+            refreshed = {}
+            for c in range(1, ws.max_column + 1):
+                value = ws.cell(row=1, column=c).value
+                if value:
+                    refreshed[str(value).strip()] = c
+            return refreshed
+
+        def _ensure_summary_column(header, reference_headers=None):
+            nonlocal header_map
+            if header in header_map:
+                return header_map[header]
+            reference_headers = reference_headers or []
+            src_col = None
+            for ref in reference_headers:
+                if ref in header_map:
+                    src_col = header_map[ref]
+                    break
+            if src_col is None:
+                src_col = ws.max_column if ws.max_column else 1
+            new_col = ws.max_column + 1
+            if src_col:
+                self._copy_column_style(ws, src_col, new_col)
+            ws.cell(row=1, column=new_col).value = header
+            header_map[header] = new_col
+            return new_col
+
+        def _move_named_columns_after(anchor_header, headers_to_move):
+            nonlocal header_map, code_col
+            header_map = _refresh_header_map()
+            anchor_col = header_map.get(anchor_header)
+            ordered_cols = [
+                header_map[h]
+                for h in headers_to_move
+                if h in header_map
+            ]
+            if not anchor_col or not ordered_cols:
                 return False
-            text = str(v).strip().upper()
-            return text in {"合计", "总计", "TOTAL"}
+            expected_cols = list(range(anchor_col + 1, anchor_col + 1 + len(ordered_cols)))
+            if ordered_cols == expected_cols:
+                return False
+
+            snapshots = [
+                self._snapshot_column(ws, col, ws.max_row)
+                for col in ordered_cols
+            ]
+            for col in sorted(ordered_cols, reverse=True):
+                ws.delete_cols(col, 1)
+            header_map = _refresh_header_map()
+            anchor_col = header_map.get(anchor_header)
+            if not anchor_col:
+                return False
+            insert_at = anchor_col + 1
+            ws.insert_cols(insert_at, len(snapshots))
+            for offset, snapshot in enumerate(snapshots):
+                self._restore_column(ws, insert_at + offset, snapshot, ws.max_row)
+            header_map = _refresh_header_map()
+            code_col = header_map.get('品目编码')
+            return True
+
+        monthly_average_headers = {
+            'qty': '月销售数量平均',
+            'revenue': '月销售收入平均',
+            'cost': '月销售成本平均',
+            'profit': '月销售利润平均',
+            'margin': '月毛利率平均',
+        }
+        monthly_average_cols = {
+            metric: _ensure_summary_column(monthly_header, [annual_header])
+            for metric, monthly_header, annual_header in [
+                ('qty', monthly_average_headers['qty'], '年销售数量平均'),
+                ('revenue', monthly_average_headers['revenue'], '年销售收入平均'),
+                ('cost', monthly_average_headers['cost'], '年销售成本平均'),
+                ('profit', monthly_average_headers['profit'], '年销售利润平均'),
+                ('margin', monthly_average_headers['margin'], '年毛利率平均'),
+            ]
+        }
+        _move_named_columns_after('年毛利率平均', list(monthly_average_headers.values()))
+        monthly_average_cols = {
+            metric: header_map.get(header)
+            for metric, header in monthly_average_headers.items()
+        }
+
+        def _is_total_label(v):
+            return self._is_summary_or_footer_label(v)
 
         def _normalize_output(v):
             if pd.isna(v):
@@ -9720,7 +12019,7 @@ class ReportGenerator:
 
         def prepare_sales_scope(source_df, scope):
             if source_df is None or source_df.empty:
-                return pd.DataFrame()
+                return pd.DataFrame(columns=['MonthStr', '品目编码', '品目名', '品目组合1名', 'Qty', 'Revenue', 'Cost'])
             work = source_df.copy()
             work['Revenue'] = self._extract_sales_revenue(work)
             work['Qty'] = pd.to_numeric(work.get('数量'), errors='coerce')
@@ -9728,7 +12027,7 @@ class ReportGenerator:
 
         sales_df = prepare_sales_scope(display_sales_df, year_scope)
         annual_sales_df = prepare_sales_scope(annual_sales_df, "current")
-        if sales_df.empty and annual_sales_df.empty:
+        if sales_df.empty and annual_sales_df.empty and not has_cost_data:
             return
 
         month_cols = {}
@@ -9883,9 +12182,12 @@ class ReportGenerator:
                 return month_map
             for _, row in df_cost.iterrows():
                 code = row.get(code_col_name)
-                if not code or pd.isna(code):
+                if code is None or pd.isna(code):
                     continue
-                month_map[str(code)] = {
+                code = str(code).strip()
+                if not code or _is_total_label(code):
+                    continue
+                month_map[code] = {
                     'name_spec': row.get(name_col),
                     'qty_start': self._to_float(row.get(qty_start_col)),
                     'amt_start': self._to_float(row.get(amt_start_col)),
@@ -9910,6 +12212,32 @@ class ReportGenerator:
             cost_map = cost_by_month[sorted(cost_by_month.keys())[-1]]
         elif cost_df is not None and not cost_df.empty:
             cost_map = build_cost_month_map(cost_df)
+
+        def _row_value(row, key):
+            if row is None:
+                return None
+            try:
+                val = row.get(key)
+            except Exception:
+                return None
+            if val is None:
+                return None
+            try:
+                if pd.isna(val):
+                    return None
+            except Exception:
+                pass
+            return val
+
+        def _first_value(*values):
+            for val in values:
+                if val is None:
+                    continue
+                text = str(val).strip()
+                if not text or text.lower() == "nan":
+                    continue
+                return val
+            return None
 
         # 补齐模板中不存在但当期有销售的品目编码，避免12月出现“有数据无行可写”
         existing_codes = {}
@@ -9941,7 +12269,7 @@ class ReportGenerator:
 
         missing_codes = []
         source_codes = []
-        for idx in list(display_by_code.index) + list(sales_by_code.index):
+        for idx in list(display_by_code.index) + list(sales_by_code.index) + list(cost_map.keys()):
             code = str(idx).strip()
             if code and code not in source_codes:
                 source_codes.append(code)
@@ -9962,7 +12290,16 @@ class ReportGenerator:
                 meta_row = display_by_code.loc[code] if code in display_by_code.index else sales_row
                 cost_row = cost_map.get(code, {})
                 if '产品名称' in header_map and meta_row is not None:
-                    ws.cell(row=insert_row, column=header_map['产品名称']).value = meta_row.get('product_name')
+                    ws.cell(row=insert_row, column=header_map['产品名称']).value = _first_value(
+                        _row_value(meta_row, 'product_name'),
+                        cost_row.get('name_spec'),
+                        code,
+                    )
+                elif '产品名称' in header_map:
+                    ws.cell(row=insert_row, column=header_map['产品名称']).value = _first_value(
+                        cost_row.get('name_spec'),
+                        code,
+                    )
                 resolved_category = self._resolve_uncategorized_product(
                     meta_row.get('category') if meta_row is not None else None,
                     cost_row.get('name_spec')
@@ -9992,19 +12329,29 @@ class ReportGenerator:
             'year_end_amt': 0,
         }
         for r in range(2, ws.max_row + 1):
+            if total_row and r == total_row:
+                continue
             code = ws.cell(row=r, column=code_col).value
             if not code:
                 continue
             code = str(code).strip()
+            if _is_total_label(code):
+                continue
             sales_row = sales_by_code.loc[code] if code in sales_by_code.index else None
             meta_row = display_by_code.loc[code] if code in display_by_code.index else sales_row
             cost_row = cost_map.get(code, {})
             resolved_category = self._resolve_uncategorized_product(
-                meta_row.get('category') if meta_row is not None else None,
+                _row_value(meta_row, 'category'),
                 cost_row.get('name_spec')
             )
-            if '产品名称' in header_map and meta_row is not None:
-                ws.cell(row=r, column=header_map['产品名称']).value = meta_row.get('product_name')
+            if '产品名称' in header_map:
+                product_name = _first_value(
+                    _row_value(meta_row, 'product_name'),
+                    cost_row.get('name_spec'),
+                    code,
+                )
+                if product_name is not None:
+                    ws.cell(row=r, column=header_map['产品名称']).value = product_name
             if '品目名规格' in header_map and cost_row.get('name_spec') is not None:
                 ws.cell(row=r, column=header_map['品目名规格']).value = cost_row.get('name_spec')
             if '产品大类' in header_map and resolved_category is not None:
@@ -10092,6 +12439,16 @@ class ReportGenerator:
                 ws.cell(row=r, column=header_map['年销售利润平均']).value = avg_profit
             if '年毛利率平均' in header_map:
                 ws.cell(row=r, column=header_map['年毛利率平均']).value = avg_margin
+            if monthly_average_cols.get('qty'):
+                ws.cell(row=r, column=monthly_average_cols['qty']).value = avg_qty
+            if monthly_average_cols.get('revenue'):
+                ws.cell(row=r, column=monthly_average_cols['revenue']).value = avg_revenue
+            if monthly_average_cols.get('cost'):
+                ws.cell(row=r, column=monthly_average_cols['cost']).value = avg_cost
+            if monthly_average_cols.get('profit'):
+                ws.cell(row=r, column=monthly_average_cols['profit']).value = avg_profit
+            if monthly_average_cols.get('margin'):
+                ws.cell(row=r, column=monthly_average_cols['margin']).value = avg_margin
 
             if month_cols:
                 for m_label, metric_cols in month_cols.items():
@@ -10130,6 +12487,15 @@ class ReportGenerator:
                         ws.cell(row=r, column=metric_cols['profit']).value = _normalize_output(m_row.get('profit'))
                     if 'margin' in metric_cols:
                         ws.cell(row=r, column=metric_cols['margin']).value = _normalize_output(m_row.get('margin'))
+
+        current_qty_total = self._safe_sum([item.get('qty_end') for item in cost_map.values()])
+        current_amt_total = self._safe_sum([item.get('amt_end') for item in cost_map.values()])
+        if current_qty_total is not None:
+            total_vals['current_qty'] = current_qty_total
+        if current_amt_total is not None:
+            total_vals['current_amt'] = current_amt_total
+            total_vals['year_end_amt'] = current_amt_total
+
         if total_row:
             if '当前库存数量' in header_map:
                 ws.cell(row=total_row, column=header_map['当前库存数量']).value = total_vals['current_qty']
@@ -10192,6 +12558,16 @@ class ReportGenerator:
                 ws.cell(row=total_row, column=header_map['年销售利润平均']).value = total_avg_profit
             if '年毛利率平均' in header_map:
                 ws.cell(row=total_row, column=header_map['年毛利率平均']).value = total_avg_margin
+            if monthly_average_cols.get('qty'):
+                ws.cell(row=total_row, column=monthly_average_cols['qty']).value = total_avg_qty
+            if monthly_average_cols.get('revenue'):
+                ws.cell(row=total_row, column=monthly_average_cols['revenue']).value = total_avg_revenue
+            if monthly_average_cols.get('cost'):
+                ws.cell(row=total_row, column=monthly_average_cols['cost']).value = total_avg_cost
+            if monthly_average_cols.get('profit'):
+                ws.cell(row=total_row, column=monthly_average_cols['profit']).value = total_avg_profit
+            if monthly_average_cols.get('margin'):
+                ws.cell(row=total_row, column=monthly_average_cols['margin']).value = total_avg_margin
 
             if month_cols:
                 month_totals = monthly_summary.groupby('MonthStr').agg(
@@ -10268,6 +12644,21 @@ class ReportGenerator:
                             self._safe_set_cell_value(ws, r, col, None)
 
         self._reorder_month_columns_desc(ws, header_row=1)
+        header_map = _refresh_header_map()
+
+        for header, col in header_map.items():
+            text = str(header or "").strip()
+            letter = get_column_letter(col)
+            is_annual_average = ("年" in text) and ("平均" in text or "均" in text)
+            keep_visible = ("毛利率" in text) or ("利润率" in text)
+            if is_annual_average:
+                ws.column_dimensions[letter].hidden = not keep_visible
+            elif text in monthly_average_headers.values():
+                ws.column_dimensions[letter].hidden = False
+
+        if total_row and total_row != 2:
+            if self._move_row_preserve(ws, total_row, 2):
+                total_row = 2
 
         # --- Pareto Chart Logic ---
         # 1. Extract Data
@@ -10350,6 +12741,8 @@ class ReportGenerator:
                 if not code or pd.isna(code):
                     continue
                 code = str(code).strip()
+                if code == "品目编码" or self._is_summary_or_footer_label(code):
+                    continue
                 month_map[code] = {
                     'qty_start': self._to_float(row.get(qty_start_col)),
                     'amt_start': self._to_float(row.get(amt_start_col)),
@@ -11261,7 +13654,13 @@ class ReportGenerator:
 
                 # 目标预算区环比公式应使用“上月日期匹配”，不能依赖 MATCH(...)-1。
                 old_mom_cells = []
-                for addr in ("F35", "F36", "F37", "F38", "F39", "F40", "F41", "F42", "F43"):
+                target_table_header = self._find_header_row_by_keyword(dash_ws, "指标", max_row=80)
+                if target_table_header:
+                    mom_rows = range(target_table_header + 1, min(dash_ws.max_row, target_table_header + 20) + 1)
+                else:
+                    mom_rows = range(35, min(dash_ws.max_row, 44) + 1)
+                for r in mom_rows:
+                    addr = f"F{r}"
                     val = dash_ws[addr].value
                     if not (isinstance(val, str) and val.startswith("=")):
                         continue
@@ -11310,6 +13709,45 @@ class ReportGenerator:
         """公开校验接口，供外部脚本调用。"""
         return self._validate_generated_report(report_path, target_year, target_month, year_scope)
 
+    def _apply_output_sheet_filter(self, wb, output_sheets=None):
+        """按输出表选择隐藏未勾选的 Sheet，返回被隐藏的 Sheet 名称。"""
+        if output_sheets is None:
+            return []
+
+        selected = []
+        seen = set()
+        for name in output_sheets:
+            text = str(name or "").strip()
+            if not text or text in seen:
+                continue
+            selected.append(text)
+            seen.add(text)
+        if not selected:
+            raise ValueError("至少需要选择一个输出表。")
+
+        selected_set = set(selected)
+        existing_selected = [name for name in wb.sheetnames if name in selected_set]
+        if not existing_selected:
+            raise ValueError("所选输出表在最终报告中不存在，请重新选择。")
+
+        hidden = []
+        for name in wb.sheetnames:
+            ws = wb[name]
+            if name in selected_set:
+                ws.sheet_state = "visible"
+            else:
+                ws.sheet_state = "hidden"
+                hidden.append(name)
+        if wb.active is None or wb.active.title not in selected_set:
+            wb.active = wb[existing_selected[0]]
+
+        missing = [name for name in selected if name not in existing_selected]
+        if missing:
+            print("以下勾选的输出表未在最终报告中生成，已忽略: " + ", ".join(missing))
+        if hidden:
+            print(f"已按输出表设置显示 {len(existing_selected)} 个 Sheet，隐藏 {len(hidden)} 个 Sheet。")
+        return hidden
+
     def generate_report(
         self,
         template_path,
@@ -11323,6 +13761,7 @@ class ReportGenerator:
         fail_on_validation_error=True,
         fail_on_data_quality_error=False,
         allow_generated_report_template=False,
+        output_sheets=None,
     ):
         print(f"\n正在根据模板 {template_path} 生成报告...")
         try:
@@ -11442,6 +13881,7 @@ class ReportGenerator:
             self._generate_extended_reports(wb, metrics_by_month_scoped, target_year, target_month)
             self._ensure_template_charts(wb, template_path)
             self._ensure_report_charts(wb)
+            self._repair_missing_chart_categories(wb)
             self._audit_chart_counts(wb)
             self._update_chart_titles(wb, target_year, target_month)
             self._update_dashboard_controls(wb, target_year, target_month, self.year_scope)
@@ -11482,6 +13922,11 @@ class ReportGenerator:
                 print("自动校验通过：关键指标与公式范围正常。")
                 self._log_audit("自动校验通过")
 
+            hidden_sheets = self._apply_output_sheet_filter(wb, output_sheets)
+            if hidden_sheets:
+                wb.save(output_path)
+                self._log_audit(f"按输出表设置隐藏 {len(hidden_sheets)} 个 Sheet")
+
             print(f"报告生成成功: {output_path}")
             self._log_audit(f"报告生成成功: {output_path}")
             return True
@@ -11504,6 +13949,7 @@ class ReportGenerator:
         fail_on_validation_error=True,
         fail_on_data_quality_error=False,
         allow_generated_report_template=False,
+        output_sheets=None,
     ):
         if months is None:
             months = [int(m[-2:]) for m in self.list_available_months() if m.startswith(f"{target_year}-")]
@@ -11523,6 +13969,7 @@ class ReportGenerator:
                 fail_on_validation_error=fail_on_validation_error,
                 fail_on_data_quality_error=fail_on_data_quality_error,
                 allow_generated_report_template=allow_generated_report_template,
+                output_sheets=output_sheets,
             )
             summary.append((month, output_path, "成功" if success else "失败"))
         summary_path = os.path.join(output_dir, f"批量生成摘要_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
@@ -11530,6 +13977,53 @@ class ReportGenerator:
             for month, path, status in summary:
                 f.write(f"{target_year}-{int(month):02d}\t{status}\t{path}\n")
         print(f"批量生成完成，摘要文件: {summary_path}")
+        return summary
+
+    def generate_continuous_batch_reports(
+        self,
+        template_path,
+        output_dir,
+        start_year,
+        start_month,
+        end_year,
+        end_month,
+        year_scope="current",
+        replenishment_params=None,
+        cashflow_params=None,
+        include_ai_placeholders=False,
+        fail_on_validation_error=True,
+        fail_on_data_quality_error=False,
+        allow_generated_report_template=False,
+        output_sheets=None,
+    ):
+        """按连续月份区间批量生成经营分析报告。"""
+        month_keys = self.build_month_range(start_year, start_month, end_year, end_month)
+        os.makedirs(output_dir, exist_ok=True)
+        summary = []
+        for month_key in month_keys:
+            year, month = month_key.split("-")
+            output_path = os.path.join(output_dir, f"{year}年{int(month):02d}月_经营分析报告.xlsx")
+            success = self.generate_report(
+                template_path,
+                output_path,
+                year,
+                month,
+                year_scope=year_scope,
+                replenishment_params=replenishment_params,
+                cashflow_params=cashflow_params,
+                include_ai_placeholders=include_ai_placeholders,
+                fail_on_validation_error=fail_on_validation_error,
+                fail_on_data_quality_error=fail_on_data_quality_error,
+                allow_generated_report_template=allow_generated_report_template,
+                output_sheets=output_sheets,
+            )
+            summary.append((month_key, output_path, "成功" if success else "失败"))
+
+        summary_path = os.path.join(output_dir, f"连续批量生成摘要_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            for month_key, path, status in summary:
+                f.write(f"{month_key}\t{status}\t{path}\n")
+        print(f"连续批量生成完成，摘要文件: {summary_path}")
         return summary
 
     def _update_all_sheet_titles(self, wb, year, month):
@@ -11623,7 +14117,7 @@ class ReportGenerator:
                 col2 = match.group(5)
                 if col1 != col2:
                     return match.group(0)
-                return f"{match.group(1)}{start_row}{match.group(4)}{end_row}"
+                return f"经营指标!${col1}${start_row}{match.group(4)}{end_row}"
 
             return range_pattern.sub(repl, str(formula))
 
@@ -11642,30 +14136,11 @@ class ReportGenerator:
                 if isinstance(cell.value, str) and cell.value.startswith('=') and '经营指标' in cell.value:
                     cell.value = update_metric_range(sanitize_formula(cell.value))
 
-        # 修复目标预算区“环比（上月）”公式：倒序月份下不能用 MATCH(...)-1。
-        if dash_ws.max_row >= 43 and dash_ws.max_column >= 6:
-            prev_month_expr = 'TEXT(DATE(LEFT($B$3,4),RIGHT($B$3,2),1)-1,"yyyy/mm")'
-            rev_prev = f"INDEX('经营指标'!$C:$C, MATCH({prev_month_expr}, '经营指标'!$A:$A, 0))"
-            net_prev = (
-                "INDEX('利润表'!$C:$N, MATCH(\"*净利润*\", '利润表'!$A:$A, 0), "
-                f"MATCH({prev_month_expr}, '利润表'!$C$1:$N$1, 0))"
-            )
-            cost_rate_prev = f"INDEX('经营指标'!$K:$K, MATCH({prev_month_expr}, '经营指标'!$A:$A, 0))"
-            sales_rate_prev = f"INDEX('经营指标'!$L:$L, MATCH({prev_month_expr}, '经营指标'!$A:$A, 0))"
-            admin_rate_prev = f"INDEX('经营指标'!$M:$M, MATCH({prev_month_expr}, '经营指标'!$A:$A, 0))"
-            ar_prev = f"INDEX('经营指标'!$H:$H, MATCH({prev_month_expr}, '经营指标'!$A:$A, 0))"
-            inv_prev = f"INDEX('经营指标'!$I:$I, MATCH({prev_month_expr}, '经营指标'!$A:$A, 0))"
-            days_prev = f"INDEX('经营指标'!$O:$O, MATCH({prev_month_expr}, '经营指标'!$A:$A, 0))"
-
-            dash_ws["F35"].value = f'=IFERROR(IF({rev_prev}=0,"",B35/{rev_prev}-1),"")'
-            dash_ws["F36"].value = f'=IFERROR(IF({net_prev}=0,"",B36/{net_prev}-1),"")'
-            dash_ws["F37"].value = f'=IFERROR(IF({rev_prev}=0,"",B37-({net_prev}/{rev_prev})),"")'
-            dash_ws["F38"].value = f'=IFERROR(B38-{cost_rate_prev},"")'
-            dash_ws["F39"].value = f'=IFERROR(B39-{sales_rate_prev},"")'
-            dash_ws["F40"].value = f'=IFERROR(B40-{admin_rate_prev},"")'
-            dash_ws["F41"].value = f'=IFERROR(IF({ar_prev}=0,"",B41/{ar_prev}-1),"")'
-            dash_ws["F42"].value = f'=IFERROR(IF({inv_prev}=0,"",B42/{inv_prev}-1),"")'
-            dash_ws["F43"].value = f'=IFERROR(B43-{days_prev},"")'
+        self._ensure_dashboard_financial_expense_rate(wb)
+        self._repair_dashboard_target_table_formulas(
+            dash_ws,
+            budget_header_row=self._dashboard_budget_header_row(wb),
+        )
 
     def _fill_profit_sheet(self, ws, target_year, target_month, year_scope=None):
         month_col_map = {} 

@@ -42,6 +42,8 @@ class ShippingDB:
             container_no TEXT,           -- 集装箱号
             file_name TEXT,              -- 来源 Excel 文件名
 
+            payment_rmb REAL,            -- 人民币货款
+            payment_usd REAL,            -- 美元货款
             tax_refund REAL,             -- 退税额(人民币)
             sea_freight_usd REAL,        -- 海运费(USD)
             all_in_rmb REAL,             -- 包干费(RMB)
@@ -60,6 +62,12 @@ class ShippingDB:
             c.execute("ALTER TABLE containers ADD COLUMN insurance_usd REAL")
         except sqlite3.OperationalError:
             pass
+
+        for column_name in ("payment_rmb", "payment_usd"):
+            try:
+                c.execute(f"ALTER TABLE containers ADD COLUMN {column_name} REAL")
+            except sqlite3.OperationalError:
+                pass
 
         # 产品明细表
         c.execute("""
@@ -278,6 +286,8 @@ class ShippingDB:
         解析费用
         """
         fees = {
+            "payment_rmb": None,
+            "payment_usd": None,
             "tax_refund": None,
             "sea_freight_usd": None,
             "all_in_rmb": None,
@@ -305,6 +315,59 @@ class ShippingDB:
                             if isinstance(v2, (int, float, np.number)) and not pd.isna(v2):
                                 return float(v2)
             return None
+
+        def find_payment_by_labels(labels, currency_markers=()):
+            normalized_labels = [re.sub(r"\s+", "", label).upper() for label in labels]
+            normalized_markers = [re.sub(r"\s+", "", marker).upper() for marker in currency_markers]
+
+            for col in cols:
+                norm_col = re.sub(r"\s+", "", str(col)).upper()
+                if "货款" not in norm_col:
+                    continue
+                if not any(label in norm_col for label in normalized_labels):
+                    continue
+                if normalized_markers and not any(marker in norm_col for marker in normalized_markers):
+                    continue
+                vals = pd.to_numeric(block_df[col], errors="coerce").dropna()
+                if not vals.empty:
+                    return float(vals.iloc[0])
+
+            for _, row in block_df.iterrows():
+                for col in cols:
+                    val = row[col]
+                    if not isinstance(val, str):
+                        continue
+
+                    norm_val = re.sub(r"\s+", "", val).upper()
+                    if not any(label in norm_val for label in normalized_labels):
+                        continue
+                    if normalized_markers and not any(marker in norm_val for marker in normalized_markers):
+                        continue
+
+                    start = cols.index(col) + 1
+                    for c2 in cols[start:]:
+                        v2 = row[c2]
+                        if isinstance(v2, (int, float, np.number)) and not pd.isna(v2):
+                            return float(v2)
+                    for c2 in cols:
+                        v2 = row[c2]
+                        if isinstance(v2, (int, float, np.number)) and not pd.isna(v2):
+                            return float(v2)
+            return None
+
+        fees["payment_rmb"] = find_payment_by_labels([
+            "人民币货款", "货款人民币", "RMB货款", "货款RMB",
+            "本币货款", "货款本币", "开票金额"
+        ])
+        if fees["payment_rmb"] is None:
+            fees["payment_rmb"] = find_payment_by_labels(["货款"], ["人民币", "RMB", "￥", "本币"])
+
+        fees["payment_usd"] = find_payment_by_labels([
+            "美元货款", "货款美元", "美金货款", "货款美金",
+            "USD货款", "货款USD", "报关总美金", "CFR价"
+        ])
+        if fees["payment_usd"] is None:
+            fees["payment_usd"] = find_payment_by_labels(["货款"], ["美元", "美金", "USD", "$"])
 
         fees["tax_refund"] = find_by_label("退税额")
 
@@ -367,11 +430,14 @@ class ShippingDB:
         c.execute("""
         INSERT INTO containers (
             shipment_code, container_no, file_name,
+            payment_rmb, payment_usd,
             tax_refund, sea_freight_usd, all_in_rmb,
             insurance_usd, exchange_rate, agency_fee_rmb,
             misc_rmb, misc_total_rmb
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(shipment_code, container_no) DO UPDATE SET
+            payment_rmb     = excluded.payment_rmb,
+            payment_usd     = excluded.payment_usd,
             tax_refund      = excluded.tax_refund,
             sea_freight_usd = excluded.sea_freight_usd,
             all_in_rmb      = excluded.all_in_rmb,
@@ -382,6 +448,7 @@ class ShippingDB:
             misc_total_rmb  = excluded.misc_total_rmb
         """, (
             shipment_code, container_no, file_name,
+            fees["payment_rmb"], fees["payment_usd"],
             fees["tax_refund"], fees["sea_freight_usd"], fees["all_in_rmb"],
             fees["insurance_usd"], fees["exchange_rate"], fees["agency_fee_rmb"],
             fees["misc_rmb"], fees["misc_total_rmb"]
@@ -416,6 +483,18 @@ class ShippingDB:
             SELECT tax_refund, sea_freight_usd, all_in_rmb,
                    insurance_usd, exchange_rate, agency_fee_rmb,
                    misc_rmb, misc_total_rmb
+            FROM containers
+            WHERE id=?
+        """, (container_id,))
+        row = c.fetchone()
+        if not row:
+            raise ValueError(f"货柜不存在: {container_id}")
+        return dict(row)
+
+    def get_container_payment(self, container_id: int) -> dict:
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT container_no, payment_rmb, payment_usd
             FROM containers
             WHERE id=?
         """, (container_id,))
@@ -742,8 +821,18 @@ class ShippingModule(ttk.Frame):
         self.container_drag_allowed = True
         self.product_last_cell = None
         self.container_last_cell = None
+        self.container_fee_copy_config = {
+            "tax_refund": ("退税额", "rmb"),
+            "sea_freight_usd": ("海运费", "usd"),
+            "all_in_rmb": ("包干费", "rmb"),
+            "insurance_usd": ("保费", "usd"),
+            "agency_fee_rmb": ("代理费", "rmb"),
+            "misc_rmb": ("其他杂费", "rmb"),
+            "misc_total_rmb": ("杂费汇总", "rmb"),
+        }
         self.product_export_format_var = tk.StringVar(value=get_active_export_format_name("shipping_product"))
         self.container_export_format_var = tk.StringVar(value=get_active_export_format_name("shipping_container"))
+        self.container_copy_status_var = tk.StringVar(value="")
         self.special_linkage_var = tk.BooleanVar(value=True) # 特殊品名联动
         self._load_filter_state()
         self._configure_tree_styles()
@@ -938,6 +1027,7 @@ class ShippingModule(ttk.Frame):
         ttk.Label(top_frame, text="货柜号:").pack(side="left")
         self.cont_keyword_var = tk.StringVar()
         ttk.Entry(top_frame, textvariable=self.cont_keyword_var, width=15).pack(side="left", padx=2)
+        ttk.Button(top_frame, text="复制货款", command=self.on_copy_container_payment).pack(side="left", padx=2)
         ttk.Button(top_frame, text="查询", command=self.refresh_container_table).pack(side="left", padx=5)
 
         ttk.Label(top_frame, text="|").pack(side="left", padx=5)
@@ -980,7 +1070,7 @@ class ShippingModule(ttk.Frame):
 
         for i, (key, text) in enumerate(labels):
             row = i // 4
-            col = (i % 4) * 2
+            col = (i % 4) * 3
             ttk.Label(grid_frame, text=text + ":").grid(row=row, column=col, sticky="e", padx=4, pady=5)
             
             var = tk.DoubleVar()
@@ -993,6 +1083,13 @@ class ShippingModule(ttk.Frame):
                 entry = ttk.Entry(grid_frame, textvariable=var, width=12)
             
             entry.grid(row=row, column=col + 1, sticky="w", padx=4, pady=5)
+            if key in self.container_fee_copy_config:
+                ttk.Button(
+                    grid_frame,
+                    text="复制",
+                    width=5,
+                    command=lambda field_key=key: self.on_copy_container_fee(field_key)
+                ).grid(row=row, column=col + 2, sticky="w", padx=(0, 8), pady=5)
 
         # 功能按钮区
         btn_frame = ttk.Frame(info_frame)
@@ -1001,6 +1098,7 @@ class ShippingModule(ttk.Frame):
         ttk.Button(btn_frame, text="保存修改并汇总", command=self.on_save_container_fees).pack(side="left", padx=20)
         ttk.Button(btn_frame, text=">> 执行分摊 (到产品) <<", command=self.on_allocate_click).pack(side="left", padx=20)
         ttk.Label(btn_frame, text="提示：分摊将根据产品体积占比，将【杂费汇总】分配到各产品的【分摊费用】字段").pack(side="left", padx=10)
+        ttk.Label(btn_frame, textvariable=self.container_copy_status_var, foreground="green").pack(side="left", padx=10)
 
         # 货柜表格
         table_frame = ttk.Frame(frame)
@@ -1268,6 +1366,131 @@ class ShippingModule(ttk.Frame):
             except Exception as e:
                 self.log(f"Error setting container info var {k}: {e}")
                 var.set(0.0)
+
+    def _get_active_container_row_data(self):
+        item_id = self._get_active_tree_item(self.container_tree, self.container_last_cell)
+        vals = self.tree_item_values(self.container_tree, item_id)
+        if not vals or str(vals[0]) == "汇总":
+            return None
+        return dict(zip(self.container_tree["columns"], vals))
+
+    @staticmethod
+    def _format_copy_amount(value):
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return "0"
+        if not math.isfinite(amount):
+            return "0"
+        if abs(amount) < 0.005:
+            amount = 0.0
+        return f"{amount:.2f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _format_copy_rate(value):
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return "0"
+        if not math.isfinite(rate):
+            return "0"
+        return f"{rate:.6f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _has_copy_amount(value):
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(amount) and abs(amount) >= 0.005
+
+    def _get_container_info_amount(self, field_key, label):
+        try:
+            return float(self.container_info_vars[field_key].get())
+        except (tk.TclError, TypeError, ValueError):
+            raise ValueError(f"{label} 必须是数字")
+
+    def _build_container_fee_copy_text(self, field_key):
+        config = self.container_fee_copy_config.get(field_key)
+        if not config:
+            raise ValueError("该字段不支持复制")
+
+        row_data = self._get_active_container_row_data()
+        if not row_data:
+            raise ValueError("请先选择一个货柜")
+
+        label, currency = config
+        container_no = str(row_data.get("container_no") or "").strip()
+        if not container_no or container_no == "None":
+            container_no = "未填货柜号"
+
+        amount = self._get_container_info_amount(field_key, label)
+        amount_text = self._format_copy_amount(amount)
+        if currency == "usd":
+            rate = self._get_container_info_amount("exchange_rate", "汇率")
+            if rate <= 0 and amount != 0:
+                raise ValueError("请先填写有效汇率")
+            rate_text = self._format_copy_rate(rate)
+            rmb_text = self._format_copy_amount(amount * rate)
+            return f"{container_no}货柜，{label}{amount_text}美元，汇率为{rate_text}，换算人民币{rmb_text}元"
+
+        return f"{container_no}货柜，{label}{amount_text}元"
+
+    def _build_container_payment_copy_text(self):
+        cid = self.get_selected_container_id()
+        if not cid:
+            raise ValueError("请先选择一个货柜")
+
+        payment = self.db.get_container_payment(cid)
+        container_no = str(payment.get("container_no") or "").strip()
+        if not container_no or container_no == "None":
+            container_no = "未填货柜号"
+
+        parts = []
+        payment_rmb = payment.get("payment_rmb")
+        payment_usd = payment.get("payment_usd")
+        if self._has_copy_amount(payment_rmb):
+            parts.append(f"{self._format_copy_amount(payment_rmb)}人民币")
+        if self._has_copy_amount(payment_usd):
+            parts.append(f"{self._format_copy_amount(payment_usd)}美元")
+        if not parts:
+            raise ValueError("当前货柜没有识别到货款金额")
+
+        return f"{container_no}货柜，{'/'.join(parts)}货款"
+
+    def on_copy_container_payment(self):
+        try:
+            copy_text = self._build_container_payment_copy_text()
+        except ValueError as exc:
+            messagebox.showwarning("复制失败", str(exc))
+            return
+
+        self.clipboard_clear()
+        self.clipboard_append(copy_text)
+        self.update()
+        status_text = f"已复制：{copy_text}"
+        self.container_copy_status_var.set(status_text)
+        self.after(5000, lambda text=status_text: self._clear_container_copy_status(text))
+        self.log(f"已复制货柜货款描述: {copy_text}")
+
+    def on_copy_container_fee(self, field_key):
+        try:
+            copy_text = self._build_container_fee_copy_text(field_key)
+        except ValueError as exc:
+            messagebox.showwarning("复制失败", str(exc))
+            return
+
+        self.clipboard_clear()
+        self.clipboard_append(copy_text)
+        self.update()
+        status_text = f"已复制：{copy_text}"
+        self.container_copy_status_var.set(status_text)
+        self.after(5000, lambda text=status_text: self._clear_container_copy_status(text))
+        self.log(f"已复制货柜费用描述: {copy_text}")
+
+    def _clear_container_copy_status(self, expected_text):
+        if self.container_copy_status_var.get() == expected_text:
+            self.container_copy_status_var.set("")
 
     def on_product_cell_double_click(self, event):
         # 获取点击的单元格

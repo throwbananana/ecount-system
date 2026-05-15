@@ -27,6 +27,7 @@ import re
 import json
 import hashlib
 import threading
+import queue
 from types import SimpleNamespace
 from datetime import datetime, date, timedelta
 from decimal import Decimal, InvalidOperation
@@ -177,6 +178,7 @@ def resolve_template_path(template_path=TEMPLATE_FILE):
 
 
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+REPORT_SHEET_FORMATS_KEY = "REPORT_SHEET_OUTPUT_FORMATS"
 
 # ======== 默认字段规则（兜底用） ========
 DEFAULT_FIELD_RULES = {
@@ -308,6 +310,22 @@ def save_header_schemes(schemes: dict):
         except Exception:
             config = {}
     config["HEADER_SCHEMES"] = schemes
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, ensure_ascii=False, indent=4)
+
+
+def _load_app_config_dict():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_app_config_dict(config):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
 
@@ -657,6 +675,10 @@ def safe_eval_expr(expr: str, env: Dict[str, Any]):
 class ExcelConverterGUI:
     def __init__(self, root):
         self.root = root
+        self._ui_thread_id = threading.get_ident()
+        self._report_task_queue = None
+        self._report_task_running = False
+        self._report_task_buttons = []
         self.root.title("一般凭证 Excel 格式转换工具（含自动识别列匹配）")
 
         self.template_headers = []
@@ -11420,24 +11442,90 @@ class ExcelConverterGUI:
         self.report_month_cb.grid(row=2, column=3, sticky="w", padx=5)
         ttk.Label(top_frame, text="月").grid(row=2, column=4, sticky="w")
 
-        ttk.Label(top_frame, text="年份显示:").grid(row=3, column=0, sticky="e", pady=5)
+        ttk.Label(top_frame, text="批量范围:").grid(row=3, column=0, sticky="e", pady=5)
+        batch_range_frame = ttk.Frame(top_frame)
+        batch_range_frame.grid(row=3, column=1, columnspan=4, sticky="w", padx=5)
+        year_values = [str(y) for y in range(current_year-2, current_year+3)]
+        month_values = [str(m) for m in range(1, 13)]
+        self.report_batch_start_year_var = tk.StringVar(value=str(current_year))
+        self.report_batch_start_month_var = tk.StringVar(value=str(current_month))
+        self.report_batch_end_year_var = tk.StringVar(value=str(current_year))
+        self.report_batch_end_month_var = tk.StringVar(value=str(current_month))
+        self.report_batch_start_year_cb = ttk.Combobox(
+            batch_range_frame,
+            textvariable=self.report_batch_start_year_var,
+            values=year_values,
+            width=6,
+            state="normal",
+        )
+        self.report_batch_start_year_cb.pack(side="left")
+        ttk.Label(batch_range_frame, text="年").pack(side="left", padx=(2, 0))
+        self.report_batch_start_month_cb = ttk.Combobox(
+            batch_range_frame,
+            textvariable=self.report_batch_start_month_var,
+            values=month_values,
+            width=4,
+            state="normal",
+        )
+        self.report_batch_start_month_cb.pack(side="left", padx=(4, 0))
+        ttk.Label(batch_range_frame, text="月  至").pack(side="left", padx=(2, 6))
+        self.report_batch_end_year_cb = ttk.Combobox(
+            batch_range_frame,
+            textvariable=self.report_batch_end_year_var,
+            values=year_values,
+            width=6,
+            state="normal",
+        )
+        self.report_batch_end_year_cb.pack(side="left")
+        ttk.Label(batch_range_frame, text="年").pack(side="left", padx=(2, 0))
+        self.report_batch_end_month_cb = ttk.Combobox(
+            batch_range_frame,
+            textvariable=self.report_batch_end_month_var,
+            values=month_values,
+            width=4,
+            state="normal",
+        )
+        self.report_batch_end_month_cb.pack(side="left", padx=(4, 0))
+        ttk.Label(batch_range_frame, text="月").pack(side="left", padx=(2, 0))
+
+        ttk.Label(top_frame, text="年份显示:").grid(row=4, column=0, sticky="e", pady=5)
         scope_values = ["仅当前年份", "显示历年"]
         self.report_year_scope_var = tk.StringVar(value=scope_values[0])
         scope_cb = ttk.Combobox(top_frame, textvariable=self.report_year_scope_var, values=scope_values, width=12, state="readonly")
-        scope_cb.grid(row=3, column=1, columnspan=3, sticky="w", padx=5)
+        scope_cb.grid(row=4, column=1, columnspan=3, sticky="w", padx=5)
 
         self.report_ai_analysis_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             top_frame,
             text="生成后AI分析并写入表格",
             variable=self.report_ai_analysis_var,
-        ).grid(row=4, column=1, columnspan=3, sticky="w", padx=5, pady=5)
+        ).grid(row=5, column=1, columnspan=3, sticky="w", padx=5, pady=5)
         self.report_ai_chart_recognition_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             top_frame,
             text="AI模式启用图表识别",
             variable=self.report_ai_chart_recognition_var,
-        ).grid(row=5, column=1, columnspan=3, sticky="w", padx=5, pady=2)
+        ).grid(row=6, column=1, columnspan=3, sticky="w", padx=5, pady=2)
+
+        ttk.Label(top_frame, text="输出表:").grid(row=7, column=0, sticky="e", pady=5)
+        sheet_frame = ttk.Frame(top_frame)
+        sheet_frame.grid(row=7, column=1, columnspan=4, sticky="w", padx=5)
+        self.report_selected_sheets = None
+        self.report_sheet_selection_label_var = tk.StringVar(value="全部")
+        self.report_sheet_format_var = tk.StringVar(value="")
+        self.report_sheet_format_combo = ttk.Combobox(
+            sheet_frame,
+            textvariable=self.report_sheet_format_var,
+            width=16,
+            state="readonly",
+        )
+        self.report_sheet_format_combo.pack(side="left")
+        self.report_sheet_format_combo.bind("<<ComboboxSelected>>", self._on_report_sheet_format_changed)
+        ttk.Button(sheet_frame, text="选择输出表...", command=self._open_report_sheet_selection_dialog, width=16).pack(side="left")
+        ttk.Button(sheet_frame, text="保存格式", command=self._save_report_sheet_format, width=10).pack(side="left", padx=(6, 0))
+        ttk.Button(sheet_frame, text="删除格式", command=self._delete_report_sheet_format, width=10).pack(side="left", padx=(6, 0))
+        ttk.Label(sheet_frame, textvariable=self.report_sheet_selection_label_var, foreground="#666666").pack(side="left", padx=8)
+        self._refresh_report_sheet_format_options()
 
         top_frame.columnconfigure(1, weight=0)
         top_frame.columnconfigure(2, weight=0)
@@ -11514,8 +11602,31 @@ class ExcelConverterGUI:
         btn_frame = ttk.Frame(report_frame, padding=10)
         btn_frame.pack(fill="x")
 
-        ttk.Button(btn_frame, text="开始生成报告", command=self._generate_business_report, width=20).pack(side="left", padx=10)
-        ttk.Button(btn_frame, text="生成并转入凭证转换", command=lambda: self._generate_business_report(True), width=22).pack(side="left", padx=10)
+        self._report_task_buttons = []
+        btn = ttk.Button(btn_frame, text="开始生成报告", command=self._generate_business_report, width=20)
+        btn.pack(side="left", padx=10)
+        self._report_task_buttons.append(btn)
+        btn = ttk.Button(btn_frame, text="生成并转入凭证转换", command=lambda: self._generate_business_report(True), width=22)
+        btn.pack(side="left", padx=10)
+        self._report_task_buttons.append(btn)
+        btn = ttk.Button(btn_frame, text="批量生成连续月份", command=self._generate_business_report_batch, width=22)
+        btn.pack(side="left", padx=10)
+        self._report_task_buttons.append(btn)
+        btn = ttk.Button(btn_frame, text="数据检视和整理", command=self._inspect_and_clean_report_data, width=18)
+        btn.pack(side="left", padx=10)
+        self._report_task_buttons.append(btn)
+
+        progress_frame = ttk.Frame(report_frame, padding=(10, 0, 10, 0))
+        progress_frame.pack(fill="x")
+        self.report_progress_var = tk.DoubleVar(value=0)
+        self.report_progress_text_var = tk.StringVar(value="待生成")
+        ttk.Progressbar(
+            progress_frame,
+            variable=self.report_progress_var,
+            maximum=100,
+            mode="determinate",
+        ).pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ttk.Label(progress_frame, textvariable=self.report_progress_text_var, width=38).pack(side="left")
 
         # Bottom: Log (Using a separate log for this tab or shared? Separate is better for context)
         log_frame = ttk.LabelFrame(report_frame, text="生成日志", padding=10)
@@ -11568,6 +11679,21 @@ class ExcelConverterGUI:
                 year_values.append(current_year_value)
         self.report_year_cb["values"] = year_values
 
+        for cb_name, var_name in [
+            ("report_batch_start_year_cb", "report_batch_start_year_var"),
+            ("report_batch_end_year_cb", "report_batch_end_year_var"),
+        ]:
+            cb = getattr(self, cb_name, None)
+            var = getattr(self, var_name, None)
+            if cb is None or var is None:
+                continue
+            batch_year_values = list(year_values)
+            current_batch_year = var.get().strip()
+            if current_batch_year and current_batch_year not in batch_year_values:
+                if current_batch_year.isdigit() and len(current_batch_year) == 4:
+                    batch_year_values.append(current_batch_year)
+            cb["values"] = batch_year_values
+
         if not current_year_value and year_values:
             self.report_year_var.set(year_values[-1])
 
@@ -11617,11 +11743,347 @@ class ExcelConverterGUI:
         if not current_month_value and month_values:
             self.report_month_var.set(month_values[-1])
 
-    def _log_report(self, msg):
+    def _is_ui_thread(self):
+        return threading.get_ident() == getattr(self, "_ui_thread_id", None)
+
+    def _append_report_log(self, msg):
         ts = datetime.now().strftime("%H:%M:%S")
         self.report_log_text.insert("end", f"[{ts}] {msg}\n")
         self.report_log_text.see("end")
         self.root.update_idletasks()
+
+    def _queue_report_event(self, kind, *args):
+        task_queue = getattr(self, "_report_task_queue", None)
+        if task_queue is not None:
+            task_queue.put((kind, args))
+            return True
+        return False
+
+    def _log_report(self, msg):
+        if not self._is_ui_thread() and self._queue_report_event("log", msg):
+            return
+        self._append_report_log(msg)
+
+    def _set_report_progress(self, current=0, total=100, message=""):
+        if not self._is_ui_thread() and self._queue_report_event("progress", current, total, message):
+            return
+        try:
+            total = float(total or 100)
+            current = float(current or 0)
+            percent = 0 if total <= 0 else max(0, min(100, current / total * 100))
+            if hasattr(self, "report_progress_var"):
+                self.report_progress_var.set(percent)
+            if hasattr(self, "report_progress_text_var"):
+                text = message or f"{percent:.0f}%"
+                self.report_progress_text_var.set(text)
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+    def _set_report_task_buttons_state(self, state):
+        for btn in getattr(self, "_report_task_buttons", []):
+            try:
+                btn.configure(state=state)
+            except Exception:
+                pass
+
+    def _report_show_message(self, kind, title, message):
+        if not self._is_ui_thread():
+            self._queue_report_event("message", kind, title, message)
+            return
+        if kind == "error":
+            messagebox.showerror(title, message)
+        elif kind == "warning":
+            messagebox.showwarning(title, message)
+        else:
+            messagebox.showinfo(title, message)
+
+    def _report_askyesno(self, title, message):
+        if self._is_ui_thread():
+            return messagebox.askyesno(title, message)
+        task_queue = getattr(self, "_report_task_queue", None)
+        if task_queue is None:
+            return False
+        event = threading.Event()
+        holder = {"result": False}
+        task_queue.put(("askyesno", (title, message, holder, event)))
+        event.wait()
+        return bool(holder.get("result"))
+
+    def _report_call_main(self, func_name, *args, wait=True, **kwargs):
+        if self._is_ui_thread():
+            return getattr(self, func_name)(*args, **kwargs)
+        task_queue = getattr(self, "_report_task_queue", None)
+        if task_queue is None:
+            return None
+        event = threading.Event()
+        holder = {"result": None, "error": None}
+        task_queue.put(("call", (func_name, args, kwargs, holder, event)))
+        if not wait:
+            return None
+        event.wait()
+        if holder.get("error"):
+            raise holder["error"]
+        return holder.get("result")
+
+    def _poll_report_task_queue(self):
+        task_queue = getattr(self, "_report_task_queue", None)
+        if task_queue is None:
+            return
+        keep_polling = True
+        try:
+            while True:
+                kind, args = task_queue.get_nowait()
+                if kind == "log":
+                    self._append_report_log(args[0])
+                elif kind == "progress":
+                    current, total, message = args
+                    self._set_report_progress(current, total, message)
+                elif kind == "message":
+                    msg_kind, title, message = args
+                    self._report_show_message(msg_kind, title, message)
+                elif kind == "askyesno":
+                    title, message, holder, event = args
+                    try:
+                        holder["result"] = messagebox.askyesno(title, message)
+                    finally:
+                        event.set()
+                elif kind == "call":
+                    func_name, call_args, call_kwargs, holder, event = args
+                    try:
+                        holder["result"] = getattr(self, func_name)(*call_args, **call_kwargs)
+                    except Exception as exc:
+                        holder["error"] = exc
+                    finally:
+                        event.set()
+                elif kind == "done":
+                    keep_polling = False
+                    self._report_task_running = False
+                    self._set_report_task_buttons_state("normal")
+                    self._report_task_queue = None
+        except queue.Empty:
+            pass
+        if keep_polling and getattr(self, "_report_task_queue", None) is not None:
+            self.root.after(100, self._poll_report_task_queue)
+
+    def _start_report_background_task(self, task_name, worker):
+        if getattr(self, "_report_task_running", False):
+            messagebox.showwarning("提示", "已有报告任务正在运行，请等待当前任务完成。")
+            return
+        self._report_task_queue = queue.Queue()
+        self._report_task_running = True
+        self._set_report_task_buttons_state("disabled")
+
+        def _runner():
+            try:
+                worker()
+            except Exception as exc:
+                import traceback
+                self._log_report(f"{task_name}异常: {exc}")
+                self._log_report(traceback.format_exc())
+                self._report_show_message("error", "错误", f"{task_name}异常:\n{exc}")
+            finally:
+                task_queue = getattr(self, "_report_task_queue", None)
+                if task_queue is not None:
+                    task_queue.put(("done", (task_name,)))
+
+        threading.Thread(target=_runner, daemon=True).start()
+        self.root.after(100, self._poll_report_task_queue)
+
+    def _inspect_and_clean_report_data(self):
+        if not ReportGenerator:
+            messagebox.showerror("错误", "ReportGenerator 模块加载失败，请检查 report_generator.py")
+            return
+
+        base_dir = resolve_resource_dir(
+            self.report_base_dir_var.get().strip(),
+            REPORT_BASE_DIR_NAME,
+        )
+        self.report_base_dir_var.set(base_dir)
+        if not os.path.exists(base_dir):
+            messagebox.showwarning("提示", f"基础资料目录不存在: {base_dir}")
+            return
+
+        try:
+            self._set_report_progress(0, 1, "正在检视数据")
+            self._log_report("开始检视基础资料目录...")
+            generator = ReportGenerator(base_dir)
+            inspection = generator.inspect_data_folder()
+            summary = generator.format_data_folder_inspection(inspection, max_items=80)
+            self._log_report(summary)
+            self._set_report_progress(1, 1, "数据检视完成")
+
+            if inspection.get("error"):
+                messagebox.showerror("数据检视失败", inspection["error"])
+                return
+            self._show_report_data_inspection_dialog(generator, inspection, summary)
+        except Exception as exc:
+            self._set_report_progress(0, 1, "数据检视失败")
+            self._log_report(f"数据检视失败: {exc}")
+            messagebox.showerror("错误", f"数据检视失败:\n{exc}")
+
+    def _show_report_data_inspection_dialog(self, generator, inspection, summary):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("数据检视和整理")
+        dialog.geometry("980x680")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        main = ttk.Frame(dialog, padding=10)
+        main.pack(fill="both", expand=True)
+
+        summary_box = scrolledtext.ScrolledText(main, height=10, wrap="word")
+        summary_box.pack(fill="x", expand=False)
+        summary_box.insert("1.0", summary or "")
+        summary_box.configure(state="disabled")
+
+        notebook = ttk.Notebook(main)
+        notebook.pack(fill="both", expand=True, pady=(10, 0))
+
+        def _add_tree(parent, columns, widths):
+            frame = ttk.Frame(parent)
+            frame.pack(fill="both", expand=True)
+            column_ids = [col for col, _ in columns]
+            tree = ttk.Treeview(frame, columns=column_ids, show="headings", selectmode="extended")
+            y_scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            x_scroll = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+            tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+            tree.grid(row=0, column=0, sticky="nsew")
+            y_scroll.grid(row=0, column=1, sticky="ns")
+            x_scroll.grid(row=1, column=0, sticky="ew")
+            frame.rowconfigure(0, weight=1)
+            frame.columnconfigure(0, weight=1)
+            for col, title in columns:
+                tree.heading(col, text=title)
+                tree.column(col, width=widths.get(col, 120), anchor="w", stretch=True)
+            return tree
+
+        dup_frame = ttk.Frame(notebook, padding=6)
+        notebook.add(dup_frame, text=f"重复数据({len(inspection.get('duplicates') or [])})")
+        dup_tree = _add_tree(
+            dup_frame,
+            [("category", "类型"), ("period", "月份"), ("latest", "最新文件"), ("files", "重复文件")],
+            {"category": 110, "period": 90, "latest": 260, "files": 520},
+        )
+        for item in inspection.get("duplicates") or []:
+            files = "；".join(meta.get("filename", "") for meta in item.get("files", []))
+            latest = (item.get("latest") or {}).get("filename", "")
+            dup_tree.insert("", "end", values=(item.get("category_label", ""), item.get("period", ""), latest, files))
+
+        missing_frame = ttk.Frame(notebook, padding=6)
+        notebook.add(missing_frame, text=f"缺失数据({len(inspection.get('missing') or [])})")
+        missing_tree = _add_tree(
+            missing_frame,
+            [("period", "月份"), ("missing", "缺少数据")],
+            {"period": 100, "missing": 760},
+        )
+        for item in inspection.get("missing") or []:
+            missing_tree.insert("", "end", values=(item.get("period", ""), "、".join(item.get("missing_labels") or [])))
+
+        candidate_frame = ttk.Frame(notebook, padding=6)
+        notebook.add(candidate_frame, text=f"旧文件候选({len(inspection.get('cleanup_candidates') or [])})")
+        candidate_tree = _add_tree(
+            candidate_frame,
+            [("category", "类型"), ("periods", "重复月份"), ("mtime", "修改时间"), ("filename", "文件名"), ("reason", "判断")],
+            {"category": 110, "periods": 150, "mtime": 160, "filename": 330, "reason": 180},
+        )
+        candidate_paths = {}
+        for item in inspection.get("cleanup_candidates") or []:
+            periods = ",".join(item.get("superseded_periods") or item.get("periods") or [])
+            tree_id = candidate_tree.insert(
+                "",
+                "end",
+                values=(
+                    item.get("category_label", ""),
+                    periods,
+                    item.get("mtime_text", ""),
+                    item.get("filename", ""),
+                    item.get("reason", ""),
+                ),
+            )
+            candidate_paths[tree_id] = item.get("path")
+        if candidate_tree.get_children():
+            candidate_tree.selection_set(candidate_tree.get_children())
+
+        other_frame = ttk.Frame(notebook, padding=6)
+        notebook.add(other_frame, text="其他")
+        other_tree = _add_tree(
+            other_frame,
+            [("kind", "类型"), ("filename", "文件名"), ("detail", "说明")],
+            {"kind": 120, "filename": 340, "detail": 500},
+        )
+        for item in inspection.get("manual_review") or []:
+            detail = (
+                f"重复月份: {','.join(item.get('superseded_periods') or [])}; "
+                f"仍需保留月份: {','.join(item.get('blocking_periods') or [])}"
+            )
+            other_tree.insert("", "end", values=("部分重叠", item.get("filename", ""), detail))
+        for item in inspection.get("unclassified") or []:
+            other_tree.insert("", "end", values=("未识别", item.get("filename", ""), "无法识别数据类型"))
+        for item in inspection.get("unreadable") or []:
+            other_tree.insert("", "end", values=("读取异常", item.get("filename", ""), item.get("error", "")))
+
+        action_frame = ttk.Frame(main)
+        action_frame.pack(fill="x", pady=(10, 0))
+
+        def select_all_candidates():
+            candidate_tree.selection_set(candidate_tree.get_children())
+
+        def clear_candidate_selection():
+            candidate_tree.selection_remove(candidate_tree.selection())
+
+        def delete_selected_candidates():
+            selected = list(candidate_tree.selection())
+            paths = [candidate_paths.get(item) for item in selected if candidate_paths.get(item)]
+            if not paths:
+                messagebox.showwarning("提示", "请先选择要删除的旧数据文件。", parent=dialog)
+                return
+
+            preview = "\n".join(os.path.basename(path) for path in paths[:20])
+            if len(paths) > 20:
+                preview += f"\n... 还有 {len(paths) - 20} 个文件"
+            confirm_msg = (
+                f"将删除选中的 {len(paths)} 个旧数据文件。\n\n"
+                f"{preview}\n\n"
+                "此操作不可恢复，是否继续？"
+            )
+            if not messagebox.askyesno("确认删除旧数据", confirm_msg, parent=dialog):
+                return
+
+            result = generator.delete_data_files(paths)
+            deleted = set(os.path.abspath(path) for path in result.get("deleted", []))
+            for item in selected:
+                path = candidate_paths.get(item)
+                if path and os.path.abspath(path) in deleted:
+                    candidate_tree.delete(item)
+                    candidate_paths.pop(item, None)
+
+            deleted_count = len(result.get("deleted", []))
+            failed = result.get("failed", [])
+            self._log_report(f"数据整理完成: 删除旧文件 {deleted_count} 个，失败 {len(failed)} 个。")
+            for path in result.get("deleted", []):
+                self._log_report(f"已删除旧数据: {os.path.basename(path)}")
+            for item in failed:
+                self._log_report(f"删除失败: {os.path.basename(str(item.get('path')))} - {item.get('error')}")
+
+            self._report_years_dir = None
+            self._refresh_report_year_options()
+            self._set_report_progress(1, 1, f"数据整理完成: 删除{deleted_count}个")
+
+            msg = f"已删除 {deleted_count} 个旧数据文件。"
+            if failed:
+                msg += f"\n失败 {len(failed)} 个，详情见生成日志。"
+            messagebox.showinfo("数据整理完成", msg, parent=dialog)
+
+        def rerun_inspection():
+            dialog.destroy()
+            self._inspect_and_clean_report_data()
+
+        ttk.Button(action_frame, text="全选旧文件", command=select_all_candidates, width=12).pack(side="left")
+        ttk.Button(action_frame, text="取消选择", command=clear_candidate_selection, width=12).pack(side="left", padx=(8, 0))
+        ttk.Button(action_frame, text="删除选中旧数据", command=delete_selected_candidates, width=16).pack(side="left", padx=(8, 0))
+        ttk.Button(action_frame, text="重新检视", command=rerun_inspection, width=12).pack(side="right", padx=(8, 0))
+        ttk.Button(action_frame, text="关闭", command=dialog.destroy, width=10).pack(side="right")
 
     def _toggle_report_warning_param_inputs(self):
         manual_var = getattr(self, "report_warning_manual_var", None)
@@ -11631,6 +12093,1057 @@ class ExcelConverterGUI:
                 entry.configure(state=state)
             except Exception:
                 pass
+
+    def _load_report_sheet_formats(self):
+        config = _load_app_config_dict()
+        data = config.get(REPORT_SHEET_FORMATS_KEY, {})
+        if not isinstance(data, dict):
+            data = {}
+        formats = data.get("formats", {})
+        if not isinstance(formats, dict):
+            formats = {}
+        clean_formats = {}
+        for name, sheets in formats.items():
+            name = str(name or "").strip()
+            if not name:
+                continue
+            if isinstance(sheets, list):
+                clean_formats[name] = [str(s).strip() for s in sheets if str(s).strip()]
+        return {
+            "active": str(data.get("active") or "").strip(),
+            "formats": clean_formats,
+        }
+
+    def _save_report_sheet_formats(self, data):
+        config = _load_app_config_dict()
+        config[REPORT_SHEET_FORMATS_KEY] = data
+        _save_app_config_dict(config)
+
+    def _refresh_report_sheet_format_options(self):
+        data = self._load_report_sheet_formats()
+        names = sorted(data.get("formats", {}).keys())
+        if hasattr(self, "report_sheet_format_combo"):
+            self.report_sheet_format_combo["values"] = ["全部"] + names
+
+        active = data.get("active") or ""
+        if active in data.get("formats", {}):
+            self.report_sheet_format_var.set(active)
+            self.report_selected_sheets = list(data["formats"][active])
+        else:
+            self.report_sheet_format_var.set("全部")
+            self.report_selected_sheets = None
+        self._update_report_sheet_selection_label()
+
+    def _on_report_sheet_format_changed(self, event=None):
+        name = self.report_sheet_format_var.get().strip()
+        data = self._load_report_sheet_formats()
+        if not name or name == "全部":
+            self.report_selected_sheets = None
+            data["active"] = ""
+            self._save_report_sheet_formats(data)
+            self._update_report_sheet_selection_label()
+            return
+        sheets = data.get("formats", {}).get(name)
+        if not sheets:
+            messagebox.showwarning("提示", f"输出格式不存在: {name}")
+            self._refresh_report_sheet_format_options()
+            return
+        self.report_selected_sheets = list(sheets)
+        data["active"] = name
+        self._save_report_sheet_formats(data)
+        self._update_report_sheet_selection_label()
+
+    def _save_report_sheet_format(self):
+        candidates = self._get_report_output_sheet_candidates()
+        selected = self._get_report_output_sheets()
+        sheets = list(candidates) if selected is None else [s for s in selected if s in candidates]
+        if not sheets:
+            messagebox.showwarning("提示", "至少需要选择一个输出表后才能保存格式。")
+            return
+
+        current = self.report_sheet_format_var.get().strip()
+        initial = current if current not in ("", "全部", "自定义") else ""
+        name = simpledialog.askstring("保存输出格式", "请输入格式名称:", initialvalue=initial, parent=self.root)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showwarning("提示", "格式名称不能为空。")
+            return
+
+        data = self._load_report_sheet_formats()
+        formats = data.setdefault("formats", {})
+        if name in formats and not messagebox.askyesno("确认覆盖", f"输出格式“{name}”已存在，是否覆盖？"):
+            return
+        formats[name] = sheets
+        data["active"] = name
+        self._save_report_sheet_formats(data)
+        self.report_selected_sheets = list(sheets)
+        self.report_sheet_format_var.set(name)
+        self._refresh_report_sheet_format_options()
+        messagebox.showinfo("成功", f"输出格式已保存：{name}")
+
+    def _delete_report_sheet_format(self):
+        name = self.report_sheet_format_var.get().strip()
+        if not name or name in ("全部", "自定义"):
+            messagebox.showwarning("提示", "请选择需要删除的输出格式。")
+            return
+        data = self._load_report_sheet_formats()
+        formats = data.setdefault("formats", {})
+        if name not in formats:
+            messagebox.showwarning("提示", f"输出格式不存在: {name}")
+            self._refresh_report_sheet_format_options()
+            return
+        if not messagebox.askyesno("确认删除", f"确定删除输出格式“{name}”？"):
+            return
+        formats.pop(name, None)
+        if data.get("active") == name:
+            data["active"] = ""
+        self._save_report_sheet_formats(data)
+        self._refresh_report_sheet_format_options()
+        messagebox.showinfo("完成", f"已删除输出格式：{name}")
+
+    def _get_report_output_sheet_candidates(self):
+        template_path = resolve_resource_file(
+            self.report_template_var.get(),
+            DEFAULT_REPORT_TEMPLATE_FILE,
+        )
+        names = []
+        if template_path and os.path.exists(template_path):
+            wb = None
+            try:
+                wb = load_workbook(template_path, read_only=True, data_only=False)
+                names = list(wb.sheetnames)
+            except Exception as exc:
+                messagebox.showwarning("提示", f"读取模板 Sheet 失败：\n{exc}")
+            finally:
+                try:
+                    if wb is not None:
+                        wb.close()
+                except Exception:
+                    pass
+
+        generated_names = [
+            "管理者解读",
+            "数据质量检查",
+            "审计日志",
+            "仪表盘",
+            "现金流量表(估算)",
+            "应付账款分析",
+            "货币资金分析",
+            "预算执行与偏差",
+            "产品贡献毛利",
+            "品类贡献毛利",
+            "客户贡献与回款",
+            "渠道贡献",
+            "存货健康度",
+            "资金链预警",
+            "补货预警",
+            "滞销与风险存货",
+            "费用结构与弹性",
+            "异常预警",
+            "费用分析",
+            "费用异常明细",
+            "预测与滚动预算",
+            "多主体汇总",
+            "币种汇总",
+            "年度利润表",
+            "年度经营指标",
+            "年度资产负债表",
+            "年度费用异常Top",
+            "年度汇总总览",
+            "销售人效分析",
+            "杜邦分析",
+            "客户流失与留存",
+        ]
+        for name in generated_names:
+            if name not in names:
+                names.append(name)
+        return names
+
+    def _update_report_sheet_selection_label(self, candidates=None):
+        selected = getattr(self, "report_selected_sheets", None)
+        label_var = getattr(self, "report_sheet_selection_label_var", None)
+        if label_var is None:
+            return
+        if selected is None:
+            label_var.set("全部")
+            return
+        total = len(candidates or self._get_report_output_sheet_candidates() or [])
+        label_var.set(f"已选 {len(selected)}/{total}")
+
+    def _get_report_output_sheets(self):
+        selected = getattr(self, "report_selected_sheets", None)
+        if selected is None:
+            return None
+        return list(selected)
+
+    def _open_report_sheet_selection_dialog(self):
+        candidates = self._get_report_output_sheet_candidates()
+        if not candidates:
+            messagebox.showwarning("提示", "未读取到可选择的输出表。")
+            return
+
+        selected_existing = getattr(self, "report_selected_sheets", None)
+        selected_set = set(candidates if selected_existing is None else selected_existing)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("选择经营报告输出表")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("460x560")
+
+        ttk.Label(dialog, text="勾选需要保留在最终报告中的工作表。").pack(anchor="w", padx=12, pady=(12, 6))
+
+        container = ttk.Frame(dialog)
+        container.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        canvas = tk.Canvas(container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        list_frame = ttk.Frame(canvas)
+        list_frame.bind(
+            "<Configure>",
+            lambda event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=list_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        vars_by_name = {}
+        for name in candidates:
+            var = tk.BooleanVar(value=name in selected_set)
+            vars_by_name[name] = var
+            ttk.Checkbutton(list_frame, text=name, variable=var).pack(anchor="w", pady=1)
+
+        def set_all(value):
+            for var in vars_by_name.values():
+                var.set(value)
+
+        def invert_all():
+            for var in vars_by_name.values():
+                var.set(not var.get())
+
+        tools = ttk.Frame(dialog)
+        tools.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Button(tools, text="全选", command=lambda: set_all(True), width=8).pack(side="left", padx=(0, 6))
+        ttk.Button(tools, text="全不选", command=lambda: set_all(False), width=8).pack(side="left", padx=6)
+        ttk.Button(tools, text="反选", command=invert_all, width=8).pack(side="left", padx=6)
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=12, pady=(0, 12))
+
+        def save_selection():
+            selected = [name for name in candidates if vars_by_name[name].get()]
+            if not selected:
+                messagebox.showwarning("提示", "至少需要选择一个输出表。", parent=dialog)
+                return
+            self.report_selected_sheets = None if len(selected) == len(candidates) else selected
+            if hasattr(self, "report_sheet_format_var"):
+                self.report_sheet_format_var.set("全部" if self.report_selected_sheets is None else "自定义")
+            self._update_report_sheet_selection_label(candidates)
+            dialog.destroy()
+
+        ttk.Button(buttons, text="确定", command=save_selection, width=10).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="取消", command=dialog.destroy, width=10).pack(side="right")
+
+    def _get_report_warning_params(self):
+        def _parse_int(value, default):
+            try:
+                return int(float(str(value).strip()))
+            except Exception:
+                return default
+
+        def _parse_float(value, default):
+            try:
+                return float(str(value).strip())
+            except Exception:
+                return default
+
+        warning_manual = self.report_warning_manual_var.get()
+        replenishment_params = {
+            "manual": warning_manual,
+            "lead_days": _parse_int(self.report_replenish_lead_var.get(), 30),
+            "safety_days": _parse_int(self.report_replenish_safety_var.get(), 20),
+            "window_months": _parse_int(self.report_replenish_window_var.get(), 3),
+        }
+        cashflow_params = {
+            "manual": warning_manual,
+            "dso_threshold": _parse_int(self.report_cash_dso_var.get(), 90),
+            "dio_threshold": _parse_int(self.report_cash_dio_var.get(), 180),
+            "ccc_threshold": _parse_int(self.report_cash_ccc_var.get(), 120),
+            "cash_coverage_threshold": _parse_float(self.report_cash_cover_var.get(), 1.5),
+        }
+        return warning_manual, replenishment_params, cashflow_params
+
+    def _parse_report_year_month(self, year_value, month_value, label):
+        year_text = str(year_value or "").strip()
+        month_text = str(month_value or "").strip()
+        try:
+            year = int(year_text)
+            month = int(month_text)
+        except Exception:
+            raise ValueError(f"{label}必须填写有效年月")
+        if year < 1900 or year > 2100:
+            raise ValueError(f"{label}年份超出有效范围: {year}")
+        if month < 1 or month > 12:
+            raise ValueError(f"{label}月份必须在 1-12 之间: {month}")
+        return year, month
+
+    def _build_report_month_range(self, start_year, start_month, end_year, end_month):
+        if ReportGenerator and hasattr(ReportGenerator, "build_month_range"):
+            return ReportGenerator.build_month_range(start_year, start_month, end_year, end_month)
+        if (start_year, start_month) > (end_year, end_month):
+            raise ValueError("开始月份不能晚于结束月份")
+        month_keys = []
+        year, month = start_year, start_month
+        while (year, month) <= (end_year, end_month):
+            month_keys.append(f"{year:04d}-{month:02d}")
+            month += 1
+            if month > 12:
+                year += 1
+                month = 1
+        return month_keys
+
+    def _check_report_generation_risks(self, generator, target_year, target_month, year_scope, batch_mode=False):
+        period_label = f"{target_year}-{int(target_month):02d}"
+        if hasattr(generator, "_get_data_quality_summary_for_scope"):
+            quality_summary = generator._get_data_quality_summary_for_scope(
+                target_year,
+                target_month,
+                year_scope,
+            )
+        elif hasattr(generator, "get_data_quality_summary"):
+            quality_summary = generator.get_data_quality_summary()
+        else:
+            quality_summary = {"ERROR": 0, "WARN": 0, "INFO": 0, "TOTAL": 0}
+
+        if hasattr(generator, "format_data_quality_details"):
+            quality_details_full = generator.format_data_quality_details(
+                target_year,
+                target_month,
+                year_scope,
+                max_per_severity=None,
+            )
+            quality_details_dialog = generator.format_data_quality_details(
+                target_year,
+                target_month,
+                year_scope,
+                max_per_severity=10,
+            )
+        else:
+            quality_details_full = ""
+            quality_details_dialog = ""
+
+        if quality_summary.get("ERROR", 0) > 0:
+            dq_msg = (
+                f"检测到数据质量问题（{period_label} 报告口径）："
+                f"ERROR={quality_summary.get('ERROR', 0)}，"
+                f"WARN={quality_summary.get('WARN', 0)}，INFO={quality_summary.get('INFO', 0)}。\n"
+                "继续生成可能导致报表口径异常。"
+            )
+            self._log_report(dq_msg)
+            if quality_details_full:
+                self._log_report("数据质量问题明细：\n" + quality_details_full)
+            dialog_msg = dq_msg
+            if quality_details_dialog:
+                dialog_msg += "\n\n问题明细：\n" + quality_details_dialog
+                dialog_msg += "\n\n完整明细已输出到生成日志，并会写入报告的“数据质量检查”Sheet。"
+            prompt = "\n\n是否继续生成该月份报告？" if batch_mode else "\n\n是否继续生成报告？"
+            proceed = self._report_askyesno("数据质量风险", dialog_msg + prompt)
+            if not proceed:
+                self._log_report("用户取消该月份生成。" if batch_mode else "用户取消操作。")
+                return False
+        elif quality_summary.get("WARN", 0) > 0:
+            self._log_report(
+                f"数据质量检查提示（{period_label} 报告口径）："
+                f"WARN={quality_summary.get('WARN', 0)}，INFO={quality_summary.get('INFO', 0)}。"
+            )
+            if quality_details_full:
+                self._log_report("数据质量问题明细：\n" + quality_details_full)
+
+        self._log_report(f"正在检查 {target_year}年{target_month}月 的数据完整性...")
+        missing = generator.check_data_completeness(target_year, target_month)
+        if missing:
+            msg = f"警告：{period_label} 缺少以下关键数据：\n" + ", ".join([m.upper() for m in missing])
+            self._log_report(msg)
+            prompt = "\n\n是否继续生成该月份报告？" if batch_mode else "\n\n是否继续生成报告？"
+            proceed = self._report_askyesno("数据缺失", msg + prompt)
+            if not proceed:
+                self._log_report("用户取消该月份生成。" if batch_mode else "用户取消操作。")
+                return False
+        else:
+            self._log_report("✅ 数据检查通过，所需资料齐全。")
+        return True
+
+    def _sync_report_base_data_from_generator(self, generator):
+        if not self._is_ui_thread():
+            return self._report_call_main("_sync_report_base_data_from_generator", generator)
+        if not self.base_data_mgr:
+            return
+        try:
+            snapshot = generator.get_latest_product_inventory_snapshot()
+            sync_result = self.base_data_mgr.sync_product_inventory_snapshot(
+                snapshot.get("records", []),
+                snapshot.get("month_key"),
+            )
+            latest_month = sync_result.get("latest_month") or "未知月份"
+            self._log_report(
+                "基础数据同步完成: "
+                f"月份={latest_month}, "
+                f"更新={sync_result.get('updated', 0)}, "
+                f"新增={sync_result.get('inserted', 0)}, "
+                f"补空字段={sync_result.get('metadata_filled', 0)}, "
+                f"未匹配={sync_result.get('unmatched', 0)}, "
+                f"跳过旧月份={sync_result.get('skipped_older', 0)}"
+            )
+            if (
+                hasattr(self, "current_table")
+                and self.current_table.get() == "product"
+            ):
+                self._load_base_data_table()
+        except Exception as sync_error:
+            self._log_report(f"基础数据同步失败: {sync_error}")
+
+        try:
+            partner_snapshot = generator.get_latest_business_partner_snapshot()
+            partner_sync_result = self.base_data_mgr.sync_business_partner_snapshot(
+                partner_snapshot.get("records", []),
+                partner_snapshot.get("month_key"),
+            )
+            latest_partner_month = partner_sync_result.get("latest_month") or "未知月份"
+            self._log_report(
+                "往来单位同步完成: "
+                f"月份={latest_partner_month}, "
+                f"更新={partner_sync_result.get('updated', 0)}, "
+                f"新增={partner_sync_result.get('inserted', 0)}, "
+                f"补空字段={partner_sync_result.get('metadata_filled', 0)}, "
+                f"科目同步={partner_sync_result.get('account_subject_updated', 0)}"
+            )
+            if (
+                hasattr(self, "current_table")
+                and self.current_table.get() == "business_partner"
+            ):
+                self._load_base_data_table()
+        except Exception as partner_sync_error:
+            self._log_report(f"往来单位同步失败: {partner_sync_error}")
+
+    def _run_report_ai_analysis_for_output(self, base_dir, output_path, backend=None, enable_chart_recognition=None):
+        try:
+            self._log_report("启动 AI 分析并写入表格...")
+            try:
+                from local_llm_analyzer import LocalLLMAnalyzer
+            except ImportError:
+                self._log_report("错误: 未找到 local_llm_analyzer 模块。")
+                self._report_show_message("error", "错误", "未找到 AI 分析模块 (local_llm_analyzer)。")
+                return False
+
+            if backend is None:
+                backend = self._report_call_main("_get_ai_backend_for_task", "report_analysis", allow_legacy=True)
+                backend = self._normalize_ai_backend(backend)
+            if enable_chart_recognition is None:
+                enable_chart_recognition = False
+            analyzer = LocalLLMAnalyzer(
+                api_base=backend["base_url"],
+                model=backend["model"],
+                api_key=backend["api_key"],
+                provider=backend["provider"],
+                base_data_dir=base_dir,
+                enable_chart_recognition=bool(enable_chart_recognition),
+            )
+            analysis_output = output_path.replace(".xlsx", "_AI_Analysis.md")
+            analyzer.analyze_report(output_path, analysis_output, embed_to_excel=True)
+            self._log_report("AI 分析已写入报告各表。")
+            self._log_report(f"AI 分析报告已生成: {analysis_output}")
+            return True
+        except Exception as e:
+            self._log_report(f"AI 分析失败: {e}")
+            self._report_show_message("error", "AI 分析失败", str(e))
+            return False
+
+    def _write_report_batch_summary(self, output_dir, summary):
+        summary_path = os.path.join(output_dir, f"连续批量生成摘要_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write("月份\t状态\t输出文件\t说明\n")
+            for item in summary:
+                f.write(
+                    f"{item.get('month', '')}\t"
+                    f"{item.get('status', '')}\t"
+                    f"{item.get('path', '')}\t"
+                    f"{item.get('message', '')}\n"
+                )
+        return summary_path
+
+    def _generate_business_report_batch(self):
+        if not ReportGenerator:
+            messagebox.showerror("错误", "ReportGenerator 模块加载失败，请检查 report_generator.py")
+            return
+
+        base_dir = resolve_resource_dir(
+            self.report_base_dir_var.get(),
+            REPORT_BASE_DIR_NAME,
+        )
+        template_path = resolve_resource_file(
+            self.report_template_var.get(),
+            DEFAULT_REPORT_TEMPLATE_FILE,
+        )
+        scope_label = self.report_year_scope_var.get()
+        year_scope = "all" if "历年" in scope_label else "current"
+        warning_manual, replenishment_params, cashflow_params = self._get_report_warning_params()
+        output_sheets = self._get_report_output_sheets()
+
+        self.report_base_dir_var.set(base_dir)
+        self.report_template_var.set(template_path)
+
+        if not os.path.exists(base_dir):
+            messagebox.showwarning("提示", f"基础资料目录不存在: {base_dir}")
+            return
+        if not os.path.exists(template_path):
+            messagebox.showwarning("提示", f"模板文件不存在: {template_path}")
+            return
+
+        try:
+            start_year, start_month = self._parse_report_year_month(
+                self.report_batch_start_year_var.get(),
+                self.report_batch_start_month_var.get(),
+                "批量开始月份",
+            )
+            end_year, end_month = self._parse_report_year_month(
+                self.report_batch_end_year_var.get(),
+                self.report_batch_end_month_var.get(),
+                "批量结束月份",
+            )
+            month_keys = self._build_report_month_range(start_year, start_month, end_year, end_month)
+        except ValueError as exc:
+            messagebox.showwarning("提示", str(exc))
+            return
+
+        output_dir = filedialog.askdirectory(
+            title="选择批量报告输出目录",
+            initialdir=os.path.dirname(template_path) or APP_DIR,
+        )
+        if not output_dir:
+            return
+
+        if not messagebox.askyesno(
+            "批量生成确认",
+            f"将连续生成 {len(month_keys)} 个月份的经营分析报告：\n"
+            f"{month_keys[0]} 至 {month_keys[-1]}\n\n"
+            f"输出目录：\n{output_dir}\n\n是否继续？",
+        ):
+            return
+
+        run_ai_analysis = self.report_ai_analysis_var.get()
+        enable_chart_recognition = self.report_ai_chart_recognition_var.get()
+        ai_backend = None
+        if run_ai_analysis:
+            ai_backend = self._normalize_ai_backend(
+                self._get_ai_backend_for_task("report_analysis", allow_legacy=True)
+            )
+
+        self._start_report_background_task(
+            "批量生成经营报告",
+            lambda: self._generate_business_report_batch_core(
+                base_dir=base_dir,
+                template_path=template_path,
+                output_dir=output_dir,
+                month_keys=month_keys,
+                year_scope=year_scope,
+                warning_manual=warning_manual,
+                replenishment_params=replenishment_params,
+                cashflow_params=cashflow_params,
+                output_sheets=output_sheets,
+                run_ai_analysis=run_ai_analysis,
+                ai_backend=ai_backend,
+                enable_chart_recognition=enable_chart_recognition,
+            ),
+        )
+        return
+
+        import sys
+        import io
+
+        class StdoutRedirector(io.StringIO):
+            def __init__(self, text_widget, tk_root):
+                super().__init__()
+                self.text_widget = text_widget
+                self.tk_root = tk_root
+
+            def write(self, string):
+                if string.strip():
+                    self.text_widget.insert("end", string + "\n")
+                    self.text_widget.see("end")
+                    self.tk_root.update_idletasks()
+                super().write(string)
+
+        original_stdout = sys.stdout
+        sys.stdout = StdoutRedirector(self.report_log_text, self.root)
+
+        summary = []
+        try:
+            self._set_report_progress(0, len(month_keys), f"准备批量生成 0/{len(month_keys)}")
+            self._log_report("开始初始化报告生成器...")
+            generator = ReportGenerator(base_dir)
+
+            self._log_report("正在加载基础数据...")
+            generator.load_all_data()
+            self._set_report_progress(0, len(month_keys), f"基础数据加载完成 0/{len(month_keys)}")
+
+            try:
+                ready_months = set(generator.list_available_months(ready_only=True))
+            except Exception:
+                ready_months = set()
+            unavailable_months = [m for m in month_keys if ready_months and m not in ready_months]
+            if unavailable_months:
+                msg = (
+                    "以下月份不在核心三表完整月份列表中，生成时可能提示缺少数据：\n"
+                    + ", ".join(unavailable_months[:24])
+                )
+                if len(unavailable_months) > 24:
+                    msg += f"\n... 还有 {len(unavailable_months) - 24} 个月份未显示"
+                self._log_report(msg)
+                if not messagebox.askyesno("数据完整性提示", msg + "\n\n是否继续逐月检查并生成？"):
+                    self._log_report("用户取消批量生成。")
+                    self._set_report_progress(0, len(month_keys), "已取消")
+                    return
+
+            run_ai_analysis = self.report_ai_analysis_var.get()
+            successful_paths = []
+            if output_sheets is not None:
+                self._log_report(f"输出表筛选: 显示 {len(output_sheets)} 个 Sheet，其余 Sheet 隐藏。")
+            for index, month_key in enumerate(month_keys, start=1):
+                target_year, target_month = month_key.split("-")
+                output_filename = f"{target_year}年{int(target_month):02d}月_经营分析报告.xlsx"
+                output_path = os.path.join(output_dir, output_filename)
+
+                self._log_report(f"==== [{index}/{len(month_keys)}] 开始生成 {month_key} 报告 ====")
+                self._set_report_progress(index - 1, len(month_keys), f"正在生成 {month_key} ({index}/{len(month_keys)})")
+                if not self._check_report_generation_risks(
+                    generator,
+                    target_year,
+                    target_month,
+                    year_scope,
+                    batch_mode=True,
+                ):
+                    summary.append({
+                        "month": month_key,
+                        "status": "跳过",
+                        "path": output_path,
+                        "message": "用户取消该月份生成",
+                    })
+                    self._set_report_progress(index, len(month_keys), f"已跳过 {month_key} ({index}/{len(month_keys)})")
+                    continue
+
+                self._log_report(f"正在生成报告到: {output_path}")
+                self._log_report("预警参数模式: 手动填入" if warning_manual else "预警参数模式: 自动分析")
+                success = generator.generate_report(
+                    template_path,
+                    output_path,
+                    target_year,
+                    target_month,
+                    year_scope=year_scope,
+                    replenishment_params=replenishment_params,
+                    cashflow_params=cashflow_params,
+                    include_ai_placeholders=self.report_ai_analysis_var.get(),
+                    fail_on_validation_error=True,
+                    fail_on_data_quality_error=False,
+                    allow_generated_report_template=False,
+                    output_sheets=output_sheets,
+                )
+
+                if success:
+                    self._log_report(f"✅ {month_key} 报告生成成功！")
+                    successful_paths.append(output_path)
+                    message = ""
+                    self._set_report_progress(index, len(month_keys), f"已生成 {month_key} ({index}/{len(month_keys)})")
+                    if run_ai_analysis:
+                        self._set_report_progress(index, len(month_keys), f"AI分析 {month_key} ({index}/{len(month_keys)})")
+                        ai_success = self._run_report_ai_analysis_for_output(base_dir, output_path)
+                        if not ai_success:
+                            message = "报告已生成，AI 分析失败或已跳过"
+                            run_ai_analysis = False
+                    summary.append({
+                        "month": month_key,
+                        "status": "成功",
+                        "path": output_path,
+                        "message": message,
+                    })
+                else:
+                    self._log_report(f"❌ {month_key} 报告生成失败，请检查日志。")
+                    self._set_report_progress(index, len(month_keys), f"生成失败 {month_key} ({index}/{len(month_keys)})")
+                    summary.append({
+                        "month": month_key,
+                        "status": "失败",
+                        "path": output_path,
+                        "message": "generate_report 返回失败",
+                    })
+
+            if successful_paths:
+                self._sync_report_base_data_from_generator(generator)
+
+            summary_path = self._write_report_batch_summary(output_dir, summary)
+            success_count = sum(1 for item in summary if item.get("status") == "成功")
+            failed_count = sum(1 for item in summary if item.get("status") == "失败")
+            skipped_count = sum(1 for item in summary if item.get("status") == "跳过")
+            self._log_report(
+                f"连续批量生成完成：成功 {success_count}，失败 {failed_count}，跳过 {skipped_count}。"
+            )
+            self._set_report_progress(len(month_keys), len(month_keys), f"完成：成功{success_count} 失败{failed_count} 跳过{skipped_count}")
+            self._log_report(f"批量摘要已生成: {summary_path}")
+            messagebox.showinfo(
+                "批量生成完成",
+                f"成功 {success_count} 个，失败 {failed_count} 个，跳过 {skipped_count} 个。\n\n"
+                f"摘要文件：\n{summary_path}",
+            )
+        except Exception as e:
+            self._log_report(f"发生异常: {e}")
+            import traceback
+            self._log_report(traceback.format_exc())
+            messagebox.showerror("错误", f"发生异常: {e}")
+        finally:
+            sys.stdout = original_stdout
+
+    def _generate_business_report_batch_core(
+        self,
+        base_dir,
+        template_path,
+        output_dir,
+        month_keys,
+        year_scope,
+        warning_manual,
+        replenishment_params,
+        cashflow_params,
+        output_sheets,
+        run_ai_analysis,
+        ai_backend,
+        enable_chart_recognition,
+    ):
+        import sys
+        import io
+
+        class StdoutRedirector(io.StringIO):
+            def __init__(self, owner):
+                super().__init__()
+                self.owner = owner
+
+            def write(self, string):
+                text = str(string)
+                if text.strip():
+                    for line in text.splitlines():
+                        if line.strip():
+                            self.owner._log_report(line)
+                return super().write(string)
+
+        original_stdout = sys.stdout
+        sys.stdout = StdoutRedirector(self)
+
+        summary = []
+        try:
+            self._set_report_progress(0, len(month_keys), f"准备批量生成 0/{len(month_keys)}")
+            self._log_report("开始初始化报告生成器...")
+            generator = ReportGenerator(base_dir)
+
+            self._log_report("正在加载基础数据...")
+            generator.load_all_data()
+            self._set_report_progress(0, len(month_keys), f"基础数据加载完成 0/{len(month_keys)}")
+
+            try:
+                ready_months = set(generator.list_available_months(ready_only=True))
+            except Exception:
+                ready_months = set()
+            unavailable_months = [m for m in month_keys if ready_months and m not in ready_months]
+            if unavailable_months:
+                msg = (
+                    "以下月份不在核心三表完整月份列表中，生成时可能提示缺少数据：\n"
+                    + ", ".join(unavailable_months[:24])
+                )
+                if len(unavailable_months) > 24:
+                    msg += f"\n... 还有 {len(unavailable_months) - 24} 个月份未显示"
+                self._log_report(msg)
+                if not self._report_askyesno("数据完整性提示", msg + "\n\n是否继续逐月检查并生成？"):
+                    self._log_report("用户取消批量生成。")
+                    self._set_report_progress(0, len(month_keys), "已取消")
+                    return
+
+            successful_paths = []
+            if output_sheets is not None:
+                self._log_report(f"输出表筛选: 显示 {len(output_sheets)} 个 Sheet，其余 Sheet 隐藏。")
+            for index, month_key in enumerate(month_keys, start=1):
+                target_year, target_month = month_key.split("-")
+                output_filename = f"{target_year}年{int(target_month):02d}月_经营分析报告.xlsx"
+                output_path = os.path.join(output_dir, output_filename)
+
+                self._log_report(f"==== [{index}/{len(month_keys)}] 开始生成 {month_key} 报告 ====")
+                self._set_report_progress(index - 1, len(month_keys), f"正在生成 {month_key} ({index}/{len(month_keys)})")
+                if not self._check_report_generation_risks(
+                    generator,
+                    target_year,
+                    target_month,
+                    year_scope,
+                    batch_mode=True,
+                ):
+                    summary.append({
+                        "month": month_key,
+                        "status": "跳过",
+                        "path": output_path,
+                        "message": "用户取消该月份生成",
+                    })
+                    self._set_report_progress(index, len(month_keys), f"已跳过 {month_key} ({index}/{len(month_keys)})")
+                    continue
+
+                self._log_report(f"正在生成报告到: {output_path}")
+                self._log_report("预警参数模式: 手动填入" if warning_manual else "预警参数模式: 自动分析")
+                success = generator.generate_report(
+                    template_path,
+                    output_path,
+                    target_year,
+                    target_month,
+                    year_scope=year_scope,
+                    replenishment_params=replenishment_params,
+                    cashflow_params=cashflow_params,
+                    include_ai_placeholders=run_ai_analysis,
+                    fail_on_validation_error=True,
+                    fail_on_data_quality_error=False,
+                    allow_generated_report_template=False,
+                    output_sheets=output_sheets,
+                )
+
+                if success:
+                    self._log_report(f"✅ {month_key} 报告生成成功！")
+                    successful_paths.append(output_path)
+                    message = ""
+                    self._set_report_progress(index, len(month_keys), f"已生成 {month_key} ({index}/{len(month_keys)})")
+                    if run_ai_analysis:
+                        self._set_report_progress(index, len(month_keys), f"AI分析 {month_key} ({index}/{len(month_keys)})")
+                        ai_success = self._run_report_ai_analysis_for_output(
+                            base_dir,
+                            output_path,
+                            backend=ai_backend,
+                            enable_chart_recognition=enable_chart_recognition,
+                        )
+                        if not ai_success:
+                            message = "报告已生成，AI 分析失败或已跳过"
+                            run_ai_analysis = False
+                    summary.append({
+                        "month": month_key,
+                        "status": "成功",
+                        "path": output_path,
+                        "message": message,
+                    })
+                else:
+                    self._log_report(f"❌ {month_key} 报告生成失败，请检查日志。")
+                    self._set_report_progress(index, len(month_keys), f"生成失败 {month_key} ({index}/{len(month_keys)})")
+                    summary.append({
+                        "month": month_key,
+                        "status": "失败",
+                        "path": output_path,
+                        "message": "generate_report 返回失败",
+                    })
+
+            if successful_paths:
+                self._sync_report_base_data_from_generator(generator)
+
+            summary_path = self._write_report_batch_summary(output_dir, summary)
+            success_count = sum(1 for item in summary if item.get("status") == "成功")
+            failed_count = sum(1 for item in summary if item.get("status") == "失败")
+            skipped_count = sum(1 for item in summary if item.get("status") == "跳过")
+            self._log_report(
+                f"连续批量生成完成：成功 {success_count}，失败 {failed_count}，跳过 {skipped_count}。"
+            )
+            self._set_report_progress(len(month_keys), len(month_keys), f"完成：成功{success_count} 失败{failed_count} 跳过{skipped_count}")
+            self._log_report(f"批量摘要已生成: {summary_path}")
+            self._report_show_message(
+                "info",
+                "批量生成完成",
+                f"成功 {success_count} 个，失败 {failed_count} 个，跳过 {skipped_count} 个。\n\n"
+                f"摘要文件：\n{summary_path}",
+            )
+        except Exception as e:
+            self._log_report(f"发生异常: {e}")
+            import traceback
+            self._log_report(traceback.format_exc())
+            self._report_show_message("error", "错误", f"发生异常: {e}")
+        finally:
+            sys.stdout = original_stdout
+
+    def _generate_business_report_core(
+        self,
+        base_dir,
+        template_path,
+        target_year,
+        target_month,
+        year_scope,
+        warning_manual,
+        replenishment_params,
+        cashflow_params,
+        output_sheets,
+        run_ai_analysis,
+        ai_backend,
+        enable_chart_recognition,
+        open_in_converter=False,
+    ):
+        import sys
+        import io
+
+        class StdoutRedirector(io.StringIO):
+            def __init__(self, owner):
+                super().__init__()
+                self.owner = owner
+
+            def write(self, string):
+                text = str(string)
+                if text.strip():
+                    for line in text.splitlines():
+                        if line.strip():
+                            self.owner._log_report(line)
+                return super().write(string)
+
+        original_stdout = sys.stdout
+        sys.stdout = StdoutRedirector(self)
+
+        try:
+            self._set_report_progress(0, 6, "准备生成报告")
+            self._log_report("开始初始化报告生成器...")
+            generator = ReportGenerator(base_dir)
+
+            self._log_report("正在加载基础数据...")
+            generator.load_all_data()
+            self._set_report_progress(1, 6, "基础数据加载完成")
+
+            if hasattr(generator, "_get_data_quality_summary_for_scope"):
+                quality_summary = generator._get_data_quality_summary_for_scope(
+                    target_year,
+                    target_month,
+                    year_scope,
+                )
+            elif hasattr(generator, "get_data_quality_summary"):
+                quality_summary = generator.get_data_quality_summary()
+            else:
+                quality_summary = {"ERROR": 0, "WARN": 0, "INFO": 0, "TOTAL": 0}
+
+            if hasattr(generator, "format_data_quality_details"):
+                quality_details_full = generator.format_data_quality_details(
+                    target_year,
+                    target_month,
+                    year_scope,
+                    max_per_severity=None,
+                )
+                quality_details_dialog = generator.format_data_quality_details(
+                    target_year,
+                    target_month,
+                    year_scope,
+                    max_per_severity=10,
+                )
+            else:
+                quality_details_full = ""
+                quality_details_dialog = ""
+
+            if quality_summary.get("ERROR", 0) > 0:
+                dq_msg = (
+                    f"检测到数据质量问题（{target_year}-{int(target_month):02d} 报告口径）："
+                    f"ERROR={quality_summary.get('ERROR', 0)}，"
+                    f"WARN={quality_summary.get('WARN', 0)}，INFO={quality_summary.get('INFO', 0)}。\n"
+                    "继续生成可能导致报表口径异常。"
+                )
+                self._log_report(dq_msg)
+                if quality_details_full:
+                    self._log_report("数据质量问题明细：\n" + quality_details_full)
+                dialog_msg = dq_msg
+                if quality_details_dialog:
+                    dialog_msg += "\n\n问题明细：\n" + quality_details_dialog
+                    dialog_msg += "\n\n完整明细已输出到生成日志，并会写入报告的“数据质量检查”Sheet。"
+                proceed = self._report_askyesno("数据质量风险", dialog_msg + "\n\n是否继续生成报告？")
+                if not proceed:
+                    self._log_report("用户取消操作。")
+                    self._set_report_progress(0, 6, "已取消")
+                    return
+            elif quality_summary.get("WARN", 0) > 0:
+                self._log_report(
+                    f"数据质量检查提示（{target_year}-{int(target_month):02d} 报告口径）："
+                    f"WARN={quality_summary.get('WARN', 0)}，INFO={quality_summary.get('INFO', 0)}。"
+                )
+                if quality_details_full:
+                    self._log_report("数据质量问题明细：\n" + quality_details_full)
+
+            self._set_report_progress(2, 6, "正在检查数据")
+            self._log_report(f"正在检查 {target_year}年{target_month}月 的数据完整性...")
+            missing = generator.check_data_completeness(target_year, target_month)
+
+            if missing:
+                msg = f"警告：{target_year}-{int(target_month):02d} 缺少以下关键数据：\n" + ", ".join([m.upper() for m in missing])
+                self._log_report(msg)
+                proceed = self._report_askyesno("数据缺失", msg + "\n\n是否继续生成报告？")
+                if not proceed:
+                    self._log_report("用户取消操作。")
+                    self._set_report_progress(0, 6, "已取消")
+                    return
+            else:
+                self._log_report("✅ 数据检查通过，所需资料齐全。")
+
+            output_filename = f"{target_year}年{int(target_month):02d}月_经营分析报告.xlsx"
+            output_path = os.path.join(os.path.dirname(template_path), output_filename)
+
+            self._log_report(f"正在生成报告到: {output_path}")
+            self._log_report("预警参数模式: 手动填入" if warning_manual else "预警参数模式: 自动分析")
+            if output_sheets is not None:
+                self._log_report(f"输出表筛选: 显示 {len(output_sheets)} 个 Sheet，其余 Sheet 隐藏。")
+            self._set_report_progress(3, 6, "正在生成Excel")
+            success = generator.generate_report(
+                template_path,
+                output_path,
+                target_year,
+                target_month,
+                year_scope=year_scope,
+                replenishment_params=replenishment_params,
+                cashflow_params=cashflow_params,
+                include_ai_placeholders=run_ai_analysis,
+                fail_on_validation_error=True,
+                fail_on_data_quality_error=False,
+                allow_generated_report_template=False,
+                output_sheets=output_sheets,
+            )
+
+            if success:
+                self._log_report("✅ 报告生成成功！")
+                self._set_report_progress(4, 6, "报告生成成功")
+
+                self._set_report_progress(5, 6, "正在同步基础数据")
+                self._sync_report_base_data_from_generator(generator)
+
+                if run_ai_analysis:
+                    self._set_report_progress(5, 6, "正在执行AI分析")
+                    ai_success = self._run_report_ai_analysis_for_output(
+                        base_dir,
+                        output_path,
+                        backend=ai_backend,
+                        enable_chart_recognition=enable_chart_recognition,
+                    )
+                    self._set_report_progress(6, 6, "完成")
+                    if ai_success:
+                        analysis_output = output_path.replace(".xlsx", "_AI_Analysis.md")
+                        self._report_show_message(
+                            "info",
+                            "AI 分析完成",
+                            f"AI 解读已写入报告：\n{output_path}\n\n分析报告: {analysis_output}",
+                        )
+                else:
+                    self._set_report_progress(6, 6, "完成")
+                    self._report_show_message("info", "成功", f"报告已生成:\n{output_path}")
+
+                if open_in_converter:
+                    self._report_call_main("_open_in_converter", output_path, wait=False)
+            else:
+                self._log_report("❌ 报告生成失败，请检查日志。")
+                self._set_report_progress(6, 6, "生成失败")
+                self._report_show_message("error", "失败", "报告生成过程中出现错误")
+
+        except Exception as e:
+            self._log_report(f"发生异常: {e}")
+            import traceback
+            self._log_report(traceback.format_exc())
+            self._set_report_progress(0, 100, "生成异常")
+            self._report_show_message("error", "错误", f"发生异常: {e}")
+        finally:
+            sys.stdout = original_stdout
 
     def _generate_business_report(self, open_in_converter=False):
         if not ReportGenerator:
@@ -11661,6 +13174,7 @@ class ExcelConverterGUI:
         target_month = self.report_month_var.get()
         scope_label = self.report_year_scope_var.get()
         year_scope = "all" if "历年" in scope_label else "current"
+        output_sheets = self._get_report_output_sheets()
 
         self.report_base_dir_var.set(base_dir)
         self.report_template_var.set(template_path)
@@ -11687,6 +13201,34 @@ class ExcelConverterGUI:
             messagebox.showwarning("提示", f"模板文件不存在: {template_path}")
             return
 
+        run_ai_analysis = self.report_ai_analysis_var.get()
+        enable_chart_recognition = self.report_ai_chart_recognition_var.get()
+        ai_backend = None
+        if run_ai_analysis:
+            ai_backend = self._normalize_ai_backend(
+                self._get_ai_backend_for_task("report_analysis", allow_legacy=True)
+            )
+
+        self._start_report_background_task(
+            "生成经营报告",
+            lambda: self._generate_business_report_core(
+                base_dir=base_dir,
+                template_path=template_path,
+                target_year=target_year,
+                target_month=target_month,
+                year_scope=year_scope,
+                warning_manual=warning_manual,
+                replenishment_params=replenishment_params,
+                cashflow_params=cashflow_params,
+                output_sheets=output_sheets,
+                run_ai_analysis=run_ai_analysis,
+                ai_backend=ai_backend,
+                enable_chart_recognition=enable_chart_recognition,
+                open_in_converter=open_in_converter,
+            ),
+        )
+        return
+
         # Redirect stdout to my log
         import sys
         import io
@@ -11707,11 +13249,13 @@ class ExcelConverterGUI:
         sys.stdout = StdoutRedirector(self.report_log_text, self.root)
 
         try:
+            self._set_report_progress(0, 6, "准备生成报告")
             self._log_report("开始初始化报告生成器...")
             generator = ReportGenerator(base_dir)
             
             self._log_report("正在加载基础数据...")
             generator.load_all_data()
+            self._set_report_progress(1, 6, "基础数据加载完成")
 
             if hasattr(generator, "_get_data_quality_summary_for_scope"):
                 quality_summary = generator._get_data_quality_summary_for_scope(
@@ -11758,6 +13302,7 @@ class ExcelConverterGUI:
                 proceed = messagebox.askyesno("数据质量风险", dialog_msg + "\n\n是否继续生成报告？")
                 if not proceed:
                     self._log_report("用户取消操作。")
+                    self._set_report_progress(0, 6, "已取消")
                     return
             elif quality_summary.get("WARN", 0) > 0:
                 self._log_report(
@@ -11768,6 +13313,7 @@ class ExcelConverterGUI:
                     self._log_report("数据质量问题明细：\n" + quality_details_full)
              
             # Check data completeness
+            self._set_report_progress(2, 6, "正在检查数据")
             self._log_report(f"正在检查 {target_year}年{target_month}月 的数据完整性...")
             missing = generator.check_data_completeness(target_year, target_month)
             
@@ -11777,6 +13323,7 @@ class ExcelConverterGUI:
                 proceed = messagebox.askyesno("数据缺失", msg + "\n\n是否继续生成报告？")
                 if not proceed:
                     self._log_report("用户取消操作。")
+                    self._set_report_progress(0, 6, "已取消")
                     return
             else:
                 self._log_report("✅ 数据检查通过，所需资料齐全。")
@@ -11786,6 +13333,9 @@ class ExcelConverterGUI:
             
             self._log_report(f"正在生成报告到: {output_path}")
             self._log_report("预警参数模式: 手动填入" if warning_manual else "预警参数模式: 自动分析")
+            if output_sheets is not None:
+                self._log_report(f"输出表筛选: 显示 {len(output_sheets)} 个 Sheet，其余 Sheet 隐藏。")
+            self._set_report_progress(3, 6, "正在生成Excel")
             success = generator.generate_report(
                 template_path,
                 output_path,
@@ -11798,12 +13348,15 @@ class ExcelConverterGUI:
                 fail_on_validation_error=True,
                 fail_on_data_quality_error=False,
                 allow_generated_report_template=False,
+                output_sheets=output_sheets,
             )
             
             if success:
                 self._log_report("✅ 报告生成成功！")
+                self._set_report_progress(4, 6, "报告生成成功")
 
                 if self.base_data_mgr:
+                    self._set_report_progress(5, 6, "正在同步基础数据")
                     try:
                         snapshot = generator.get_latest_product_inventory_snapshot()
                         sync_result = self.base_data_mgr.sync_product_inventory_snapshot(
@@ -11853,6 +13406,7 @@ class ExcelConverterGUI:
                 
                 if self.report_ai_analysis_var.get():
                     try:
+                        self._set_report_progress(5, 6, "正在执行AI分析")
                         self._log_report("启动 AI 分析并写入表格...")
                         try:
                             from local_llm_analyzer import LocalLLMAnalyzer
@@ -11877,6 +13431,7 @@ class ExcelConverterGUI:
                         analyzer.analyze_report(output_path, analysis_output, embed_to_excel=True)
                         self._log_report("AI 分析已写入报告各表。")
                         self._log_report(f"AI 分析报告已生成: {analysis_output}")
+                        self._set_report_progress(6, 6, "完成")
                         messagebox.showinfo(
                             "AI 分析完成",
                             f"AI 解读已写入报告：\n{output_path}\n\n分析报告: {analysis_output}",
@@ -11885,17 +13440,20 @@ class ExcelConverterGUI:
                         self._log_report(f"AI 分析失败: {e}")
                         messagebox.showerror("AI 分析失败", str(e))
                 else:
+                    self._set_report_progress(6, 6, "完成")
                     messagebox.showinfo("成功", f"报告已生成:\n{output_path}")
                 if open_in_converter:
                     self._open_in_converter(output_path)
             else:
                 self._log_report("❌ 报告生成失败，请检查日志。")
+                self._set_report_progress(6, 6, "生成失败")
                 messagebox.showerror("失败", "报告生成过程中出现错误")
                 
         except Exception as e:
             self._log_report(f"发生异常: {e}")
             import traceback
             self._log_report(traceback.format_exc())
+            self._set_report_progress(0, 100, "生成异常")
             messagebox.showerror("错误", f"发生异常: {e}")
         finally:
             sys.stdout = original_stdout
