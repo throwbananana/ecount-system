@@ -1,12 +1,12 @@
-__pycache__/
-*.py[cod]
-*.db
-*.sqlite
-*.sqlite3
-config.json
-runtime/
-.pytest_cache/
-.mypy_cache/
-.vscode/
-.idea/
-*.log
+# 默认忽略所有文件
+*
+
+# 保留目录，使 Git 可以继续检查目录下的文件
+!*/
+
+# 仅上传 Python 脚本和 Markdown 文档
+!*.py
+!*.md
+
+# 保留本规则文件
+!.gitignore

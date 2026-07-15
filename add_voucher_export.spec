@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:/Users/123/Downloads/亿看智能识别系统\\add_voucher_export.py'],
+    ['C:\\Users\\123\\Downloads\\亿看智能识别系统\\add_voucher_export.py'],
     pathex=[],
     binaries=[],
     datas=[],

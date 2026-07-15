@@ -11488,10 +11488,10 @@ class ExcelConverterGUI:
         self.report_batch_end_month_cb.pack(side="left", padx=(4, 0))
         ttk.Label(batch_range_frame, text="月").pack(side="left", padx=(2, 0))
 
-        ttk.Label(top_frame, text="年份显示:").grid(row=4, column=0, sticky="e", pady=5)
-        scope_values = ["仅当前年份", "显示历年"]
+        ttk.Label(top_frame, text="图表期间:").grid(row=4, column=0, sticky="e", pady=5)
+        scope_values = ["不跨年(仅当前年份)", "跨年(最多2年)"]
         self.report_year_scope_var = tk.StringVar(value=scope_values[0])
-        scope_cb = ttk.Combobox(top_frame, textvariable=self.report_year_scope_var, values=scope_values, width=12, state="readonly")
+        scope_cb = ttk.Combobox(top_frame, textvariable=self.report_year_scope_var, values=scope_values, width=18, state="readonly")
         scope_cb.grid(row=4, column=1, columnspan=3, sticky="w", padx=5)
 
         self.report_ai_analysis_var = tk.BooleanVar(value=False)
@@ -11962,12 +11962,16 @@ class ExcelConverterGUI:
         notebook.add(dup_frame, text=f"重复数据({len(inspection.get('duplicates') or [])})")
         dup_tree = _add_tree(
             dup_frame,
-            [("category", "类型"), ("period", "月份"), ("latest", "最新文件"), ("files", "重复文件")],
+            [("category", "类型"), ("period", "月份"), ("latest", "保留文件"), ("files", "重复来源")],
             {"category": 110, "period": 90, "latest": 260, "files": 520},
         )
         for item in inspection.get("duplicates") or []:
             files = "；".join(meta.get("filename", "") for meta in item.get("files", []))
             latest = (item.get("latest") or {}).get("filename", "")
+            latest_time = item.get("latest_time_text") or ""
+            latest_source = item.get("latest_time_source") or ""
+            if latest_time:
+                latest = f"{latest} ({latest_source}: {latest_time})"
             dup_tree.insert("", "end", values=(item.get("category_label", ""), item.get("period", ""), latest, files))
 
         missing_frame = ttk.Frame(notebook, padding=6)
@@ -11981,29 +11985,103 @@ class ExcelConverterGUI:
             missing_tree.insert("", "end", values=(item.get("period", ""), "、".join(item.get("missing_labels") or [])))
 
         candidate_frame = ttk.Frame(notebook, padding=6)
-        notebook.add(candidate_frame, text=f"旧文件候选({len(inspection.get('cleanup_candidates') or [])})")
+        notebook.add(candidate_frame, text=f"重复数据处理({len(inspection.get('cleanup_candidates') or [])})")
         candidate_tree = _add_tree(
             candidate_frame,
-            [("category", "类型"), ("periods", "重复月份"), ("mtime", "修改时间"), ("filename", "文件名"), ("reason", "判断")],
-            {"category": 110, "periods": 150, "mtime": 160, "filename": 330, "reason": 180},
+            [
+                ("selected", "选择"),
+                ("action", "处理方式"),
+                ("category", "类型"),
+                ("periods", "重复月份"),
+                ("keeper", "保留文件"),
+                ("keep", "保留月份"),
+                ("filename", "待处理文件"),
+                ("reason", "判断"),
+            ],
+            {
+                "selected": 60,
+                "action": 110,
+                "category": 100,
+                "periods": 130,
+                "keeper": 260,
+                "keep": 120,
+                "filename": 280,
+                "reason": 220,
+            },
         )
-        candidate_paths = {}
+        candidate_items = {}
+        checked_text = "[x]"
+        unchecked_text = "[ ]"
+
+        def _cleanup_action_label(item):
+            if item.get("cleanup_action") == "trim_months":
+                return "清理月份"
+            return "删除文件"
+
+        def _set_candidate_checked(tree_id, checked):
+            if not candidate_tree.exists(tree_id):
+                return
+            values = list(candidate_tree.item(tree_id, "values"))
+            if not values:
+                return
+            values[0] = checked_text if checked else unchecked_text
+            candidate_tree.item(tree_id, values=values)
+            if checked:
+                candidate_tree.selection_add(tree_id)
+            else:
+                candidate_tree.selection_remove(tree_id)
+
+        def _is_candidate_checked(tree_id):
+            values = list(candidate_tree.item(tree_id, "values"))
+            return bool(values and values[0] == checked_text)
+
+        def _toggle_candidate_checked(tree_id):
+            _set_candidate_checked(tree_id, not _is_candidate_checked(tree_id))
+
+        def _checked_candidate_ids():
+            return [tree_id for tree_id in candidate_tree.get_children() if _is_candidate_checked(tree_id)]
+
+        def _on_candidate_tree_click(event):
+            if candidate_tree.identify_region(event.x, event.y) != "cell":
+                return None
+            if candidate_tree.identify_column(event.x) != "#1":
+                return None
+            tree_id = candidate_tree.identify_row(event.y)
+            if tree_id:
+                _toggle_candidate_checked(tree_id)
+                return "break"
+            return None
+
+        def _on_candidate_tree_space(_event):
+            targets = list(candidate_tree.selection()) or ([candidate_tree.focus()] if candidate_tree.focus() else [])
+            for tree_id in targets:
+                if tree_id:
+                    _toggle_candidate_checked(tree_id)
+            return "break"
+
         for item in inspection.get("cleanup_candidates") or []:
             periods = ",".join(item.get("superseded_periods") or item.get("periods") or [])
+            keep = ",".join(item.get("blocking_periods") or [])
+            keeper = item.get("keeper_file") or ""
             tree_id = candidate_tree.insert(
                 "",
                 "end",
                 values=(
+                    checked_text,
+                    _cleanup_action_label(item),
                     item.get("category_label", ""),
                     periods,
-                    item.get("mtime_text", ""),
+                    keeper,
+                    keep,
                     item.get("filename", ""),
                     item.get("reason", ""),
                 ),
             )
-            candidate_paths[tree_id] = item.get("path")
+            candidate_items[tree_id] = item
         if candidate_tree.get_children():
             candidate_tree.selection_set(candidate_tree.get_children())
+        candidate_tree.bind("<Button-1>", _on_candidate_tree_click)
+        candidate_tree.bind("<space>", _on_candidate_tree_space)
 
         other_frame = ttk.Frame(notebook, padding=6)
         notebook.add(other_frame, text="其他")
@@ -12015,9 +12093,13 @@ class ExcelConverterGUI:
         for item in inspection.get("manual_review") or []:
             detail = (
                 f"重复月份: {','.join(item.get('superseded_periods') or [])}; "
-                f"仍需保留月份: {','.join(item.get('blocking_periods') or [])}"
+                f"仍需保留月份: {','.join(item.get('blocking_periods') or [])}; "
+                f"{item.get('reason') or '需人工判断'}"
             )
             other_tree.insert("", "end", values=("部分重叠", item.get("filename", ""), detail))
+        for item in inspection.get("files") or []:
+            if item.get("period_warning"):
+                other_tree.insert("", "end", values=("月份不一致", item.get("filename", ""), item.get("period_warning", "")))
         for item in inspection.get("unclassified") or []:
             other_tree.insert("", "end", values=("未识别", item.get("filename", ""), "无法识别数据类型"))
         for item in inspection.get("unreadable") or []:
@@ -12027,61 +12109,78 @@ class ExcelConverterGUI:
         action_frame.pack(fill="x", pady=(10, 0))
 
         def select_all_candidates():
-            candidate_tree.selection_set(candidate_tree.get_children())
+            for tree_id in candidate_tree.get_children():
+                _set_candidate_checked(tree_id, True)
 
         def clear_candidate_selection():
-            candidate_tree.selection_remove(candidate_tree.selection())
+            for tree_id in candidate_tree.get_children():
+                _set_candidate_checked(tree_id, False)
 
-        def delete_selected_candidates():
-            selected = list(candidate_tree.selection())
-            paths = [candidate_paths.get(item) for item in selected if candidate_paths.get(item)]
-            if not paths:
-                messagebox.showwarning("提示", "请先选择要删除的旧数据文件。", parent=dialog)
+        def cleanup_selected_candidates():
+            selected = _checked_candidate_ids()
+            items = [candidate_items.get(item) for item in selected if candidate_items.get(item)]
+            if not items:
+                messagebox.showwarning("提示", "请先选择要处理的重复数据。", parent=dialog)
                 return
 
-            preview = "\n".join(os.path.basename(path) for path in paths[:20])
-            if len(paths) > 20:
-                preview += f"\n... 还有 {len(paths) - 20} 个文件"
+            preview_lines = []
+            for item in items[:20]:
+                periods = ",".join(item.get("superseded_periods") or item.get("periods_to_remove") or [])
+                keeper = item.get("keeper_file") or ""
+                preview_lines.append(f"{_cleanup_action_label(item)} {periods}: {item.get('filename')} -> 保留 {keeper}")
+            preview = "\n".join(preview_lines)
+            if len(items) > 20:
+                preview += f"\n... 还有 {len(items) - 20} 项"
             confirm_msg = (
-                f"将删除选中的 {len(paths)} 个旧数据文件。\n\n"
+                f"将处理选中的 {len(items)} 项重复数据。\n\n"
                 f"{preview}\n\n"
+                "处理后每个类型+月份只保留在“保留文件”一处；整份都重复的文件会删除，部分重叠的文件只删除重复月份整月行。\n"
                 "此操作不可恢复，是否继续？"
             )
-            if not messagebox.askyesno("确认删除旧数据", confirm_msg, parent=dialog):
+            if not messagebox.askyesno("确认处理重复数据", confirm_msg, parent=dialog):
                 return
 
-            result = generator.delete_data_files(paths)
+            result = generator.cleanup_superseded_data(items)
             deleted = set(os.path.abspath(path) for path in result.get("deleted", []))
+            trimmed = set(os.path.abspath(item.get("path")) for item in result.get("trimmed", []))
             for item in selected:
-                path = candidate_paths.get(item)
-                if path and os.path.abspath(path) in deleted:
+                data_item = candidate_items.get(item) or {}
+                path = data_item.get("path")
+                if path and os.path.abspath(path) in deleted.union(trimmed):
                     candidate_tree.delete(item)
-                    candidate_paths.pop(item, None)
+                    candidate_items.pop(item, None)
 
             deleted_count = len(result.get("deleted", []))
+            trimmed_count = len(result.get("trimmed", []))
             failed = result.get("failed", [])
-            self._log_report(f"数据整理完成: 删除旧文件 {deleted_count} 个，失败 {len(failed)} 个。")
+            self._log_report(f"重复数据处理完成: 删除整份重复文件 {deleted_count} 个，清理重复月份文件 {trimmed_count} 个，失败 {len(failed)} 个。")
             for path in result.get("deleted", []):
-                self._log_report(f"已删除旧数据: {os.path.basename(path)}")
+                self._log_report(f"已删除整份重复文件: {os.path.basename(path)}")
+            for item in result.get("trimmed", []):
+                months = ",".join(item.get("months") or [])
+                self._log_report(
+                    f"已清理重复月份数据: {os.path.basename(item.get('path', ''))} "
+                    f"月份={months} 删除行数={item.get('deleted_rows')}"
+                )
             for item in failed:
-                self._log_report(f"删除失败: {os.path.basename(str(item.get('path')))} - {item.get('error')}")
+                self._log_report(f"整理失败: {os.path.basename(str(item.get('path')))} - {item.get('error')}")
 
             self._report_years_dir = None
             self._refresh_report_year_options()
-            self._set_report_progress(1, 1, f"数据整理完成: 删除{deleted_count}个")
+            self._set_report_progress(1, 1, f"重复数据处理完成: 删除{deleted_count}个，清理{trimmed_count}个")
 
-            msg = f"已删除 {deleted_count} 个旧数据文件。"
+            msg = f"已删除 {deleted_count} 个整份重复文件，清理 {trimmed_count} 个部分重叠文件。"
             if failed:
                 msg += f"\n失败 {len(failed)} 个，详情见生成日志。"
-            messagebox.showinfo("数据整理完成", msg, parent=dialog)
+            messagebox.showinfo("重复数据处理完成", msg, parent=dialog)
 
         def rerun_inspection():
             dialog.destroy()
             self._inspect_and_clean_report_data()
 
-        ttk.Button(action_frame, text="全选旧文件", command=select_all_candidates, width=12).pack(side="left")
+        ttk.Button(action_frame, text="全选重复数据", command=select_all_candidates, width=14).pack(side="left")
         ttk.Button(action_frame, text="取消选择", command=clear_candidate_selection, width=12).pack(side="left", padx=(8, 0))
-        ttk.Button(action_frame, text="删除选中旧数据", command=delete_selected_candidates, width=16).pack(side="left", padx=(8, 0))
+        ttk.Button(action_frame, text="处理选中重复数据", command=cleanup_selected_candidates, width=18).pack(side="left", padx=(8, 0))
         ttk.Button(action_frame, text="重新检视", command=rerun_inspection, width=12).pack(side="right", padx=(8, 0))
         ttk.Button(action_frame, text="关闭", command=dialog.destroy, width=10).pack(side="right")
 
@@ -12247,6 +12346,7 @@ class ExcelConverterGUI:
             "预测与滚动预算",
             "多主体汇总",
             "币种汇总",
+            "连续年度分析",
             "年度利润表",
             "年度经营指标",
             "年度资产负债表",
@@ -12345,6 +12445,16 @@ class ExcelConverterGUI:
 
         ttk.Button(buttons, text="确定", command=save_selection, width=10).pack(side="right", padx=(6, 0))
         ttk.Button(buttons, text="取消", command=dialog.destroy, width=10).pack(side="right")
+
+    def _get_report_year_scope(self):
+        label = str(self.report_year_scope_var.get() or "").strip()
+        if "不跨" in label or "当前" in label:
+            return "current"
+        if "跨年" in label or "2年" in label or "两年" in label:
+            return "recent_two_years"
+        if "历年" in label:
+            return "recent_two_years"
+        return "current"
 
     def _get_report_warning_params(self):
         def _parse_int(value, default):
@@ -12586,8 +12696,7 @@ class ExcelConverterGUI:
             self.report_template_var.get(),
             DEFAULT_REPORT_TEMPLATE_FILE,
         )
-        scope_label = self.report_year_scope_var.get()
-        year_scope = "all" if "历年" in scope_label else "current"
+        year_scope = self._get_report_year_scope()
         warning_manual, replenishment_params, cashflow_params = self._get_report_warning_params()
         output_sheets = self._get_report_output_sheets()
 
@@ -13172,8 +13281,7 @@ class ExcelConverterGUI:
         )
         target_year = self.report_year_var.get()
         target_month = self.report_month_var.get()
-        scope_label = self.report_year_scope_var.get()
-        year_scope = "all" if "历年" in scope_label else "current"
+        year_scope = self._get_report_year_scope()
         output_sheets = self._get_report_output_sheets()
 
         self.report_base_dir_var.set(base_dir)

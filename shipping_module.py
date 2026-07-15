@@ -178,6 +178,16 @@ class ShippingDB:
 
                 if '集装箱号' not in df.columns:
                     df['集装箱号'] = None
+                # 集装箱号必须是字符串格式（如 MRSU5871290）。
+                # 费用汇总行中，集装箱号列的位置可能存放着金额数字（如 7861.14），
+                # ffill()会将其当作货柜号向下传播，导致费用行被切割到独立的虚假货柜块中。
+                # 修复：仅保留包含至少一个字母和一个数字的字符串值作为有效货柜号。
+                def _is_valid_container_no(v):
+                    if not isinstance(v, str):
+                        return False
+                    s = v.strip()
+                    return bool(re.search(r'[A-Za-z]', s) and re.search(r'\d', s))
+                df['集装箱号'] = df['集装箱号'].apply(lambda v: v if _is_valid_container_no(v) else None)
                 df['集装箱号'] = df['集装箱号'].ffill()
                 
                 # 记录该Sheet中的货柜号及其对应的税率
