@@ -1485,21 +1485,52 @@ class ReportGenerator:
         return {"deleted": deleted, "trimmed": trimmed, "failed": failed}
 
     def _extract_month_from_filename(self, filename):
-        """从文件名提取月份 (e.g., '成本1月.xlsx' -> '2025-01')"""
-        year = datetime.now().year # Default
-        year_match = re.search(r'(20\d{2})', filename)
+        """从文件名提取月份 (e.g., '实际成本报表_2025-01-01_to_2025-01-31.xlsx' -> '2025-01', '成本1月.xlsx' -> '2025-01')"""
+        name = str(filename or "")
+        
+        # 1. 匹配标准日期区间: 2025-01-01_to_2025-01-31 或 2025/01/01~2025/01/31
+        m_range = re.search(
+            r'(20\d{2})[./-](\d{1,2})[./-]\d{1,2}\s*(?:to|[~～\-_])\s*(20\d{2})[./-](\d{1,2})[./-]\d{1,2}',
+            name,
+            re.IGNORECASE,
+        )
+        if m_range:
+            y1, m1, y2, m2 = int(m_range.group(1)), int(m_range.group(2)), int(m_range.group(3)), int(m_range.group(4))
+            if 1 <= m1 <= 12:
+                return f"{y1}-{m1:02d}"
+            if 1 <= m2 <= 12:
+                return f"{y2}-{m2:02d}"
+
+        # 2. 匹配标准单日期: 2025-01-01 或 2025/01/01
+        m_date = re.search(r'(20\d{2})[./-](\d{1,2})[./-]\d{1,2}', name)
+        if m_date:
+            y, m = int(m_date.group(1)), int(m_date.group(2))
+            if 1 <= m <= 12:
+                return f"{y}-{m:02d}"
+
+        # 3. 匹配带年份月份: 2025年01月, 2025年1月, 2025-01, 2025.01, 2025/01
+        m_ym = re.search(r'(20\d{2})\s*(?:年|[./\-_])\s*(\d{1,2})\s*月?', name)
+        if m_ym:
+            y, m = int(m_ym.group(1)), int(m_ym.group(2))
+            if 1 <= m <= 12:
+                return f"{y}-{m:02d}"
+
+        # 4. 匹配 6 位数字年月: 202501 (前后非数字)
+        m_6d = re.search(r'(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)', name)
+        if m_6d:
+            return f"{m_6d.group(1)}-{m_6d.group(2)}"
+
+        # 5. 回退提取单独月份 "X月" (结合年份)
+        year = datetime.now().year
+        year_match = re.search(r'(20\d{2})', name)
         if year_match:
             year = int(year_match.group(1))
-            
-        month_match = re.search(r'(?<![\d\-])(\d{1,2})月', filename)
-        if month_match:
-            month = int(month_match.group(1))
-            return f"{year}-{month:02d}"
-            
-        month_matches = re.findall(r'(\d{1,2})月', filename)
+
+        month_matches = re.findall(r'(?<![\d\-])(\d{1,2})月', name)
         if month_matches:
             month = int(month_matches[-1])
-            return f"{year}-{month:02d}"
+            if 1 <= month <= 12:
+                return f"{year}-{month:02d}"
 
         return "Unknown"
 
@@ -1570,7 +1601,11 @@ class ReportGenerator:
         return None, None
 
     def _determine_period_key(self, path, filename, df_peek=None):
-        if df_peek is None:
+        fn_month = self._extract_month_from_filename(filename)
+        if fn_month and fn_month != "Unknown":
+            return fn_month
+
+        if df_peek is None and path and os.path.exists(path):
             try:
                 df_peek = pd.read_excel(path, header=None, nrows=1)
             except Exception:
@@ -1583,7 +1618,7 @@ class ReportGenerator:
                     return f"{s_date.year}-{s_date.month:02d}"
                 return f"{e_date.year}-{e_date.month:02d}"
 
-        return self._extract_month_from_filename(filename)
+        return fn_month or "Unknown"
 
     def _load_cost_data(self, path, filename):
         try:
