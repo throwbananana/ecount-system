@@ -1766,7 +1766,7 @@ def test_ensure_report_charts_rebuilds_sales_inventory_chart_with_fallback_data(
     # Sales revenue column is empty, chart should fallback to ending inventory amount.
     assert ws.cell(row=2, column=28).value == '鞋类'
     assert abs(ws.cell(row=2, column=29).value - 150) < 1e-12
-    assert ws.cell(row=3, column=28).value == '电器'
+    assert ws.cell(row=3, column=28).value == '电器类'
     assert abs(ws.cell(row=3, column=29).value - 80) < 1e-12
     titles = {_chart_title_text(chart) for chart in ws._charts}
     assert any('品类销售/库存/毛利对比' in title for title in titles)
@@ -1857,6 +1857,117 @@ def test_add_pareto_chart_uses_header_series_titles():
     assert any(token.endswith('!B1') for token in title_tokens)
     assert any(token.endswith('!C1') for token in title_tokens)
     assert all(token not in {'系列1', '系列2', 'Series1', 'Series2'} for token in title_tokens)
+
+
+def test_customer_profit_sheet_displays_period_and_uses_period_days_for_dso(monkeypatch):
+    gen = ReportGenerator('.')
+    sales = pd.DataFrame({
+        'MonthStr': ['2026-01', '2026-06'],
+        '往来单位名': ['A客户', 'A客户'],
+        '数量': [2, 3],
+        '销售额': [400.0, 600.0],
+        '成本额': [240.0, 360.0],
+    })
+    monkeypatch.setattr(gen, '_get_sales_df', lambda: sales.copy())
+    monkeypatch.setattr(gen, '_extract_sales_revenue', lambda df: df['销售额'])
+    monkeypatch.setattr(
+        gen,
+        '_attach_sales_cost',
+        lambda df, *_args, **_kwargs: df.assign(Cost=df['成本额']),
+    )
+    monkeypatch.setattr(gen, '_get_ar_balance_by_customer', lambda *_args: {'A客户': 500.0})
+
+    wb = openpyxl.Workbook()
+    wb.active.title = '应收账款账龄分析'
+    gen._update_customer_profit_sheet(wb, '2026', '6', 'current')
+
+    ws = wb['客户贡献与回款']
+    assert '2026年01月01日—2026年06月30日' in ws['A1'].value
+    assert '本年累计' in ws['A1'].value
+    assert '共181天' in ws['A1'].value
+    assert '应收余额取截至2026年06月30日每个客户最后一笔有效本币余额' in ws['A2'].value
+    assert [ws.cell(3, c).value for c in range(1, 10)] == [
+        '客户', '期间销量', '期间销售收入', '期间销售成本', '期间毛利润',
+        '期间毛利率', '期末应收余额(本币)', 'DSO(天)', '累计收入占比',
+    ]
+    assert ws['H4'].value == 90.5
+    assert ws.freeze_panes == 'A4'
+
+
+def test_customer_profit_sheet_credit_ar_does_not_create_negative_dso(monkeypatch):
+    gen = ReportGenerator('.')
+    sales = pd.DataFrame({
+        'MonthStr': ['2026-06'],
+        '往来单位名': ['预收客户'],
+        '数量': [1],
+        '销售额': [100.0],
+        '成本额': [60.0],
+    })
+    monkeypatch.setattr(gen, '_get_sales_df', lambda: sales.copy())
+    monkeypatch.setattr(gen, '_extract_sales_revenue', lambda df: df['销售额'])
+    monkeypatch.setattr(
+        gen,
+        '_attach_sales_cost',
+        lambda df, *_args, **_kwargs: df.assign(Cost=df['成本额']),
+    )
+    monkeypatch.setattr(gen, '_get_ar_balance_by_customer', lambda *_args: {'预收客户': -50.0})
+
+    wb = openpyxl.Workbook()
+    wb.active.title = '应收账款账龄分析'
+    gen._update_customer_profit_sheet(wb, '2026', '6', 'current')
+
+    assert wb['客户贡献与回款']['H4'].value == 0
+
+
+def test_ar_customer_balance_uses_latest_local_running_balance_not_foreign_movements(tmp_path):
+    gen = ReportGenerator(str(tmp_path))
+    gen.ar_detail_df = pd.DataFrame({
+        '日期-号码': ['2026/06/18 -30', '2026/06/30 -5', '2026/06/30 -5'],
+        'ParsedDate': pd.to_datetime(['2026-06-18', '2026-06-30', '2026-06-30']),
+        '往来单位名': ['A客户', 'A客户', 'B客户'],
+        '账页往来单位名': ['A客户', 'A客户', 'B客户'],
+        '外币借方金额': [1000.0, None, None],
+        '外币贷方金额': [None, 2000.0, 500.0],
+        '外币余额': [1000.0, -1000.0, -500.0],
+        '借方金额': [7000.0, None, None],
+        '贷方金额': [None, 100.0, 3500.0],
+        '余额': [7000.0, 6900.0, -3500.0],
+        'SourceFile': ['2026-06.xlsx', '2026-06.xlsx', '2026-06.xlsx'],
+    })
+
+    balances = gen._get_ar_balance_by_customer('2026', '6')
+
+    assert balances == {'A客户': 6900.0, 'B客户': -3500.0}
+
+
+def test_ar_customer_balance_prefers_ledger_page_party_and_ignores_future_balance(tmp_path):
+    gen = ReportGenerator(str(tmp_path))
+    gen.ar_detail_df = pd.DataFrame({
+        'ParsedDate': pd.to_datetime(['2026-06-30', '2026-07-31']),
+        '往来单位名': ['交易对手名称', '交易对手名称'],
+        '账页往来单位名': ['实际客户', '实际客户'],
+        '余额': [1234.5, 9999.0],
+        '借方金额': [1234.5, 8764.5],
+        '贷方金额': [0.0, 0.0],
+        'SourceFile': ['2026-06.xlsx', '2026-07.xlsx'],
+    })
+
+    balances = gen._get_ar_balance_by_customer('2026', '6')
+
+    assert balances == {'实际客户': 1234.5}
+
+
+def test_ensure_parsed_date_and_month_ignores_document_number_suffix():
+    gen = ReportGenerator('.')
+    df = pd.DataFrame({'日期-号码': ['2026/06/22 -18', '2026/06/30 -105']})
+
+    result = gen._ensure_parsed_date_and_month(df)
+
+    assert result['MonthStr'].tolist() == ['2026-06', '2026-06']
+    assert result['ParsedDate'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist() == [
+        '2026-06-22 00:00:00',
+        '2026-06-30 00:00:00',
+    ]
 
 
 def test_add_scatter_chart_uses_y_header_as_series_title():
@@ -3374,6 +3485,16 @@ def test_category_contribution_is_merged_and_old_sheet_redirects():
     gen._ensure_report_charts(wb)
     titles = {_chart_title_text(chart) for chart in ws_month._charts}
     assert any('品类毛利润趋势' in title for title in titles)
+
+
+def test_product_family_normalizes_electrical_aliases():
+    gen = ReportGenerator('.')
+
+    assert gen._normalize_product_family('电器') == '电器类'
+    assert gen._normalize_product_family('电器类') == '电器类'
+    assert gen._normalize_product_family('机电类') == '电器类'
+    assert gen._normalize_product_family('电动工具') == '电器类'
+    assert gen._normalize_product_family(None, '3500 [汽油发电机组]') == '电器类'
 
 
 def test_delete_merged_sheets_keeps_expense_details():

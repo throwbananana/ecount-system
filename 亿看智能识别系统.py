@@ -11212,6 +11212,7 @@ class ExcelConverterGUI:
             "summary": "摘要",
             "parent_subject": "上级科目",
             "display_name": "显示名称",
+            "product_group_name": "品目组合1名",
             "product_type": "品目类型",
             "spec_info": "规格信息",
             "unit": "单位",

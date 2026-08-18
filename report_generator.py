@@ -2093,6 +2093,22 @@ class ReportGenerator:
 
         return None, None
 
+    def _ensure_parsed_date_and_month(self, df):
+        """Populate ParsedDate/MonthStr without treating document numbers as time parts."""
+        if df is None or df.empty or "MonthStr" in df.columns:
+            return df
+        work = df.copy()
+        if "ParsedDate" in work.columns:
+            parsed = pd.to_datetime(work["ParsedDate"], errors="coerce")
+        else:
+            _, parsed = self._pick_best_date_column(
+                work, ["日期", "date", "业务日期", "单据日期", "日期-号码"]
+            )
+        if parsed is not None and parsed.notna().sum() > 0:
+            work["ParsedDate"] = parsed
+            work["MonthStr"] = parsed.dt.strftime("%Y-%m")
+        return work
+
     def _dedupe_excel_headers(self, headers):
         result = []
         seen = Counter()
@@ -2630,8 +2646,8 @@ class ReportGenerator:
 
                 # 借贷金额合理性
                 if category in {"expense", "ar", "ap", "cash"}:
-                    debit_col = self._pick_first_column(df, ["借方金额", "借方"])
-                    credit_col = self._pick_first_column(df, ["贷方金额", "贷方"])
+                    debit_col = self._pick_ledger_amount_column(df, "借方金额") or self._pick_ledger_amount_column(df, "借方")
+                    credit_col = self._pick_ledger_amount_column(df, "贷方金额") or self._pick_ledger_amount_column(df, "贷方")
                     if debit_col and credit_col:
                         debit = self._coerce_numeric(df[debit_col]).fillna(0)
                         credit = self._coerce_numeric(df[credit_col]).fillna(0)
@@ -3098,6 +3114,69 @@ class ReportGenerator:
             return col
         return None
 
+    def _dashboard_locate_card(self, ws, label, search_rows=None):
+        """Find a dashboard summary card by label text and return its row/column info.
+
+        Scans rows in *search_rows* (default: first 30 rows) for a cell whose
+        value contains *label*.  Resolves merged-cell left-edge for the column.
+        Returns a dict with keys:
+            label_row  - row where the label was found
+            label_col  - leftmost column of the label cell (merged or plain)
+            value_row  - data/formula row (label_row + 1)
+            delta_row  - MoM-delta row (value_row + 2)
+        Returns None if the label is not found.
+        """
+        if search_rows is None:
+            search_rows = range(1, min(ws.max_row, 30) + 1)
+        for r in search_rows:
+            for c in range(1, ws.max_column + 1):
+                val = ws.cell(row=r, column=c).value
+                if not (isinstance(val, str) and label in val):
+                    continue
+                label_col = c
+                for merged in ws.merged_cells.ranges:
+                    if (
+                        merged.min_row <= r <= merged.max_row
+                        and merged.min_col <= c <= merged.max_col
+                    ):
+                        label_col = merged.min_col
+                        break
+                value_row = r + 1
+                delta_row = value_row + 2
+                return {
+                    "label_row": r,
+                    "label_col": label_col,
+                    "value_row": value_row,
+                    "delta_row": delta_row,
+                }
+        return None
+
+    def _dashboard_locate_turnover_row(self, ws):
+        """Locate the 'inventory-turnover days' supplemental block on the dashboard.
+
+        Looks for a row containing a title with 'inventory turnover days' meaning
+        (e.g. the Chinese label for that metric) and returns
+        (value_row, value_col, delta_col) or None.
+        """
+        turnover_label = "\u5b58\u8d27\u5468\u8f6c\u5929\u6570"  # raw Unicode for the Chinese label
+        for r in range(1, min(ws.max_row, 40) + 1):
+            for c in range(1, ws.max_column + 1):
+                val = ws.cell(row=r, column=c).value
+                if not isinstance(val, str):
+                    continue
+                # Title rows contain the label but NOT comparison phrases
+                compare_words = ["\u8f83\u4e0a\u6708", "\u73af\u6bd4", "\u8f83\u4e0a\u5e74"]
+                if turnover_label in val and not any(w in val for w in compare_words):
+                    value_row = r + 1
+                    # Scan the value row for a cell that itself contains the label
+                    for vc in range(1, ws.max_column + 1):
+                        vval = ws.cell(row=value_row, column=vc).value
+                        if isinstance(vval, str) and turnover_label in vval:
+                            return value_row, vc + 1, vc + 3
+                    # Fallback: value in col B, delta in col D (original hardcoded layout)
+                    return value_row, 2, 4
+        return None
+
     def _dashboard_summary_range_overlaps(self, ws, min_row, max_row, min_col, max_col):
         for merged in ws.merged_cells.ranges:
             if merged.max_row < min_row or merged.min_row > max_row:
@@ -3199,6 +3278,80 @@ class ReportGenerator:
         ws.cell(row=label_row, column=dest_col).value = "财务费用率"
         return self._write_dashboard_financial_rate_summary_card_formulas(ws)
 
+    def _ensure_dashboard_net_profit_card(self, ws):
+        """确保仪表盘第一组卡片中存在明确标注「净利润」的卡片。
+
+        模板历史遗留问题：该位置标签为「营业利润（元）」但填入的是净利润公式，
+        语义不清。本方法在标签行（row 4）扫描：
+          - 若已存在含「净利润」的卡片 → 直接返回 True（公式由后续流程写入）。
+          - 若不存在 → 在第一组最右侧空闲 4 列处新建卡片，标签写「净利润（元）」，
+            样式从同行已有卡片复制，公式在 _repair_template_dashboard_formulas 写入。
+        """
+        label_row   = 4
+        value_row   = 5
+        value_row_end = 6
+        delta_row   = 7
+        block_width = 4
+
+        # 已有净利润卡片 → 什么都不做
+        if (self._dashboard_locate_card(ws, "净利润（元）")
+                or self._dashboard_locate_card(ws, "净利润")):
+            return True
+
+        # 找到一个有内容的卡片作为样式来源
+        source_col = (
+            self._dashboard_summary_card_col(ws, "主营业务收入", label_row=label_row)
+            or self._dashboard_summary_card_col(ws, "营业利润", label_row=label_row)
+        )
+        if not source_col:
+            return False
+
+        # 找第一个空闲的 4 列块
+        dest_col = None
+        max_scan_col = max(ws.max_column, 16) + block_width
+        for col in range(1, max_scan_col + 1, block_width):
+            if ws.cell(row=label_row, column=col).value:
+                continue
+            if self._dashboard_summary_range_overlaps(
+                ws, label_row, delta_row, col, col + block_width - 1
+            ):
+                continue
+            dest_col = col
+            break
+        if not dest_col:
+            return False
+
+        # 复制样式
+        for row in range(label_row, delta_row + 1):
+            for offset in range(block_width):
+                self._copy_cell_style(
+                    ws.cell(row=row, column=source_col + offset),
+                    ws.cell(row=row, column=dest_col + offset),
+                )
+        for offset in range(block_width):
+            src_l = get_column_letter(source_col + offset)
+            dst_l = get_column_letter(dest_col + offset)
+            if src_l in ws.column_dimensions:
+                ws.column_dimensions[dst_l].width = ws.column_dimensions[src_l].width
+
+        # 合并单元格
+        ws.merge_cells(
+            start_row=label_row, start_column=dest_col,
+            end_row=label_row,   end_column=dest_col + block_width - 1,
+        )
+        ws.merge_cells(
+            start_row=value_row, start_column=dest_col,
+            end_row=value_row_end, end_column=dest_col + block_width - 1,
+        )
+        ws.merge_cells(
+            start_row=delta_row, start_column=dest_col,
+            end_row=delta_row,   end_column=dest_col + block_width - 1,
+        )
+
+        ws.cell(row=label_row, column=dest_col).value = "净利润（元）"
+        self._log_audit("仪表盘已自动添加「净利润（元）」卡片，数据来自利润表，公式将在下一步写入")
+        return True
+
     def _dashboard_budget_header_row(self, wb):
         if wb is None or "目标_预算" not in wb.sheetnames:
             return 10
@@ -3284,7 +3437,6 @@ class ReportGenerator:
             ws.cell(row=r, column=3).value = f'=IFERROR({budget_target(target_header)},"")'
             ws.cell(row=r, column=4).value = f'=IF(OR(C{r}="",C{r}=0),"",B{r}/C{r})'
             ws.cell(row=r, column=5).value = f'=IF(C{r}="","",B{r}-C{r})'
-
             if compare_kind == "ratio":
                 ws.cell(row=r, column=6).value = f'=IFERROR(IF({prev_expr}=0,"",B{r}/{prev_expr}-1),"")'
                 ws.cell(row=r, column=7).value = (
@@ -3385,8 +3537,12 @@ class ReportGenerator:
             return False
         changed = False
         dash_ws = wb["仪表盘"]
+        # 主动确保仪表盘有净利润卡片（来自利润表）
+        if self._ensure_dashboard_net_profit_card(dash_ws):
+            changed = True
         if self._ensure_dashboard_financial_rate_summary_card(dash_ws):
             changed = True
+
         row = self._ensure_dashboard_financial_rate_table_row(dash_ws)
         if row:
             changed = True
@@ -3440,36 +3596,104 @@ class ReportGenerator:
         days_curr = metric_curr("O")
         days_prev = metric_prev("O")
 
-        ws["A5"].value = f'=IFERROR({revenue_curr},"")'
-        ws["E5"].value = f'=IFERROR({net_curr},"")'
-        ws["I5"].value = '=IFERROR(E5/A5,"")'
-        ws["M5"].value = f'=IFERROR({cost_rate_curr},"")'
-        ws["Q5"].value = f'=IFERROR({op_curr},"")'
+        # ── Helper: write one formula card located by label ────────────────────
+        # Using label-based lookup avoids hardcoded coordinates; the code
+        # remains correct even when the template shifts rows or columns.
+        def _write_card(loc, value_fn, delta_fn):
+            if loc is None:
+                return
+            vr, vc = loc["value_row"], loc["label_col"]
+            dr = loc["delta_row"]
+            vcl = get_column_letter(vc)
+            vf = value_fn(f"{vcl}{vr}")
+            if vf is not None:
+                ws.cell(row=vr, column=vc).value = vf
+            df_val = delta_fn(f"{vcl}{vr}")
+            if df_val is not None:
+                ws.cell(row=dr, column=vc).value = df_val
 
-        ws["A7"].value = mom_text("A5", revenue_prev)
-        ws["E7"].value = mom_text("E5", net_prev)
-        ws["I7"].value = pp_text("(E5/A5)", f"({net_prev}/{revenue_prev})")
-        ws["M7"].value = pp_text("M5", cost_rate_prev)
-        ws["Q7"].value = mom_text("Q5", op_prev)
+        # ── Group 1: revenue / net-profit / rate / cost-rate / op-profit ─────────
+        # 注意：标准模板将“净利润”插槽标为“营业利润（元）”，我们匹配实际存在的标签。
+        loc_rev  = self._dashboard_locate_card(ws, "主营业务收入")
+        # 历史模板将净利润填入“营业利润（元）”卡片中，所以同时匹配两种标签。
+        loc_net  = (self._dashboard_locate_card(ws, "净利润（元）")
+                    or self._dashboard_locate_card(ws, "净利润")
+                    or self._dashboard_locate_card(ws, "营业利润（元）"))
+        loc_rate = (self._dashboard_locate_card(ws, "净利润率")
+                    or self._dashboard_locate_card(ws, "营业利润率"))
+        loc_cost = self._dashboard_locate_card(ws, "成本率")
+        # loc_op: 如果模板中有独立的营业利润卡片（与loc_net不同）则写入，否则跳过。
+        _loc_op_candidate = self._dashboard_locate_card(ws, "营业利润（元）")
+        loc_op   = _loc_op_candidate if _loc_op_candidate != loc_net else None
+        loc_oprate = self._dashboard_locate_card(ws, "营业利润率")
 
-        # 若模板补充了营业利润率区块(U列)，同步修复“较上月”公式。
-        if ws.max_column >= 21:
-            ws["U5"].value = f'=IFERROR({op_rate_curr},"")'
-            ws["U7"].value = pp_text("U5", op_rate_prev)
+        _write_card(loc_rev,
+                    lambda vl: f'=IFERROR({revenue_curr},"")'  ,
+                    lambda vl: mom_text(vl, revenue_prev))
+        _write_card(loc_net,
+                    lambda vl: f'=IFERROR({net_curr},"")'  ,
+                    lambda vl: mom_text(vl, net_prev))
+        _write_card(loc_cost,
+                    lambda vl: f'=IFERROR({cost_rate_curr},"")'  ,
+                    lambda vl: pp_text(vl, cost_rate_prev))
+        _write_card(loc_op,
+                    lambda vl: f'=IFERROR({op_curr},"")'  ,
+                    lambda vl: mom_text(vl, op_prev))
 
-        ws["A9"].value = f'=IFERROR({sales_rate_curr},"")'
-        ws["E9"].value = f'=IFERROR({admin_rate_curr},"")'
-        ws["I9"].value = f'=IFERROR({ar_curr},"")'
-        ws["M9"].value = f'=IFERROR({inv_curr},"")'
+        # 净利润率卡片：依赖收入和净利润单元格地址
+        if loc_rate and loc_rev and loc_net:
+            rvc = get_column_letter(loc_rev["label_col"])
+            rvr = loc_rev["value_row"]
+            nvc = get_column_letter(loc_net["label_col"])
+            nvr = loc_net["value_row"]
+            rate_vr = loc_rate["value_row"]
+            rate_vc = loc_rate["label_col"]
+            rate_dr = loc_rate["delta_row"]
+            ws.cell(row=rate_vr, column=rate_vc).value = (
+                f'=IFERROR({nvc}{nvr}/{rvc}{rvr},"")'
+            )
+            ws.cell(row=rate_dr, column=rate_vc).value = pp_text(
+                f"({nvc}{nvr}/{rvc}{rvr})",
+                f"({net_prev}/{revenue_prev})",
+            )
 
-        ws["A11"].value = pp_text("A9", sales_rate_prev)
-        ws["E11"].value = pp_text("E9", admin_rate_prev)
-        ws["I11"].value = mom_text("I9", ar_prev)
-        ws["M11"].value = mom_text("M9", inv_prev)
+        # 营业利润率独立卡片（模板扩充时才有）
+        if loc_oprate and loc_oprate != loc_rate:
+            _write_card(loc_oprate,
+                        lambda vl: f'=IFERROR({op_rate_curr},"")'  ,
+                        lambda vl: pp_text(vl, op_rate_prev))
+
+        # ── Group 2: sales-rate / admin-rate / AR / inventory ────────────────
+        loc_sales = self._dashboard_locate_card(ws, "销售费用率")
+        loc_admin = self._dashboard_locate_card(ws, "管理费用率")
+        loc_ar    = self._dashboard_locate_card(ws, "应收账款")
+        loc_inv   = (self._dashboard_locate_card(ws, "存货期末")
+                     or self._dashboard_locate_card(ws, "存货余额"))
+
+        _write_card(loc_sales,
+                    lambda vl: f'=IFERROR({sales_rate_curr},"")'  ,
+                    lambda vl: pp_text(vl, sales_rate_prev))
+        _write_card(loc_admin,
+                    lambda vl: f'=IFERROR({admin_rate_curr},"")'  ,
+                    lambda vl: pp_text(vl, admin_rate_prev))
+        _write_card(loc_ar,
+                    lambda vl: f'=IFERROR({ar_curr},"")'  ,
+                    lambda vl: mom_text(vl, ar_prev))
+        _write_card(loc_inv,
+                    lambda vl: f'=IFERROR({inv_curr},"")'  ,
+                    lambda vl: mom_text(vl, inv_prev))
+
         self._write_dashboard_financial_rate_summary_card_formulas(ws)
 
-        ws["B13"].value = f'=IFERROR({days_curr},"")'
-        ws["D13"].value = f'=IFERROR(B13-({days_prev}),"")'
+        # ── Inventory-turnover days supplemental block ──────────────────────
+        _turnover = self._dashboard_locate_turnover_row(ws)
+        if _turnover:
+            _tv_row, _tv_col, _td_col = _turnover
+            _tv_letter = get_column_letter(_tv_col)
+            ws.cell(row=_tv_row, column=_tv_col).value = f'=IFERROR({days_curr},"")'
+            ws.cell(row=_tv_row, column=_td_col).value = (
+                f'=IFERROR({_tv_letter}{_tv_row}-({days_prev}),"")'
+            )
         self._repair_dashboard_target_table_formulas(ws, budget_header_row=budget_header_row)
 
         # 仪表盘比较口径统一为“较上月”，避免模板残留“较上一年/较上年”文案误导。
@@ -5191,11 +5415,7 @@ class ReportGenerator:
         if not scoped.columns.is_unique:
             scoped = scoped.loc[:, ~scoped.columns.duplicated()].copy()
 
-        if 'MonthStr' not in scoped.columns:
-            date_col = next((c for c in scoped.columns if '日期' in str(c) or 'Date' in str(c)), None)
-            if date_col:
-                scoped['ParsedDate'] = pd.to_datetime(scoped[date_col], errors='coerce')
-                scoped['MonthStr'] = scoped['ParsedDate'].dt.strftime('%Y-%m')
+        scoped = self._ensure_parsed_date_and_month(scoped)
         if 'MonthStr' not in scoped.columns:
             return None
 
@@ -7087,6 +7307,9 @@ class ReportGenerator:
             if not cat:
                 continue
             product = ws.cell(row=r, column=product_col).value if product_col else cat
+            cat = self._normalize_product_family(cat, product)
+            if not cat:
+                continue
             product_label = self._short_chart_label(product or cat, 18)
             revenue = self._to_float(ws.cell(row=r, column=revenue_col).value) if revenue_col else None
             inventory = self._to_float(ws.cell(row=r, column=inventory_col).value) if inventory_col else None
@@ -7959,7 +8182,7 @@ class ReportGenerator:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        work = df.copy()
+        work = self._drop_older_source_duplicate_rows(df.copy())
         work.columns = [str(c).strip().rstrip('\t') for c in work.columns]
         for col in work.columns:
             if work[col].dtype == object:
@@ -7986,7 +8209,7 @@ class ReportGenerator:
         summary_col = self._pick_ledger_column(work, ["摘要", "说明", "用途"])
         party_col = self._pick_ledger_column(
             work,
-            ["往来单位名", "对应往来单位名", "供应商名", "客户名", "供应商", "客户", "单位名", "收货公司"],
+            ["账页往来单位名", "往来单位名", "对应往来单位名", "供应商名", "客户名", "供应商", "客户", "单位名", "收货公司"],
         )
         subject_col = self._pick_ledger_column(work, ["相对科目编码名", "科目名", "对方科目", "账户名"])
 
@@ -8336,6 +8559,7 @@ class ReportGenerator:
             category = None
             if '品目组合1名' in group and not group.get('品目组合1名').dropna().empty:
                 category = group.get('品目组合1名').dropna().iloc[0]
+            category = self._normalize_product_family(category, name)
             avg_price = revenue / qty if (revenue is not None and qty not in (None, 0)) else None
             avg_cost = cost / qty if (cost is not None and qty not in (None, 0)) else None
             code_text = str(code).strip()
@@ -8499,8 +8723,16 @@ class ReportGenerator:
         total_revenue = self._sum_numeric_or_none(df.get('Revenue'))
         total_cost = self._sum_numeric_or_none(df.get('Cost'))
         total_profit = (total_revenue - total_cost) if (total_revenue is not None and total_cost is not None) else None
+        name_col = next((c for c in ['品目名', '产品名称', '品目名规格'] if c in df.columns), None)
+        df['_NormalizedCategory'] = df.apply(
+            lambda row: self._normalize_product_family(
+                row.get('品目组合1名'), row.get(name_col) if name_col else None
+            ),
+            axis=1,
+        )
+        df = df[df['_NormalizedCategory'].notna()].copy()
         rows = []
-        for category, group in df.groupby('品目组合1名'):
+        for category, group in df.groupby('_NormalizedCategory'):
             metrics = self._calc_sales_metrics_from_group(group)
             revenue = metrics.get('revenue')
             cost = metrics.get('cost')
@@ -8584,25 +8816,79 @@ class ReportGenerator:
     def _get_ar_balance_by_customer(self, target_year, target_month):
         if self.ar_detail_df is None or self.ar_detail_df.empty:
             return {}
-        df = self.ar_detail_df.copy()
-        date_col = next((c for c in df.columns if '日期' in str(c)), None)
-        cust_col = next((c for c in df.columns if '往来单位名' in str(c)), None)
-        debit_col = next((c for c in df.columns if '借方金额' in str(c)), None)
-        credit_col = next((c for c in df.columns if '贷方金额' in str(c)), None)
-        if not date_col or not cust_col or not debit_col or not credit_col:
+        df = self._drop_older_source_duplicate_rows(self.ar_detail_df.copy())
+        df.columns = [str(c).strip().rstrip('\t') for c in df.columns]
+
+        # The ledger exports contain both foreign-currency movements and the
+        # local-currency running balance.  A customer closing balance must come
+        # from the exact local "余额" column; reconstructing it from fuzzy
+        # "借方金额/贷方金额" matches can accidentally select the foreign-currency
+        # columns and can also omit opening balances and FX adjustments.
+        balance_col = self._pick_ledger_amount_column(df, "余额")
+        if not balance_col:
             return {}
 
-        df['ParsedDate'] = pd.to_datetime(df[date_col], errors='coerce')
+        if "ParsedDate" in df.columns:
+            parsed = pd.to_datetime(df["ParsedDate"], errors="coerce")
+        else:
+            _, parsed = self._pick_best_date_column(
+                df, ["日期", "date", "业务日期", "单据日期", "日期-号码"]
+            )
+        if parsed is None or parsed.notna().sum() == 0:
+            return {}
+        df["_BalanceDate"] = parsed
+
         if target_year and target_month:
-            end_dt = datetime(int(target_year), int(target_month), 1)
-            last_day = (end_dt.replace(day=28) + pd.Timedelta(days=4)).replace(day=1) - pd.Timedelta(days=1)
-            df = df[df['ParsedDate'] <= last_day]
-        df['Debit'] = pd.to_numeric(df[debit_col], errors='coerce').fillna(0)
-        df['Credit'] = pd.to_numeric(df[credit_col], errors='coerce').fillna(0)
-        df['Amount'] = df['Debit'] - df['Credit']
-        df = df.dropna(subset=[cust_col])
-        balances = df.groupby(cust_col)['Amount'].sum().to_dict()
-        return balances
+            last_day = self._month_end_datetime(target_year, target_month)
+            df = df[df["_BalanceDate"] <= last_day]
+
+        page_party_col = self._pick_ledger_column(
+            df,
+            ["账页往来单位名", "账页客户名", "账页客户", "账页往来单位编码"],
+        )
+        row_party_col = self._pick_ledger_column(
+            df,
+            ["往来单位名", "客户名称", "客户名", "客户", "对应往来单位名"],
+        )
+        if not page_party_col and not row_party_col:
+            return {}
+
+        page_party = (
+            df[page_party_col].apply(self._normalize_party_name_key)
+            if page_party_col
+            else pd.Series("", index=df.index)
+        )
+        row_party = (
+            df[row_party_col].apply(self._normalize_party_name_key)
+            if row_party_col
+            else pd.Series("", index=df.index)
+        )
+        df["_CustomerKey"] = page_party.where(page_party != "", row_party)
+        df["_EndingBalance"] = pd.to_numeric(df[balance_col], errors="coerce")
+        df["_RowPosition"] = range(len(df))
+        df = df[
+            (df["_CustomerKey"] != "")
+            & df["_BalanceDate"].notna()
+            & df["_EndingBalance"].notna()
+        ].copy()
+        if df.empty:
+            return {}
+
+        # Prefer the latest dated balance.  For same-day overlapping exports,
+        # prefer the newer source file and then the later physical row, which is
+        # the final running-balance line within that customer ledger page.
+        source_priorities = []
+        for idx, row in df.iterrows():
+            source_priorities.append(
+                self._source_file_priority(row.get("SourceFile"), int(row["_RowPosition"]))
+            )
+        df["_SourceMtime"] = [item[0] for item in source_priorities]
+        df["_SourcePosition"] = [item[1] for item in source_priorities]
+        df = df.sort_values(
+            ["_CustomerKey", "_BalanceDate", "_SourceMtime", "_SourcePosition"]
+        )
+        latest = df.groupby("_CustomerKey", sort=False).tail(1)
+        return dict(zip(latest["_CustomerKey"], latest["_EndingBalance"]))
 
     def _update_customer_profit_sheet(self, wb, target_year, target_month, year_scope=None):
         ws = self._prepare_sheet(wb, "客户贡献与回款", insert_after="应收账款账龄分析")
@@ -8618,6 +8904,15 @@ class ReportGenerator:
         df['Qty'] = pd.to_numeric(df.get('数量'), errors='coerce')
         df = self._attach_sales_cost(df, target_year, target_month, year_scope)
         balances = self._get_ar_balance_by_customer(target_year, target_month)
+        period_start, period_end, period_days = self._ar_turnover_period_bounds(
+            target_year, target_month, year_scope
+        )
+        scope = self._normalize_year_scope(year_scope)
+        scope_label = {
+            "current": "本年累计",
+            "recent_two_years": "跨年累计（最多2年）",
+            "all": "历史累计",
+        }.get(scope, "期间累计")
         rows = []
         for cust, group in df.groupby('往来单位名'):
             metrics = self._calc_sales_metrics_from_group(group)
@@ -8627,7 +8922,14 @@ class ReportGenerator:
             profit = metrics.get('profit')
             margin = metrics.get('margin')
             ar_balance = balances.get(cust)
-            dso = (ar_balance / revenue * 365) if (ar_balance is not None and revenue) else None
+            # DSO must use the same sales period as the denominator.  A credit AR
+            # balance represents an advance/overpayment, so it does not create
+            # collection days and is reported as zero rather than a negative DSO.
+            dso = (
+                max(ar_balance, 0) / revenue * period_days
+                if (ar_balance is not None and revenue and revenue > 0)
+                else None
+            )
             rows.append([cust, qty, revenue, cost, profit, margin, ar_balance, dso])
         
         rows = sorted(rows, key=lambda x: x[2] if x[2] is not None else 0, reverse=True)
@@ -8639,8 +8941,50 @@ class ReportGenerator:
             cum_rev += rev
             r.append(cum_rev / total_rev if total_rev else 0)
             
-        headers = ["客户", "销量", "销售收入", "销售成本", "毛利润", "毛利率", "应收余额", "DSO(天)", "累计收入占比"]
-        self._write_table(ws, 1, 1, headers, rows)
+        period_text = (
+            f"统计期间：{period_start:%Y年%m月%d日}—{period_end:%Y年%m月%d日}"
+            f"（{scope_label}，共{period_days}天）"
+        )
+        basis_text = (
+            f"口径：销量、收入、成本及毛利为上述期间累计；应收余额取截至"
+            f"{period_end:%Y年%m月%d日}每个客户最后一笔有效本币余额；"
+            f"DSO=正数应收余额÷期间销售收入×{period_days}天。"
+        )
+        ws.merge_cells("A1:I1")
+        ws["A1"] = period_text
+        ws["A1"].font = Font(name="微软雅黑", size=12, bold=True, color="FFFFFF")
+        ws["A1"].fill = PatternFill("solid", fgColor="1F4E78")
+        ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[1].height = 24
+        ws.merge_cells("A2:I2")
+        ws["A2"] = basis_text
+        ws["A2"].font = Font(name="微软雅黑", size=10, color="404040")
+        ws["A2"].fill = PatternFill("solid", fgColor="D9EAF7")
+        ws["A2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws.row_dimensions[2].height = 32
+
+        headers = [
+            "客户", "期间销量", "期间销售收入", "期间销售成本", "期间毛利润",
+            "期间毛利率", "期末应收余额(本币)", "DSO(天)", "累计收入占比",
+        ]
+        header_row = 3
+        data_start_row = header_row + 1
+        data_end_row = header_row + len(rows)
+        self._write_table(ws, header_row, 1, headers, rows)
+        ws.freeze_panes = "A4"
+        if rows:
+            ws.auto_filter.ref = f"A{header_row}:I{data_end_row}"
+            for r in range(data_start_row, data_end_row + 1):
+                for c in (2, 3, 4, 5, 7, 8):
+                    ws.cell(row=r, column=c).number_format = '#,##0.00'
+                for c in (6, 9):
+                    ws.cell(row=r, column=c).number_format = '0.00%'
+        ws.column_dimensions['A'].width = 34
+        for col in ('B', 'C', 'D', 'E', 'G'):
+            ws.column_dimensions[col].width = 15
+        ws.column_dimensions['F'].width = 13
+        ws.column_dimensions['H'].width = 12
+        ws.column_dimensions['I'].width = 15
 
         start_col = len(headers) + 2
         top_rows = rows[:10]
@@ -8671,9 +9015,9 @@ class ReportGenerator:
             ws, 
             3, 
             6, 
-            1, 
-            2, 
-            1 + len(rows), 
+            header_row,
+            data_start_row,
+            data_end_row,
             "客户价值矩阵 (收入 vs 毛利率)",
             anchor_scatter,
             x_title="销售收入",
@@ -8858,11 +9202,7 @@ class ReportGenerator:
             return params, "自动分析缺少销售数据，沿用默认补货参数"
 
         sales_df = sales_df.copy()
-        if "MonthStr" not in sales_df.columns:
-            date_col = next((c for c in sales_df.columns if "日期" in str(c) or "Date" in str(c)), None)
-            if date_col:
-                sales_df["ParsedDate"] = pd.to_datetime(sales_df[date_col], errors="coerce")
-                sales_df["MonthStr"] = sales_df["ParsedDate"].dt.strftime("%Y-%m")
+        sales_df = self._ensure_parsed_date_and_month(sales_df)
         if "MonthStr" not in sales_df.columns or "品目编码" not in sales_df.columns or "数量" not in sales_df.columns:
             return params, "自动分析缺少销售月份、品目编码或数量字段，沿用默认补货参数"
 
@@ -9406,11 +9746,7 @@ class ReportGenerator:
             return
 
         sales_df = sales_df.copy()
-        if 'MonthStr' not in sales_df.columns:
-            date_col = next((c for c in sales_df.columns if '日期' in str(c) or 'Date' in str(c)), None)
-            if date_col:
-                sales_df['ParsedDate'] = pd.to_datetime(sales_df[date_col], errors='coerce')
-                sales_df['MonthStr'] = sales_df['ParsedDate'].dt.strftime('%Y-%m')
+        sales_df = self._ensure_parsed_date_and_month(sales_df)
 
         if 'MonthStr' not in sales_df.columns:
             self._write_table(ws, 1, 1, ["提示"], [["销售数据缺少月份字段"]])
@@ -11115,14 +11451,7 @@ class ReportGenerator:
             return pd.DataFrame()
 
         df = sales_df.copy()
-        if "MonthStr" not in df.columns:
-            if "ParsedDate" in df.columns:
-                df["MonthStr"] = pd.to_datetime(df["ParsedDate"], errors="coerce").dt.strftime("%Y-%m")
-            else:
-                date_col = next((c for c in df.columns if "日期" in str(c) or "Date" in str(c)), None)
-                if date_col:
-                    df["ParsedDate"] = pd.to_datetime(df[date_col], errors="coerce")
-                    df["MonthStr"] = df["ParsedDate"].dt.strftime("%Y-%m")
+        df = self._ensure_parsed_date_and_month(df)
         if "MonthStr" not in df.columns:
             return pd.DataFrame()
 
@@ -11142,7 +11471,13 @@ class ReportGenerator:
         category_col = "品目组合1名" if "品目组合1名" in df.columns else None
         df["ProductCode"] = df[code_col].astype(str).str.strip() if code_col else ""
         df["ProductName"] = df[name_col].astype(str).str.strip() if name_col else ""
-        df["Category"] = df[category_col].astype(str).str.strip() if category_col else "未分类"
+        df["Category"] = df.apply(
+            lambda row: self._normalize_product_family(
+                row.get(category_col) if category_col else None,
+                row.get(name_col) if name_col else None,
+            ) or "未分类",
+            axis=1,
+        )
         df.loc[df["ProductCode"].str.lower().isin(["nan", "none"]), "ProductCode"] = ""
         df.loc[df["ProductName"].str.lower().isin(["nan", "none"]), "ProductName"] = ""
         df.loc[df["Category"].str.lower().isin(["", "nan", "none"]), "Category"] = "未分类"
@@ -12484,7 +12819,7 @@ class ReportGenerator:
             cost = sales.get('cost')
             profit = revenue - cost if revenue is not None and cost is not None else None
             margin = profit / revenue if (profit is not None and revenue not in (None, 0)) else None
-            resolved_category = self._resolve_uncategorized_product(sales.get('category'), name_spec)
+            resolved_category = self._normalize_product_family(sales.get('category'), name_spec)
             self._safe_set_cell_value(ws, row_idx, 18, revenue)
             self._safe_set_cell_value(ws, row_idx, 19, qty)
             self._safe_set_cell_value(ws, row_idx, 20, sales.get('name') or name_spec)
@@ -12770,14 +13105,7 @@ class ReportGenerator:
         sales_df = self._get_sales_df()
         if sales_df is not None and not sales_df.empty and '品目编码' in sales_df.columns:
             sales_df = sales_df.copy()
-            if 'MonthStr' not in sales_df.columns:
-                if 'ParsedDate' in sales_df.columns:
-                    sales_df['MonthStr'] = pd.to_datetime(sales_df['ParsedDate'], errors='coerce').dt.strftime('%Y-%m')
-                else:
-                    date_col = next((c for c in sales_df.columns if '日期' in str(c) or 'Date' in str(c)), None)
-                    if date_col:
-                        sales_df['ParsedDate'] = pd.to_datetime(sales_df[date_col], errors='coerce')
-                        sales_df['MonthStr'] = sales_df['ParsedDate'].dt.strftime('%Y-%m')
+            sales_df = self._ensure_parsed_date_and_month(sales_df)
             if 'MonthStr' in sales_df.columns:
                 sales_df = sales_df[sales_df['MonthStr'].notna()].copy()
                 sales_df = sales_df[sales_df['MonthStr'].astype(str) <= latest_month]
@@ -12832,14 +13160,7 @@ class ReportGenerator:
             return pd.DataFrame(columns=["MonthStr", "PartnerCode", "PartnerName", "PartnerCategory", "AccountSubject"])
 
         frame = df.copy()
-        if "MonthStr" not in frame.columns:
-            if "ParsedDate" in frame.columns:
-                frame["MonthStr"] = pd.to_datetime(frame["ParsedDate"], errors="coerce").dt.strftime("%Y-%m")
-            else:
-                date_col = next((c for c in frame.columns if '日期' in str(c) or 'Date' in str(c)), None)
-                if date_col:
-                    frame["ParsedDate"] = pd.to_datetime(frame[date_col], errors="coerce")
-                    frame["MonthStr"] = frame["ParsedDate"].dt.strftime("%Y-%m")
+        frame = self._ensure_parsed_date_and_month(frame)
         if "MonthStr" not in frame.columns and fallback_month:
             frame["MonthStr"] = fallback_month
         if "MonthStr" not in frame.columns:
@@ -12977,11 +13298,7 @@ class ReportGenerator:
             df['Qty'] = pd.to_numeric(df.get('数量'), errors='coerce')
         else:
             df['Qty'] = pd.to_numeric(df.get('Qty'), errors='coerce')
-        if 'MonthStr' not in df.columns:
-            date_col = next((c for c in df.columns if '日期' in str(c) or 'Date' in str(c)), None)
-            if date_col:
-                df['ParsedDate'] = pd.to_datetime(df[date_col], errors='coerce')
-                df['MonthStr'] = df['ParsedDate'].dt.strftime('%Y-%m')
+        df = self._ensure_parsed_date_and_month(df)
         if 'MonthStr' not in df.columns and target_year and target_month:
             df['MonthStr'] = f"{target_year}-{int(target_month):02d}"
 
@@ -13023,7 +13340,13 @@ class ReportGenerator:
             if source_df is None or source_df.empty:
                 return pd.DataFrame()
             work = source_df.copy()
-            work['Category'] = work.get('品目组合1名')
+            name_col = next((c for c in ['品目名', '产品名称', '品目名规格'] if c in work.columns), None)
+            work['Category'] = work.apply(
+                lambda row: self._normalize_product_family(
+                    row.get('品目组合1名'), row.get(name_col) if name_col else None
+                ),
+                axis=1,
+            )
             work['Revenue'] = self._extract_sales_revenue(work)
             work['Qty'] = pd.to_numeric(work.get('数量'), errors='coerce')
             return self._attach_sales_cost(work, target_year, target_month, scope)
@@ -13324,14 +13647,7 @@ class ReportGenerator:
             sales_df = pd.DataFrame(columns=['MonthStr', '品目编码', '品目名', '品目组合1名', '数量'])
         else:
             sales_df = sales_df.copy()
-        if 'MonthStr' not in sales_df.columns:
-            if 'ParsedDate' in sales_df.columns:
-                sales_df['MonthStr'] = pd.to_datetime(sales_df['ParsedDate'], errors='coerce').dt.strftime('%Y-%m')
-            else:
-                date_col = next((c for c in sales_df.columns if '日期' in str(c) or 'Date' in str(c)), None)
-                if date_col:
-                    parsed = pd.to_datetime(sales_df[date_col], errors='coerce')
-                    sales_df['MonthStr'] = parsed.dt.strftime('%Y-%m')
+        sales_df = self._ensure_parsed_date_and_month(sales_df)
         display_sales_df = self._filter_df_by_scope(sales_df.copy(), target_year, target_month, year_scope)
         annual_sales_df = self._filter_df_by_scope(sales_df.copy(), target_year, target_month, "current")
 
@@ -13539,6 +13855,12 @@ class ReportGenerator:
                 category=('品目组合1名', 'first'),
                 product_name=('品目名', 'first')
             ).reset_index()
+            grouped['category'] = grouped.apply(
+                lambda row: self._normalize_product_family(
+                    row.get('category'), row.get('product_name')
+                ),
+                axis=1,
+            )
             grouped.loc[grouped['year_cost_non_na'] == 0, 'year_cost'] = None
             grouped['year_profit'] = grouped.apply(
                 lambda r: (r['year_revenue'] - r['year_cost'])
@@ -13559,6 +13881,12 @@ class ReportGenerator:
             meta = work.groupby('品目编码').agg(
                 category=('品目组合1名', 'first'),
                 product_name=('品目名', 'first'),
+            )
+            meta['category'] = meta.apply(
+                lambda row: self._normalize_product_family(
+                    row.get('category'), row.get('product_name')
+                ),
+                axis=1,
             )
             return meta
 
@@ -14719,13 +15047,8 @@ class ReportGenerator:
         if not cust_col:
             return
 
-        debit_col = None
-        credit_col = None
-        for c in df.columns:
-            if '借方金额' in c:
-                debit_col = c
-            if '贷方金额' in c:
-                credit_col = c
+        debit_col = self._pick_ledger_amount_column(df, "借方金额") or self._pick_ledger_amount_column(df, "借方")
+        credit_col = self._pick_ledger_amount_column(df, "贷方金额") or self._pick_ledger_amount_column(df, "贷方")
         if not debit_col or not credit_col:
             return
 
@@ -17081,11 +17404,7 @@ class ReportGenerator:
             return
 
         df = df.copy()
-        if 'MonthStr' not in df.columns:
-            date_col = next((c for c in df.columns if '日期' in str(c) or 'Date' in str(c)), None)
-            if date_col:
-                df['ParsedDate'] = pd.to_datetime(df[date_col], errors='coerce')
-                df['MonthStr'] = df['ParsedDate'].dt.strftime('%Y-%m')
+        df = self._ensure_parsed_date_and_month(df)
 
         if 'MonthStr' not in df.columns:
             self._write_table(ws, 1, 1, ["提示"], [["费用数据缺少月份字段"]])

@@ -94,6 +94,7 @@ class BaseDataManager:
         self._ensure_business_partner_local_code()
         self._ensure_business_partner_account_subject()
         self._ensure_product_inventory_columns()
+        self._ensure_product_group_column()
         self._init_default_rules()
         self._load_cache_maps()
 
@@ -159,6 +160,7 @@ class BaseDataManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code TEXT UNIQUE,
                 name TEXT,
+                product_group_name TEXT,
                 product_type TEXT,
                 spec_info TEXT,
                 unit TEXT,
@@ -452,6 +454,7 @@ class BaseDataManager:
         self._ensure_business_partner_local_code()
         self._ensure_business_partner_account_subject()
         self._ensure_product_inventory_columns()
+        self._ensure_product_group_column()
         self._init_default_rules()
         self._load_cache_maps()
         return {
@@ -713,6 +716,20 @@ class BaseDataManager:
                 print(f"已为 product 补充 {column_name} 列")
             except Exception as e:
                 print(f"补充 product.{column_name} 列失败: {e}")
+
+    def _ensure_product_group_column(self):
+        """为品目表补充品目组合字段（向后兼容）"""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(product)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "product_group_name" in columns:
+            return
+        try:
+            cursor.execute("ALTER TABLE product ADD COLUMN product_group_name TEXT")
+            self.conn.commit()
+            print("已为 product 补充 product_group_name 列")
+        except Exception as e:
+            print(f"补充 product_group_name 列失败: {e}")
 
     def _load_cache_maps(self):
         """加载智能识别缓存到内存，避免高频全表扫描"""
@@ -1280,6 +1297,7 @@ class BaseDataManager:
                 df_result = pd.DataFrame()
                 df_result['code'] = df['品目编码']
                 df_result['name'] = df.get('品目名', '')
+                df_result['product_group_name'] = df.get('品目组合1名', '')
                 df_result['product_type'] = df.get('品目类型', '')
                 df_result['spec_info'] = df.get('规格信息', '')
                 df_result['unit'] = df.get('单位', '')
