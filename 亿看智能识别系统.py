@@ -1,4 +1,4 @@
-﻿﻿# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 一般凭证 Excel 模板转换工具（带 GUI + 自动识别列匹配）
 
@@ -11744,6 +11744,63 @@ class ExcelConverterGUI:
         if not current_month_value and month_values:
             self.report_month_var.set(month_values[-1])
 
+    def _report_dir_signature(self, base_dir):
+        """基础资料目录的指纹：文件名 + 大小 + 修改时间。任一变化即视为需要重新加载。"""
+        entries = []
+        try:
+            for name in sorted(os.listdir(base_dir)):
+                if not name.lower().endswith((".xlsx", ".xls")):
+                    continue
+                if name.startswith("~$"):
+                    continue
+                try:
+                    stat = os.stat(os.path.join(base_dir, name))
+                except OSError:
+                    continue
+                entries.append((name, stat.st_size, int(stat.st_mtime)))
+        except OSError:
+            return None
+        return tuple(entries)
+
+    def _get_report_generator(self, base_dir, force_reload=False):
+        """返回已加载基础资料的 ReportGenerator，目录未变化时复用上次的实例。
+
+        一次加载要读 150+ 个 Excel（约 1 分钟），而生成报告、批量生成、
+        刷新月份等操作原本每次都会重新加载一遍。
+        """
+        if not ReportGenerator:
+            raise RuntimeError("ReportGenerator 模块加载失败，请检查 report_generator.py")
+
+        signature = self._report_dir_signature(base_dir)
+        cache = getattr(self, "_report_generator_cache", None)
+        if (
+            not force_reload
+            and cache
+            and cache.get("dir") == base_dir
+            and signature is not None
+            and cache.get("signature") == signature
+        ):
+            generator = cache["generator"]
+            if generator.reset_run_state():
+                self._log_report("基础资料目录未变化，复用已加载的数据（跳过重新加载）。")
+                return generator
+
+        self._log_report("开始初始化报告生成器...")
+        generator = ReportGenerator(base_dir)
+        self._log_report("正在加载基础数据...")
+        generator.load_all_data()
+        if hasattr(generator, "snapshot_loaded_state"):
+            generator.snapshot_loaded_state()
+            self._report_generator_cache = {
+                "dir": base_dir,
+                "signature": signature,
+                "generator": generator,
+            }
+        return generator
+
+    def _invalidate_report_generator_cache(self):
+        self._report_generator_cache = None
+
     def _is_ui_thread(self):
         return threading.get_ident() == getattr(self, "_ui_thread_id", None)
 
@@ -12142,6 +12199,8 @@ class ExcelConverterGUI:
                 return
 
             result = generator.cleanup_superseded_data(items)
+            # 源文件已被删除/裁剪，缓存的已加载数据随之失效。
+            self._invalidate_report_generator_cache()
             deleted = set(os.path.abspath(path) for path in result.get("deleted", []))
             trimmed = set(os.path.abspath(item.get("path")) for item in result.get("trimmed", []))
             for item in selected:
@@ -12806,11 +12865,7 @@ class ExcelConverterGUI:
             self._set_report_progress(0, len(month_keys), f"准备批量生成 0/{len(month_keys)}")
             if no_template_mode:
                 self._log_report("⚠️ 无模板模式：将使用空白工作簿批量生成报告，不含原模板格式和图表。")
-            self._log_report("开始初始化报告生成器...")
-            generator = ReportGenerator(base_dir)
-
-            self._log_report("正在加载基础数据...")
-            generator.load_all_data()
+            generator = self._get_report_generator(base_dir)
             self._set_report_progress(0, len(month_keys), f"基础数据加载完成 0/{len(month_keys)}")
 
             try:
@@ -12967,11 +13022,7 @@ class ExcelConverterGUI:
             self._set_report_progress(0, len(month_keys), f"准备批量生成 0/{len(month_keys)}")
             if no_template_mode:
                 self._log_report("⚠️ 无模板模式：将使用空白工作簿批量生成报告，不含原模板格式和图表。")
-            self._log_report("开始初始化报告生成器...")
-            generator = ReportGenerator(base_dir)
-
-            self._log_report("正在加载基础数据...")
-            generator.load_all_data()
+            generator = self._get_report_generator(base_dir)
             self._set_report_progress(0, len(month_keys), f"基础数据加载完成 0/{len(month_keys)}")
 
             try:
@@ -13133,11 +13184,7 @@ class ExcelConverterGUI:
             self._set_report_progress(0, 6, "准备生成报告")
             if no_template_mode:
                 self._log_report("⚠️ 无模板模式：将使用空白工作簿生成报告，不含原模板格式和图表。")
-            self._log_report("开始初始化报告生成器...")
-            generator = ReportGenerator(base_dir)
-
-            self._log_report("正在加载基础数据...")
-            generator.load_all_data()
+            generator = self._get_report_generator(base_dir)
             self._set_report_progress(1, 6, "基础数据加载完成")
 
             if hasattr(generator, "_get_data_quality_summary_for_scope"):
@@ -13395,11 +13442,7 @@ class ExcelConverterGUI:
             self._set_report_progress(0, 6, "准备生成报告")
             if no_template_mode:
                 self._log_report("⚠️ 无模板模式：将使用空白工作簿生成报告，不含原模板格式和图表。")
-            self._log_report("开始初始化报告生成器...")
-            generator = ReportGenerator(base_dir)
-            
-            self._log_report("正在加载基础数据...")
-            generator.load_all_data()
+            generator = self._get_report_generator(base_dir)
             self._set_report_progress(1, 6, "基础数据加载完成")
 
             if hasattr(generator, "_get_data_quality_summary_for_scope"):

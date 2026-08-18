@@ -24,6 +24,14 @@ import warnings
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
+# pandas 3.0 默认把字符串列换成 Arrow 类型(ArrowDtype)，
+# 本模块大量按元素访问字符串（逐行比较/取值），Arrow 下比 object 慢得多。
+# 实测：基础资料加载 91.7s -> 61.0s。恢复 pandas 2.x 的 object 语义。
+try:
+    pd.options.future.infer_string = False
+except Exception:
+    pass
+
 class ReportGenerator:
     DETAIL_ROW_MONTH_CATEGORIES = {"expense", "sales", "ar", "ap", "cash"}
 
@@ -71,6 +79,31 @@ class ReportGenerator:
         self.expense_detail_sheet_name = "费用异常明细"
         self.expense_analysis_sheet_name = "费用分析"
         self.expense_detail_key_row_map = {}
+        self._loaded_state_snapshot = None
+
+    def snapshot_loaded_state(self):
+        """记录“刚加载完基础资料”时的状态，供复用同一实例时回滚。"""
+        self._loaded_state_snapshot = {
+            "audit_logs": list(self.audit_logs),
+            "data_quality_issues": list(self.data_quality_issues),
+            "report_params": copy.deepcopy(self.report_params),
+        }
+
+    def reset_run_state(self):
+        """把实例恢复到刚加载完数据的状态，等价于新建一个实例并重新加载。
+
+        用于复用已加载的实例生成下一份报告：已解析的 self.data 保留，
+        而审计日志、数据质量问题、报表参数等按次累积的状态被清回加载后的基线。
+        """
+        snapshot = self._loaded_state_snapshot
+        if not snapshot:
+            return False
+        self.audit_logs = list(snapshot["audit_logs"])
+        self.data_quality_issues = list(snapshot["data_quality_issues"])
+        self.report_params = copy.deepcopy(snapshot["report_params"])
+        self.expense_detail_key_row_map = {}
+        self.year_scope = "current"
+        return True
 
     def _normalize_year_scope(self, year_scope=None):
         raw = self.year_scope if year_scope is None else year_scope
@@ -5316,13 +5349,23 @@ class ReportGenerator:
     def _copy_cell_style(self, src, dst):
         if not src or not dst:
             return
-        if src.has_style:
-            dst.font = copy.copy(src.font)
-            dst.border = copy.copy(src.border)
-            dst.fill = copy.copy(src.fill)
-            dst.number_format = src.number_format
-            dst.protection = copy.copy(src.protection)
-            dst.alignment = copy.copy(src.alignment)
+        if not src.has_style:
+            return
+        # 同一个工作簿内直接复制样式索引(StyleArray)即可，效果完全一致。
+        # 逐属性赋值会让 openpyxl 把字体/边框/填充重新登记进样式表，
+        # 每次都在 IndexedList 里做一遍线性深比较，是复制列/行样式的主要开销。
+        try:
+            if src.parent.parent is dst.parent.parent:
+                dst._style = copy.copy(src._style)
+                return
+        except AttributeError:
+            pass
+        dst.font = copy.copy(src.font)
+        dst.border = copy.copy(src.border)
+        dst.fill = copy.copy(src.fill)
+        dst.number_format = src.number_format
+        dst.protection = copy.copy(src.protection)
+        dst.alignment = copy.copy(src.alignment)
 
     def _clone_hyperlink(self, link, dest_cell):
         if not link or not dest_cell:
@@ -5514,6 +5557,26 @@ class ReportGenerator:
             return False
         cell.value = self._sanitize_excel_text(value)
         return True
+
+    def _clear_cell_range(self, ws, min_row, max_row=None, min_col=1, max_col=None):
+        """清空矩形区域的单元格值（保留样式）。
+
+        注意：ws.max_row / ws.max_column 是 O(单元格数) 的属性，
+        写在嵌套循环里会退化成平方复杂度（实测 32 万格清空需 258s）。
+        这里把边界一次性取出后用 iter_rows 遍历，等价但快约 290 倍。
+        """
+        sheet_max_row = ws.max_row
+        sheet_max_col = ws.max_column
+        max_row = sheet_max_row if max_row is None else min(max_row, sheet_max_row)
+        max_col = sheet_max_col if max_col is None else min(max_col, sheet_max_col)
+        if max_row < min_row or max_col < min_col:
+            return
+        for row in ws.iter_rows(min_row=min_row, max_row=max_row,
+                                min_col=min_col, max_col=max_col):
+            for cell in row:
+                if isinstance(cell, MergedCell):
+                    continue
+                cell.value = None
 
     def _sanitize_excel_text(self, value):
         """
@@ -7384,9 +7447,7 @@ class ReportGenerator:
         # Keep a stable helper range so chart references do not drift right across regenerations.
         start_col = 28  # AB
         helper_end_col = start_col + 8
-        for r in range(1, ws.max_row + 1):
-            for c in range(start_col, helper_end_col + 1):
-                self._safe_set_cell_value(ws, r, c, None)
+        self._clear_cell_range(ws, 1, min_col=start_col, max_col=helper_end_col)
 
         anchor_col = start_col + 4
         row_cursor = 1
@@ -8725,9 +8786,10 @@ class ReportGenerator:
 
             block_width = 14
             clear_end_row = max(ws.max_row, 300)
-            for r in range(1, clear_end_row + 1):
-                for c in range(merge_start_col, merge_start_col + block_width):
-                    self._safe_set_cell_value(ws, r, c, None)
+            self._clear_cell_range(
+                ws, 1, clear_end_row,
+                min_col=merge_start_col, max_col=merge_start_col + block_width - 1,
+            )
 
             ws.cell(row=1, column=merge_start_col).value = merge_header
             ws.cell(row=2, column=merge_start_col).value = "与【按品类汇总(按月)】合并展示的品类贡献分析区"
@@ -12522,9 +12584,7 @@ class ReportGenerator:
         rows.sort(key=lambda x: (x['费用类别'], x['子科目']))
 
         # Clear old rows
-        for r in range(2, ws.max_row + 1):
-            for c in range(1, ws.max_column + 1):
-                self._safe_set_cell_value(ws, r, c, None)
+        self._clear_cell_range(ws, 2)
 
         row_idx = 2
         for row in rows:
@@ -12818,9 +12878,7 @@ class ReportGenerator:
                 }
 
         # Clear old data
-        for r in range(2, ws.max_row + 1):
-            for c in range(1, ws.max_column + 1):
-                self._safe_set_cell_value(ws, r, c, None)
+        self._clear_cell_range(ws, 2)
 
         row_idx = 2
         month_label = f"{target_year}/{int(target_month):02d}"
@@ -14077,11 +14135,15 @@ class ReportGenerator:
         if missing_codes:
             insert_row = total_row if total_row else ws.max_row + 1
             style_row = insert_row - 1 if insert_row > 2 else 2
+            # 一次性插入所需行数：openpyxl 的 insert_rows 每次都要搬动下方全部单元格，
+            # 逐行插入会退化成 O(缺失行数 × 表格单元格数)。
+            self._insert_rows_preserve_merges(ws, insert_row, len(missing_codes))
+            if total_row is not None and insert_row <= total_row:
+                total_row += len(missing_codes)
+            insert_max_col = ws.max_column
             for code in missing_codes:
-                self._insert_rows_preserve_merges(ws, insert_row)
-                self._copy_row_style(ws, style_row, insert_row)
-                for c in range(1, ws.max_column + 1):
-                    self._safe_set_cell_value(ws, insert_row, c, None)
+                self._copy_row_style(ws, style_row, insert_row, max_col=insert_max_col)
+                self._clear_cell_range(ws, insert_row, insert_row, 1, insert_max_col)
                 ws.cell(row=insert_row, column=code_col).value = code
                 sales_row = sales_by_code.loc[code] if code in sales_by_code.index else None
                 meta_row = display_by_code.loc[code] if code in display_by_code.index else sales_row
@@ -14104,9 +14166,6 @@ class ReportGenerator:
                 if '产品大类' in header_map and resolved_category is not None:
                     ws.cell(row=insert_row, column=header_map['产品大类']).value = resolved_category
                 style_row = insert_row
-                # 插入发生在合计行之前时，合计行会整体下移，需同步行号。
-                if total_row is not None and insert_row <= total_row:
-                    total_row += 1
                 insert_row += 1
 
         if total_row is None:
@@ -14645,6 +14704,18 @@ class ReportGenerator:
 
         first_month = current_keys[0] if current_keys else (required_month_keys[0] if required_month_keys else None)
         last_month = current_keys[-1] if current_keys else (required_month_keys[-1] if required_month_keys else None)
+
+        # 预聚合：原实现对每个产品、每个月都做一次全表布尔筛选
+        # (产品数 × 月份数 次全表扫描)，这里一次 groupby 得到同样的分组结果。
+        empty_metrics = self._calc_sales_metrics_from_group(source_df.iloc[0:0])
+        period_metrics_by_code = {
+            str(code): self._calc_sales_metrics_from_group(group)
+            for code, group in current_df.groupby('Code', dropna=False)
+        }
+        month_metrics_by_code = {}
+        for (m_key, code), group in source_df.groupby(['MonthStr', 'Code'], dropna=False):
+            month_metrics_by_code[(str(m_key), str(code))] = self._calc_sales_metrics_from_group(group)
+
         row_idx = 2
         for _, row in code_stats.iterrows():
             code = str(row.get('Code') or '').strip()
@@ -14658,8 +14729,7 @@ class ReportGenerator:
                         break
             ws.cell(row=row_idx, column=1).value = self._product_compare_display_label(code, name)
 
-            period_group = current_df[current_df['Code'] == code]
-            period_metrics = self._calc_sales_metrics_from_group(period_group)
+            period_metrics = period_metrics_by_code.get(code, empty_metrics)
             start_cost = cost_by_month.get(first_month, {}).get(code, {}) if first_month else {}
             end_cost = cost_by_month.get(last_month, {}).get(code, {}) if last_month else {}
             values = [
@@ -14691,8 +14761,7 @@ class ReportGenerator:
                 col += 1
 
             for m_key in required_month_keys:
-                m_group = source_df[(source_df['MonthStr'] == m_key) & (source_df['Code'] == code)]
-                m_metrics = self._calc_sales_metrics_from_group(m_group)
+                m_metrics = month_metrics_by_code.get((str(m_key), code), empty_metrics)
                 c_map = cost_by_month.get(m_key, {}).get(code, {})
                 qty_change = (
                     c_map.get('qty_end') - c_map.get('qty_start')
@@ -15256,9 +15325,7 @@ class ReportGenerator:
 
         ws._charts = []
         clear_cols = max(ws.max_column, len(headers) + 18)
-        for r in range(1, ws.max_row + 1):
-            for c in range(1, clear_cols + 1):
-                self._safe_set_cell_value(ws, r, c, None)
+        self._clear_cell_range(ws, 1, max_col=clear_cols)
         for col, header in enumerate(headers, start=1):
             ws.cell(row=1, column=col).value = header
         self._apply_header_style(ws, 1, 1, len(headers))
@@ -17217,13 +17284,9 @@ class ReportGenerator:
         # 先清理主表历史残留，确保只保留一段主表头。
         start_row = 2
         clear_end = max(ws.max_row, start_row + (len(df) if df is not None else 0) + 300)
-        for r in range(start_row, clear_end + 1):
-            for c in range(1, 9):
-                self._safe_set_cell_value(ws, r, c, None)
+        self._clear_cell_range(ws, start_row, clear_end, min_col=1, max_col=8)
         max_clear_col = max(ws.max_column, 9)
-        for r in range(1, min(clear_end, ws.max_row) + 1):
-            for c in range(9, max_clear_col + 1):
-                self._safe_set_cell_value(ws, r, c, None)
+        self._clear_cell_range(ws, 1, clear_end, min_col=9, max_col=max_clear_col)
 
         for idx, h in enumerate(main_headers, start=1):
             self._safe_set_cell_value(ws, 1, idx, h)
