@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿﻿# -*- coding: utf-8 -*-
 """
 一般凭证 Excel 模板转换工具（带 GUI + 自动识别列匹配）
 
@@ -12707,9 +12707,21 @@ class ExcelConverterGUI:
         if not os.path.exists(base_dir):
             messagebox.showwarning("提示", f"基础资料目录不存在: {base_dir}")
             return
+        # --- 模板文件检测：不存在时询问是否启用无模板模式（批量）---
+        no_template_mode = False
         if not os.path.exists(template_path):
-            messagebox.showwarning("提示", f"模板文件不存在: {template_path}")
-            return
+            answer = messagebox.askyesno(
+                "未找到报告模板",
+                f"未检测到报告模板文件：\n{template_path}\n\n"
+                "是否启用【无模板模式】批量生成？\n"
+                "（将使用空白工作簿生成报告，仅包含程序自动计算的数据表，\n"
+                " 不含原模板的格式、图表及自定义布局。）\n\n"
+                "点击【否】可重新在上方选择模板文件。",
+            )
+            if not answer:
+                return
+            no_template_mode = True
+            template_path = ""  # 传空字符串，report_generator 会走无模板分支
 
         try:
             start_year, start_month = self._parse_report_year_month(
@@ -12751,7 +12763,7 @@ class ExcelConverterGUI:
             )
 
         self._start_report_background_task(
-            "批量生成经营报告",
+            "批量生成经营报告（无模板模式）" if no_template_mode else "批量生成经营报告",
             lambda: self._generate_business_report_batch_core(
                 base_dir=base_dir,
                 template_path=template_path,
@@ -12765,6 +12777,7 @@ class ExcelConverterGUI:
                 run_ai_analysis=run_ai_analysis,
                 ai_backend=ai_backend,
                 enable_chart_recognition=enable_chart_recognition,
+                no_template_mode=no_template_mode,
             ),
         )
         return
@@ -12791,6 +12804,8 @@ class ExcelConverterGUI:
         summary = []
         try:
             self._set_report_progress(0, len(month_keys), f"准备批量生成 0/{len(month_keys)}")
+            if no_template_mode:
+                self._log_report("⚠️ 无模板模式：将使用空白工作簿批量生成报告，不含原模板格式和图表。")
             self._log_report("开始初始化报告生成器...")
             generator = ReportGenerator(base_dir)
 
@@ -12926,6 +12941,7 @@ class ExcelConverterGUI:
         run_ai_analysis,
         ai_backend,
         enable_chart_recognition,
+        no_template_mode=False,
     ):
         import sys
         import io
@@ -12949,6 +12965,8 @@ class ExcelConverterGUI:
         summary = []
         try:
             self._set_report_progress(0, len(month_keys), f"准备批量生成 0/{len(month_keys)}")
+            if no_template_mode:
+                self._log_report("⚠️ 无模板模式：将使用空白工作簿批量生成报告，不含原模板格式和图表。")
             self._log_report("开始初始化报告生成器...")
             generator = ReportGenerator(base_dir)
 
@@ -13090,6 +13108,7 @@ class ExcelConverterGUI:
         ai_backend,
         enable_chart_recognition,
         open_in_converter=False,
+        no_template_mode=False,
     ):
         import sys
         import io
@@ -13112,6 +13131,8 @@ class ExcelConverterGUI:
 
         try:
             self._set_report_progress(0, 6, "准备生成报告")
+            if no_template_mode:
+                self._log_report("⚠️ 无模板模式：将使用空白工作簿生成报告，不含原模板格式和图表。")
             self._log_report("开始初始化报告生成器...")
             generator = ReportGenerator(base_dir)
 
@@ -13306,9 +13327,21 @@ class ExcelConverterGUI:
         if not os.path.exists(base_dir):
             messagebox.showwarning("提示", f"基础资料目录不存在: {base_dir}")
             return
+        # --- 模板文件检测：不存在时询问是否启用无模板模式 ---
+        no_template_mode = False
         if not os.path.exists(template_path):
-            messagebox.showwarning("提示", f"模板文件不存在: {template_path}")
-            return
+            answer = messagebox.askyesno(
+                "未找到报告模板",
+                f"未检测到报告模板文件：\n{template_path}\n\n"
+                "是否启用【无模板模式】？\n"
+                "（将使用空白工作簿生成报告，仅包含程序自动计算的数据表，\n"
+                " 不含原模板的格式、图表及自定义布局。）\n\n"
+                "点击【否】可重新在上方选择模板文件。",
+            )
+            if not answer:
+                return
+            no_template_mode = True
+            template_path = ""  # 传空字符串，report_generator 会走无模板分支
 
         run_ai_analysis = self.report_ai_analysis_var.get()
         enable_chart_recognition = self.report_ai_chart_recognition_var.get()
@@ -13319,7 +13352,7 @@ class ExcelConverterGUI:
             )
 
         self._start_report_background_task(
-            "生成经营报告",
+            "生成经营报告（无模板模式）" if no_template_mode else "生成经营报告",
             lambda: self._generate_business_report_core(
                 base_dir=base_dir,
                 template_path=template_path,
@@ -13334,6 +13367,7 @@ class ExcelConverterGUI:
                 ai_backend=ai_backend,
                 enable_chart_recognition=enable_chart_recognition,
                 open_in_converter=open_in_converter,
+                no_template_mode=no_template_mode,
             ),
         )
         return
@@ -13359,6 +13393,8 @@ class ExcelConverterGUI:
 
         try:
             self._set_report_progress(0, 6, "准备生成报告")
+            if no_template_mode:
+                self._log_report("⚠️ 无模板模式：将使用空白工作簿生成报告，不含原模板格式和图表。")
             self._log_report("开始初始化报告生成器...")
             generator = ReportGenerator(base_dir)
             

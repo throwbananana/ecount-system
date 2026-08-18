@@ -15993,12 +15993,21 @@ class ReportGenerator:
                 self.report_params.setdefault("cashflow", {}).update(cashflow_params)
             self.report_params.setdefault("ai", {})["include_placeholders"] = bool(include_ai_placeholders)
             self._log_audit(f"开始生成报告: {output_path}")
-            wb = openpyxl.load_workbook(template_path)
-
-            has_risk, risk_reasons = self._detect_template_risk(wb, template_path)
-            if has_risk and not allow_generated_report_template:
-                reason_text = "；".join(risk_reasons)
-                raise ValueError(f"模板疑似为已生成报告文件，不建议直接复用。{reason_text}")
+            # --- 无模板模式支持 ---
+            _template_missing = not template_path or not os.path.exists(template_path)
+            if _template_missing:
+                print("⚠️  未检测到模板文件，已启用无模板模式（使用空白工作簿）。")
+                self._log_audit("无模板模式：使用空白工作簿生成报告")
+                wb = openpyxl.Workbook()
+                # 移除默认的 Sheet，后续各 _generate_extended_reports 会按需创建
+                if "Sheet" in wb.sheetnames:
+                    del wb["Sheet"]
+            else:
+                wb = openpyxl.load_workbook(template_path)
+                has_risk, risk_reasons = self._detect_template_risk(wb, template_path)
+                if has_risk and not allow_generated_report_template:
+                    reason_text = "；".join(risk_reasons)
+                    raise ValueError(f"模板疑似为已生成报告文件，不建议直接复用。{reason_text}")
 
             if fail_on_data_quality_error:
                 dq = self.get_data_quality_summary()
