@@ -4,362 +4,168 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**亿看智能识别系统** (Yikan Intelligent Recognition System) is a Tkinter GUI application for converting arbitrary Excel files into standardized accounting voucher template format ("一般凭证") with intelligent column mapping, AI-powered field recognition, and integrated base data management.
+**亿看智能识别系统** (Yikan Intelligent Recognition System) — a single-window Tkinter desktop app that turns arbitrary business Excel/PDF/image files into ECount-compatible accounting artifacts, plus a large Excel report engine that builds monthly 经营分析报告 workbooks from ECount exports.
 
-**Core Capabilities**:
-1. Excel format conversion with intelligent column matching and field transformation rules
-2. AI-powered summary recognition (摘要智能识别) - extracts business type, partner info, account codes, amounts, dates from summary text
-3. Multi-field recognition from dedicated columns (日期, 金额, 汇率)
-4. Base data management with CRUD operations for 7 data types via SQLite
-5. Image intelligent recognition (图片智能识别) - OCR and AI-powered table extraction from images with template-based export
-6. Accounting reconciliation between local and Yikan formats
-7. Shipping/logistics cost management with multi-currency allocation
-8. Business intelligence report generation
+Everything is Chinese-language UI and data. Field names, sheet names, and config keys are Chinese string literals — they are load-bearing, not cosmetic.
 
-## Running the Application
+## Commands
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+pip install -r requirements.txt              # pandas openpyxl pdfplumber zhipuai numpy xlrd
+pip install -r requirements-optional.txt     # Pillow pytesseract openai paddleocr easyocr (image/OCR features)
 
-# Optional: For AI/OCR features
-pip install -r requirements-optional.txt
+python 亿看智能识别系统.py                    # run the GUI (entry point)
+python migrate_runtime_state.py              # move config.json/*.db out of the repo into %APPDATA%\ecount-system
 
-# Run the main application
-python 亿看智能识别系统.py
+# Validate a generated report against 基础资料 source data (CLI, no GUI)
+python validate_generated_report.py --report Generated_Report.xlsx --year 2026 --month 7 [--base-dir 基础资料] [--year-scope current|all]
 
-# Run tests
-python test_base_data.py              # Base data import/query tests
-python test_smart_recognition.py      # Summary recognition tests
-python test_multi_field_recognition.py # Multi-field recognition tests
-python test_preview_function.py       # Preview window tests
-python test_edit_functions.py         # CRUD operation tests
-python test_image_recognition.py      # Image recognition tests
-python test_auto_balance.py           # Debit/credit balance tests
-python test_actual_conversion.py      # Full conversion workflow tests
-python test_encoding_fix.py           # Character encoding tests
-python test_actual_matching.py        # Column matching tests
-python test_recon_sign.py             # Reconciliation sign/direction tests
+pyinstaller 亿看智能识别系统.spec             # packaging (spec's Analysis path is hardcoded to a Downloads copy — fix before use)
 ```
 
-**Environment Variables** (optional):
-- `ZHIPU_API_KEY` or `YIKAN_AI_API_KEY` - API key for ZhipuAI cloud service
+### Tests
+
+pytest 9 is installed and the newer tests are pytest-style; older ones are `python <file>` scripts with a `__main__` block.
+
+```bash
+# Never run bare `pytest` at the repo root: test_ai_key.py raises SystemExit at import
+# time when ZHIPU_API_KEY is unset, which aborts collection with an INTERNALERROR.
+python -m pytest test_report_generator_repairs.py          # report engine regressions (largest suite, ~3.9K lines)
+python -m pytest test_report_inventory_sync.py test_danfe_recognition_module.py test_template_path_resolution.py
+python -m pytest test_report_generator_repairs.py -k 品类   # single test
+
+python test_base_data.py            # base data import/query
+python test_smart_recognition.py    # summary recognition
+python test_auto_balance.py         # debit/credit balancing
+python test_shipping_module.py      # shipping DB + allocation
+python test_recon_sign.py           # reconciliation sign/direction
+```
+
+Note: `test_template_path_resolution.py` executes the whole main module (`spec.loader.exec_module`), so it exercises import-time side effects of `亿看智能识别系统.py`. A syntax error or bad import there fails this test first.
+
+### Sanity check before committing
+
+`python -m py_compile 亿看智能识别系统.py report_generator.py` — the two big files are edited most often and a broken one only surfaces at app start. `亿看智能识别系统.py` is stored **UTF-8 with BOM**; preserve exactly one BOM (a duplicated BOM at byte 0 produced `SyntaxError: invalid non-printable character U+FEFF`).
+
+**Environment variables**: `ZHIPU_API_KEY` / `YIKAN_AI_API_KEY` (ZhipuAI key, read as a fallback so keys need not be stored in the DB), `ECOUNT_SYSTEM_HOME` / `YIKAN_APP_HOME` (override the runtime dir used by `runtime_paths.py`).
+
+## Repository conventions
+
+`.gitignore` is a **whitelist**: `*` is ignored, then `!*.py`, `!*.md`, `!*/` re-included. Only Python and Markdown are tracked. Every `.xlsx`, `.db`, `.json` (including `config.json`), and template in the tree is untracked working data — adding one requires `git add -f`, and asking git for "the state of the data" is meaningless. `base_data.db` is ~800 MB locally; never copy or rewrite it wholesale.
+
+`历史上传数据/亿看智能识别系统/亿看智能识别系统/` is a tracked snapshot of an older full copy of the app. Greps hit it constantly — always check the path before editing, and never edit it as if it were live code.
+
+`*.py.rej` files at the root are leftovers from failed patch applications, not source.
 
 ## Architecture
 
-### Core Module Design
+### Module map
 
 ```
-亿看智能识别系统.py          # Main GUI application (entry point)
-├── base_data_manager.py     # SQLite database manager (7 base tables + system tables)
-├── summary_intelligence.py  # AI-powered text recognition engine
-├── image_intelligence.py    # Image OCR and AI vision recognition
-├── image_recognition_gui.py # Standalone image recognition GUI window
-├── export_format_manager.py # Flexible output format mapping system
-├── reconciliation_module.py # Standard format accounting reconciliation
-├── shipping_module.py       # Shipping cost management (shipping.db)
-├── bank_parser.py           # PDF bank statement extraction
-├── report_generator.py      # Business intelligence report generation
-└── treeview_tools.py        # GUI utilities for TreeView (smart code restoration)
+亿看智能识别系统.py     13.6K lines — GUI, all tabs, conversion pipeline (entry point)
+report_generator.py     17.7K lines — 经营分析报告 Excel engine (largest module)
+shipping_module.py       2.8K lines — 报关清单/柜子 costing, own SQLite (shipping.bd)
+base_data_manager.py     2.2K lines — SQLite base data + app settings + caches
+treeview_tools.py        1.4K lines — shared TreeView helpers, smart code restoration
+export_format_manager.py 1.3K lines — user-defined output column mappings (config.json)
+local_llm_analyzer.py    1.3K lines — LLM commentary written back into report workbooks
+image_recognition_gui.py 1.1K + image_intelligence.py 1.0K — image → table extraction
+summary_intelligence.py  1.0K lines — summary-text field recognition
+reconciliation_module.py 966 lines  — StandardReconciler (local ledger vs Yikan)
+danfe_recognition_module.py / danfe_xml_parser.py / danfe_recognition_gui.py — Brazilian DANFE invoices
+bank_parser.py, excel_merger.py, folder_processor.py, shipping_report_utils.py, runtime_paths.py
 ```
 
-### Operating Modes
+### The main window is one class
 
-The main application supports multiple conversion modes:
-- `MODE_GENERAL_VOUCHER` = "通用凭证模式" - Standard accounting vouchers
-- `MODE_SALES_OUTBOUND` = "销售出库模式" - Sales outbound/export format
-- `MODE_CUSTOM` = "自定义模式" - User-defined templates
-- `MODE_ORIGINAL` = "原格式模式(不使用模板)" - No template conversion
+`ExcelConverterGUI` spans lines ~675–13606 of `亿看智能识别系统.py` — every tab, dialog, and worker lives on it. Tabs are added in `_build_ui()` and each has its own `_build_*_tab()`:
 
-### 1. Main Application (`亿看智能识别系统.py`)
+| Tab | Builder | Backing module |
+|---|---|---|
+| Excel凭证转换 | `_build_excel_converter_tab` | template mapping + `summary_intelligence` |
+| 摘要匹配 | `_build_summary_match_tab` | in-file (fuzzy match summaries between two files) |
+| 智能对账系统 | `_build_reconciliation_tab` | `reconciliation_module`, `bank_parser` |
+| 基础数据管理 | `_build_base_data_tab` | `base_data_manager` |
+| 报关清单汇总 | `_build_shipping_tab` | `shipping_module` |
+| 经营报告 | `_build_report_tab` | `report_generator`, `local_llm_analyzer` |
+| 文档识别 (Docs) | `_build_document_recognition_tab` | `danfe_*` |
+| 文件夹平铺汇总 / 批量合并 | `_build_folder_processor_tab` / `_build_batch_merge_tab` | `folder_processor`, `excel_merger` |
+| 控制台 (Console) | `_build_console_tab` | stdout capture |
 
-**Key Components**:
-- `FIELD_RULES` (dict): Type and constraints for template columns - `"date"`, `"number"`, `"text"`
-- `FIELD_SYNONYMS` (dict): Synonym mappings for auto-matching source columns
-- `TemplateHeader` (dataclass): Stores template column name, position, comment
-- `load_template_headers()`: Extracts headers from `Template.xlsx` row 1
-- `normalize_header()`: Normalizes column names for matching
-- `score_similarity()`: Multi-strategy scoring (exact=1.0, contains=0.85, synonym=0.9, difflib)
-- `convert_value()`: Applies transformation based on field type
+Optional modules (`report_generator`, `excel_merger`, `folder_processor`, `bank_parser`, image and DANFE GUIs) are imported in `try/except ImportError` blocks. **A broken import silently removes its tab instead of raising** — if a feature "disappeared", check the import guard at the top of the file first.
 
-**GUI Structure**:
-- Menu bar with "基础数据" and "文件" menus for base data and file operations
-- Top section: File selection + sheet picker + mode selector
-- Middle section: Scrollable mapping grid (template → source dropdowns)
-- Bottom section: Auto-match button, Smart recognition checkbox, Default values button, Convert button
+Long-running work (report generation, batch runs) is dispatched via `_start_report_background_task()` onto a thread that talks back through a queue drained by `_poll_report_task_queue()`; UI calls from workers must go through `_queue_report_event` / `_report_call_main`, never directly.
 
-### 2. Base Data Manager (`base_data_manager.py`)
+### Path resolution
 
-**`BaseDataManager` class**:
-- `_init_database()`: Creates 7 tables + import_log table
-- `import_all_data()` / `import_single_file()`: Batch/single Excel import
-- `_clean_dataframe()`: Excel column → database column mapping with table-specific logic
-- `query(table, code)`: Retrieve by code
-- `search_by_name(table, keyword)`: Full-text search
-- `add_record()` / `update_record()` / `delete_record()`: CRUD operations
-- `get_table_columns()`: Returns column names for table
+Nothing assumes the CWD. `RESOURCE_ROOT_DIRS` (frozen-exe dir, its parents, `APP_DIR`, `os.getcwd()`) and `RESOURCE_SEARCH_DIRS` (each root + `基础数据/基础数据`, `基础资料`, `基础数据`) drive `resolve_resource_file()` / `resolve_resource_dir()` / `resolve_template_path()`. Use those helpers for any new asset; a bare relative path will break both the PyInstaller build and launches from another directory.
 
-**Database Tables** (Base Data):
-| Table | Primary Fields | Records |
-|-------|---------------|---------|
-| currency | code, name | 1 |
-| department | code, name | 2 |
-| warehouse | code, name | 3 |
-| account_subject | code, name | 254 |
-| product | code, name, category, etc. | 1674 |
-| business_partner | code, name, type, local_code | 480 |
-| bank_account | code, name, bank_name | 21 |
+Consequence: `Template.xlsx` is **not** in the repo root — it lives in `基础数据/基础数据/Template.xlsx`. On startup the app prefers `Template_通用凭证.xlsx` (repo root) if present. If no template resolves, the app offers a no-template mode (blank workbook) rather than failing.
 
-**System Tables**:
-- `smart_recognition_cache`: Caches AI recognition results with `match_items` (JSON aliases)
-- `app_config`: Persists user settings
-- `mapping_schemes`: Stores column mapping presets
-- `auto_mapping_cache`: Caches auto-match results per template/mode
-- `recognition_rules`: Custom business type, account, department rules
-- `import_log`: Tracks all data imports with timestamps
+### Persistence: three stores, two locations
 
-**Excel Import Format**: Header at row 2 (index=1), row 1 is company name, last row is timestamp (filtered out).
+| Store | What | Where |
+|---|---|---|
+| `config.json` | `FIELD_RULES`, `FIELD_SYNONYMS`, `HEADER_SCHEMES`, `EXPORT_FORMATS`, `REPORT_SHEET_OUTPUT_FORMATS` | `APP_DIR` (next to the script), auto-backed up to `config.json.bak` |
+| `base_data.db` | 7 base tables + `app_config`, `smart_recognition_cache`, `mapping_schemes`, `auto_mapping_cache`, `recognition_rules`, `custom_category`/`custom_record`, `import_log` | `APP_DIR` |
+| `shipping.bd` (note the `.bd` extension), `reconciliation.db`, `reconciliation_header_mapping.json` | module-local state | `APP_DIR` |
 
-### 3. Summary Intelligence (`summary_intelligence.py`)
+`runtime_paths.py` defines the intended future home (`%APPDATA%\ecount-system`, or `ECOUNT_SYSTEM_HOME`) and `migrate_runtime_state.py` moves files there, **but the app itself still reads `APP_DIR`** (`CONFIG_FILE = os.path.join(APP_DIR, "config.json")`). Migration is half-finished; don't assume `runtime_paths` is authoritative without wiring it up.
 
-**`SummaryIntelligence` class**:
-- `_init_ai_client()`: Initializes ZhipuAI or OpenAI (LM Studio) client based on config
-- `_init_recognition_rules()`: Loads business type keywords and rules
-- `_load_base_data_cache()`: Caches partners, accounts, departments from database
-- `recognize(summary)`: Main entry - returns dict of recognized fields
-- `recognize_from_row(row_data)`: Multi-field recognition from entire row
-- `batch_recognize(df)`: Process entire DataFrame
+User toggles are persisted per key in `app_config` under `setting_*` names (e.g. `setting_enable_smart_recognition`), loaded in `ExcelConverterGUI.__init__`.
 
-**Recognition Pipeline**:
-```
-Input row → _recognize_from_fields() → Extract date/amount/rate from columns
-         → recognize(summary)       → Extract from summary text:
-             ├── _recognize_business_type()  # Keywords → type, account, summary_code
-             ├── _recognize_partner()        # Database match + company patterns
-             ├── _recognize_account()        # Direct reference + name match
-             ├── _recognize_department()     # Database + keywords
-             ├── _recognize_amount()         # Regex patterns
-             └── _recognize_date()           # Multiple date formats
-```
+### Base data (`base_data_manager.py`)
 
-**AI Configuration** (in `default_values` dict):
-- `ai_provider`: "zhipu" (cloud) or "lm_studio" (local)
-- `ai_api_key`: API key for ZhipuAI
-- `ai_base_url`: LM Studio endpoint (default: "http://localhost:1234/v1")
-- `ai_model_name`: Local model name
+`BaseDataManager` owns 7 base tables — `currency`, `department`, `warehouse`, `account_subject`, `product`, `business_partner` (has `local_code`, the bridge for reconciliation), `bank_account` — with `query()`, `search_by_name()`, `lookup_value()`, and add/update/delete.
 
-### 4. Image Intelligence (`image_intelligence.py`)
+Source Excel layout: **row 1 is the company name, row 2 is the header (`header=1`), and the last row is an export timestamp that must be dropped**. `_clean_dataframe()` holds the per-table Excel-column → DB-column mapping; new data types need an entry there plus a table in `_init_database()`.
 
-**`ImageIntelligence` class**:
-- `check_and_install_dependencies()`: Auto-installs missing dependencies (Pillow, zhipuai, openai)
-- `recognize_image()`: Main entry - auto-selects best recognition method
-- `recognize_image_with_ai()`: Uses AI vision models (ZhipuAI glm-4v-flash or OpenAI compatible)
-- `recognize_with_local_ocr()`: Fallback to local PaddleOCR/EasyOCR
-- `batch_recognize()`: Process multiple images
-- `merge_results_to_table()`: Combine results from multiple images
-- `export_to_excel()`: Export with optional template mapping
+### Conversion pipeline (Excel凭证转换)
 
-**Recognition Methods**:
-1. **ZhipuAI Vision** (recommended): Uses `glm-4v-flash` model for accurate table extraction
-2. **LM Studio**: Local vision models with OpenAI-compatible API
-3. **PaddleOCR**: Local Chinese OCR (requires `paddleocr` package)
-4. **EasyOCR**: Multilingual local OCR (requires `easyocr` package)
+`FIELD_RULES` / `FIELD_SYNONYMS` (defaults in the main file, overridable from `config.json`) describe each template column. `normalize_header()` + `score_similarity()` (exact 1.0 → synonym 0.9 → containment 0.85 → difflib ≤0.8, accepted at ≥0.6) auto-map source columns; `convert_value()` coerces per `{"type": "date"|"number"|"text"}` with `max_int_len` / `max_decimal_len` / `max_len`.
 
-**Auto-Install Dependencies**:
-When dependencies are missing, the module automatically installs:
-- `Pillow`: Image processing
-- `zhipuai`: ZhipuAI SDK for cloud AI
-- `openai`: OpenAI SDK for LM Studio
+Modes: `MODE_GENERAL_VOUCHER` 通用凭证 / `MODE_SALES_OUTBOUND` 销售出库 / `MODE_CUSTOM` / `MODE_ORIGINAL` (no template).
 
-### 5. Image Recognition GUI (`image_recognition_gui.py`)
+**Field value priority** (do not reorder without checking the preview dialog): manual mapping → recognized dedicated column (`_recognize_from_fields`: 日期/金额/汇率) → summary recognition → configured default.
 
-**`ImageRecognitionWindow` class**:
-- Standalone Tkinter window for image recognition operations
-- Features:
-  - Import images/folders
-  - Image preview with thumbnail
-  - Single/batch recognition
-  - Table preview of recognized data
-  - Raw text view
-  - Merged data view (combining multiple images)
-  - Export to Excel (direct or template-based)
-  - AI settings configuration
+`summary_intelligence.py` resolves a summary string into 业务类型 / 往来单位 / 科目 / 部门 / 金额 / 日期, using keyword rules from `_init_recognition_rules()` plus a cached snapshot of base data; results are cached in `smart_recognition_cache` (whose `match_items` JSON column stores learned aliases — the "将摘要加入科目匹配项" action writes here).
 
-**Access**: Menu → 文件 → 图片智能识别
+### Report engine (`report_generator.py`)
 
-### 6. Export Format Manager (`export_format_manager.py`)
+`ReportGenerator(base_data_dir)` reads a **flat directory of monthly ECount exports** — by default `基础资料/`, whose filenames look like `利润表_2026-07-01_to_2026-07-31.xlsx`, `销售出库明细表_…`, `实际成本报表_…`, `资产负债表_…`, `会计科目明细表_{应收账款|应付账款|银行存款}_…`, `科目账簿_期间费用…`.
 
-Flexible output format mapping system for converting template columns to custom output schemas.
+- `_classify_source_file()` buckets each file into `profit / cost / expense / asset / sales / ar / ap / cash` **using both the filename and a peek at the first rows and sheet names** — 科目账簿 expense files are only identifiable by their 6601/6602/6603 account codes inside the sheet. Month keys are `YYYY-MM` via `_determine_period_key()`.
+- `self.data[category][month_key] = DataFrame` is the single in-memory shape everything downstream reads.
+- `list_available_months(ready_only=True)` intersects `profit`/`cost`/`asset` — a month missing any core statement is not offered in the GUI.
+- `generate_report(template_path, output_path, target_year, target_month, year_scope, replenishment_params, cashflow_params, include_ai_placeholders, fail_on_validation_error, fail_on_data_quality_error, allow_generated_report_template, output_sheets)` loads the template workbook, rewrites sheets by **Chinese sheet name** (`利润表`, `费用明细`, `经营指标`, `仪表盘`, `按产品汇总(含合计数)`, …), regenerates charts, and appends 审计日志 / 数据质量检查 sheets. `generate_batch_reports` / `generate_continuous_batch_reports` loop months.
+- `year_scope` is `current` | `recent_two_years` | `all` and is normalized from both English keys and Chinese phrases ("跨年", "历年") by `_normalize_year_scope()`.
+- Guards worth knowing: `_detect_template_risk()` refuses a template that looks like a previously *generated* report (name contains 经营分析报告, or an 审计日志 sheet with generation records) unless `allow_generated_report_template=True`; a missing template silently switches to blank-workbook mode; `fail_on_data_quality_error` blocks output when `_run_data_quality_checks()` found ERRORs.
+- `validate_report_file()` re-checks a produced workbook against the source data — that's what `validate_generated_report.py` wraps.
 
-**Key Functions**:
-- `load_export_formats()` / `save_export_formats()`: Persist format definitions to `config.json`
-- `get_active_export_format_name(module_key)`: Get current active format
-- `apply_export_format(module_key, headers, rows)`: Apply mapping transformation
+`local_llm_analyzer.LocalLLMAnalyzer` writes AI commentary into the generated workbook (chunked sheet summaries, optional chart recognition) via ZhipuAI or any OpenAI-compatible local endpoint.
 
-**Module Keys**: `shipping_product`, `image_recognition`, `general_voucher`
+### AI backend routing
 
-**Format Definition** supports special source syntax:
-- `BDV:table|code|display|fallback` - Base Data Value lookup
+AI config is **not** a single provider setting. `app_config` holds:
 
-### 7. Reconciliation Module (`reconciliation_module.py`)
+- `ai_backends` — JSON list of `{name, provider ("zhipu"|"lm_studio"), api_key, base_url, model}` (edited in 设置 → AI 设置 → "模型源配置")
+- `ai_task_map` — JSON `{task_id: backend_name}` for the five tasks `smart_summary`, `formula_gen`, `image_rec`, `reconciliation`, `report_analysis` ("功能模块分配" tab)
 
-**`StandardReconciler` class** for matching two accounting datasets:
-- Accepts DataFrames in "Standard Template Format" (as defined in Template.xlsx)
-- Local code → Yikan code mapping via `business_partner.local_code`
-- Date parsing with locale-aware strategies (DD/MM/YYYY vs YYYY/MM/DD)
-- Amount reconciliation with debit/credit separation
+`_get_ai_backend_for_task()` → `_normalize_ai_backend()` → `_build_ai_context()` resolves a task to a client, falling back to the legacy single-provider keys (`ai_provider`, `ai_api_key`, `ai_base_url`, `ai_model_name`) and then to the `ZHIPU_API_KEY`/`YIKAN_AI_API_KEY` env vars. Defaults: `glm-4-flash` (zhipu), `local-model` @ `http://localhost:1234/v1` (LM Studio); image recognition uses `glm-4v-flash`.
 
-### 8. Shipping Module (`shipping_module.py`)
+### Export format layer (`export_format_manager.py`)
 
-Shipping & logistics cost management with its own database (`shipping.db`):
-- `containers` table: Shipment header (shipment_code, container_no, costs in USD/RMB)
-- `products` table: Line items with allocated costs and tax rates
-- Multi-currency cost allocation with exchange rate conversion
+Per-module user-defined output schemas stored in `config.json` under `EXPORT_FORMATS[module_key] = {"active": name, "use_original": bool, "formats": {name: [ {output, source, default}, … ]}}`. Module keys in use: `main_export`, `summary_match_export`, `image_recognition`, `shipping_product`, `shipping_container` (report sheets use the separate `REPORT_SHEET_OUTPUT_FORMATS` key). `apply_export_format(module_key, headers, rows, base_data_mgr)` returns `(headers, rows, applied)`.
 
-### 9. Report Generator (`report_generator.py`)
+Two special `source` tokens resolve against base data instead of a source column:
+- `BD:table|target_col|key_header` — per-row lookup keyed by `code` taken from the row's `key_header` column
+- `BDV:table|target_col|key_col|key_val` — fixed lookup, same value for every row
 
-**`ReportGenerator` class** - Comprehensive business intelligence reporting (6,444 lines):
-- Profit & Loss statements with trend analysis
-- Cash flow analysis (estimated from accounting data)
-- Budget execution & variance analysis
-- Anomaly alerts and threshold-based warnings
-- Product/Category contribution analysis with Pareto charts
-- Customer contribution & collections tracking
-- Inventory health & slow-moving items identification
-- Expense structure analysis
-- Multi-entity consolidation (when multiple directories)
-- Multi-currency summary
-- Data quality audits
+## Known limitations / traps
 
-**Chart Types**: Pareto (bar + cumulative line), Scatter, Line, Bar charts via openpyxl
-
-### 10. Supporting Modules
-
-- **`bank_parser.py`**: PDF bank statement extraction (BAC, St. Georges Bank formats)
-- **`treeview_tools.py`**: GUI utilities including smart code restoration from names (fuzzy matching against base data)
-- **`excel_merger.py`**: Batch Excel file consolidation for multi-file processing
-
-## Field Value Priority
-
-When a field has multiple sources, priority is:
-1. **Manual mapping** (user selected source column)
-2. **Original data fields** (recognized from dedicated columns)
-3. **Summary recognition** (extracted from summary text)
-4. **Default values** (user-configured fallbacks)
-
-## Configuration Points
-
-### Adding Field Rules
-
-Edit `FIELD_RULES` dict:
-```python
-FIELD_RULES = {
-    "新字段名": {
-        "type": "date",  # or "number" or "text"
-        "max_int_len": 15,      # for number
-        "max_decimal_len": 2,   # for number
-        "max_len": 100          # for text
-    }
-}
-```
-
-### Adding Synonyms
-
-Edit `FIELD_SYNONYMS` dict:
-```python
-FIELD_SYNONYMS = {
-    "模板字段名": ["别名1", "别名2", "别名3"],
-}
-```
-
-### Adding Business Type Rules
-
-Edit `_init_recognition_rules()` in `summary_intelligence.py`:
-```python
-self.business_type_rules = {
-    "新业务类型": {
-        "keywords": ["关键词1", "关键词2"],
-        "account": "XXXX",
-        "type": "1",  # 1=出, 2=入, 3=借, 4=贷
-        "summary_code": "XX"
-    },
-}
-```
-
-### Auto-Match Threshold
-
-Default threshold is 0.6. Adjust in auto-match logic:
-```python
-if best_score >= 0.6 and best_col:  # Lower = more permissive
-```
-
-## Template File Requirements
-
-`Template.xlsx` must:
-- Have headers in row 1 matching `FIELD_RULES` keys
-- Be in same directory as main script
-- Formatting is preserved in output
-
-## Configuration Persistence
-
-**`config.json`** stores persistent configuration:
-- `FIELD_RULES`: Field type and constraint definitions
-- `FIELD_SYNONYMS`: Column name synonyms for auto-matching
-- `HEADER_SCHEMES`: Saved column mapping presets
-- `EXPORT_FORMATS`: Custom output format definitions per module
-
-## Key Files
-
-```
-亿看智能识别系统.py          # Main GUI application (entry point, ~10K lines)
-base_data_manager.py          # Database manager module (~1.7K lines)
-summary_intelligence.py       # AI text recognition engine (~1K lines)
-image_intelligence.py         # Image OCR/AI vision module (~1K lines)
-image_recognition_gui.py      # Image recognition GUI window (~1.1K lines)
-export_format_manager.py      # Output format mapping (~1.2K lines)
-reconciliation_module.py      # Accounting reconciliation (~1K lines)
-shipping_module.py            # Shipping cost management (~2.4K lines)
-report_generator.py           # Business intelligence reports (~6.4K lines)
-bank_parser.py                # PDF bank statement extraction
-treeview_tools.py             # GUI utilities with fuzzy matching
-excel_merger.py               # Multi-file batch processing
-Template.xlsx                 # Required template (headers + comments)
-config.json                   # Persistent configuration
-base_data.db                  # SQLite database (auto-created)
-shipping.db                   # Shipping module database (auto-created)
-基础数据/基础数据/            # Source Excel files for base data import
-```
-
-## Auto-Match Algorithm
-
-**`score_similarity()`** uses multi-strategy scoring:
-1. Exact match → 1.0
-2. Synonym match → 0.9
-3. Containment → 0.85
-4. Difflib ratio → 0.0-0.8 (weighted)
-
-Default threshold: 0.6 (lower = more permissive)
-
-## Known Limitations
-
-1. **Template dependency**: Application requires `Template.xlsx` in working directory
-2. **Single sheet processing**: Multi-sheet files require multiple conversion runs
-3. **Memory-based**: Entire source file loaded into memory (no pagination)
-4. **Number truncation**: Integers exceeding `max_int_len` are silently truncated
-5. **First-match wins**: Conflicting keywords in summary use first matched rule
-
-## Data Flow Summary
-
-```
-User selects Excel → Choose sheet → Select mode → Auto-match columns (optional)
-    → Enable Smart Recognition (optional) → Set Default Values (optional)
-    → Preview & Confirm → Convert & Export
-```
-
-**Recognition Pipeline** (when Smart Recognition enabled):
-```
-Input row → _recognize_from_fields() [date/amount/rate columns]
-         → recognize(summary) [AI analysis of summary text]
-         → Apply field priority: Manual > Original > Recognized > Default
-         → Cache results in smart_recognition_cache
-```
+1. Whole source files are read into memory; no pagination.
+2. Numbers over `max_int_len` are truncated silently.
+3. First matching keyword wins in `summary_intelligence` business-type rules.
+4. One sheet per conversion run.
+5. `shipping_module` defaults to `shipping.bd`, not `shipping.db` — the odd extension is intentional and matches the on-disk file.
+6. `folder_processor` drag-and-drop uses raw Win32 `ctypes` window subclassing; it is Windows-only and unwinds the window proc on close.
