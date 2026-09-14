@@ -1102,6 +1102,75 @@ def test_replenishment_alert_uses_product_specific_auto_params():
     assert ws.cell(row=rows["B"], column=header_map["安全库存天数"]).value == 30
 
 
+def test_replenishment_alert_advanced_features():
+    gen = ReportGenerator('.')
+    gen.sales_df = pd.DataFrame([
+        {"MonthStr": "2026-01", "品目编码": "P001", "品目名": "断货品", "数量": 90},
+        {"MonthStr": "2026-02", "品目编码": "P001", "品目名": "断货品", "数量": 90},
+        {"MonthStr": "2026-03", "品目编码": "P001", "品目名": "断货品", "数量": 90},
+        {"MonthStr": "2026-01", "品目编码": "P002", "品目名": "在途缺货品", "数量": 90},
+        {"MonthStr": "2026-02", "品目编码": "P002", "品目名": "在途缺货品", "数量": 90},
+        {"MonthStr": "2026-03", "品目编码": "P002", "品目名": "在途缺货品", "数量": 90},
+    ])
+    gen.data["cost"]["2026-03"] = pd.DataFrame({
+        "品目编码": ["P001", "P002"],
+        "品目名": ["断货品", "在途缺货品"],
+        "库存_期末": [-5, 20],
+        "单价_期末": [100.0, 50.0],
+        "金额_期末": [-500.0, 1000.0],
+    })
+
+    wb = Workbook()
+    wb.active.title = "存货健康度"
+    gen._update_replenishment_alert_sheet(
+        wb,
+        "2026",
+        "03",
+        "current",
+        lead_days=30,
+        safety_days=20,
+        window_months=3,
+        use_product_params=False,
+    )
+
+    ws = wb["补货预警"]
+    header_map = {ws.cell(row=1, column=c).value: c for c in range(1, 15)}
+    assert "再订货点(ROP)" in header_map
+    assert "建议补货量" in header_map
+    assert "参考单价(元)" in header_map
+    assert "预估采购金额(元)" in header_map
+    assert "采购紧迫度" in header_map
+
+    rows = {
+        ws.cell(row=r, column=header_map["品目编码"]).value: r
+        for r in range(2, ws.max_row + 1)
+        if ws.cell(row=r, column=header_map["品目编码"]).value in ("P001", "P002", "合计")
+    }
+
+    # P001: inv = -5, 270 sales in 90 days -> avg_daily = 3.0, need_days = 50, rop = 150.0, reorder = 155, price = 100, amt = 15500
+    p001_row = rows["P001"]
+    assert "P0" in str(ws.cell(row=p001_row, column=header_map["采购紧迫度"]).value)
+    assert ws.cell(row=p001_row, column=header_map["建议补货量"]).value == 155
+    assert ws.cell(row=p001_row, column=header_map["预估采购金额(元)"]).value == 15500.0
+
+    # P002: inv = 20, avg_daily = 3.0, need_days = 50, rop = 150.0, reorder = 130, price = 50, amt = 6500
+    p002_row = rows["P002"]
+    assert "P1" in str(ws.cell(row=p002_row, column=header_map["采购紧迫度"]).value)
+    assert ws.cell(row=p002_row, column=header_map["建议补货量"]).value == 130
+    assert ws.cell(row=p002_row, column=header_map["预估采购金额(元)"]).value == 6500.0
+
+    # Total row
+    tot_row = rows["合计"]
+    assert ws.cell(row=tot_row, column=header_map["建议补货量"]).value == 285
+    assert ws.cell(row=tot_row, column=header_map["预估采购金额(元)"]).value == 22000.0
+
+    # Charts verification
+    assert len(ws._charts) == 2
+    chart_titles = [c.title for c in ws._charts]
+    assert any("预估采购金额 Top 10 重点品目" in str(t) for t in chart_titles)
+    assert any("采购计划紧迫度资金分布" in str(t) for t in chart_titles)
+
+
 def test_manual_warning_params_are_preserved_and_sanitized():
     gen = ReportGenerator('.')
     gen.report_params["replenishment"] = {

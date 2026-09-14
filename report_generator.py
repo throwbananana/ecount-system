@@ -7,11 +7,12 @@
 import os
 import re
 import copy
+import math
 import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.utils.cell import range_boundaries
-from openpyxl.chart import LineChart, Reference, BarChart, ScatterChart, Series
+from openpyxl.chart import LineChart, Reference, BarChart, ScatterChart, Series, DoughnutChart, PieChart
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.worksheet.hyperlink import Hyperlink
@@ -59,7 +60,7 @@ class ReportGenerator:
         self.data_quality_issues = []
         self.report_params = {
             "replenishment": {
-                "manual": True,
+                "manual": False,
                 "lead_days": 30,
                 "safety_days": 20,
                 "window_months": 3,
@@ -9777,7 +9778,7 @@ class ReportGenerator:
     def _resolve_warning_params(self, metrics_by_month, target_year, target_month, year_scope=None):
         repl_config = dict((self.report_params or {}).get("replenishment", {}))
         cash_config = dict((self.report_params or {}).get("cashflow", {}))
-        repl_manual = self._bool_param(repl_config.pop("manual", True), default=True)
+        repl_manual = self._bool_param(repl_config.pop("manual", False), default=False)
         cash_manual = self._bool_param(cash_config.pop("manual", True), default=True)
 
         repl_params = {
@@ -9965,6 +9966,20 @@ class ReportGenerator:
         code_col = self._find_cost_col_contains(cost_df, '品目编码')
         name_col = self._find_cost_col_contains(cost_df, '品目名')
         q_end_col = self._find_cost_col_suffix(cost_df, '期末')
+        p_end_col = self._find_cost_col_suffix(cost_df, '期末.1')
+        if not p_end_col:
+            for c in cost_df.columns:
+                sc = str(c)
+                if '单价' in sc and '期末' in sc:
+                    p_end_col = c
+                    break
+        amt_end_col = self._find_cost_col_suffix(cost_df, '期末.2')
+        if not amt_end_col:
+            for c in cost_df.columns:
+                sc = str(c)
+                if '金额' in sc and '期末' in sc:
+                    amt_end_col = c
+                    break
         cost_category_col = None
         for c in cost_df.columns:
             name = str(c)
@@ -10073,10 +10088,14 @@ class ReportGenerator:
             "库存覆盖天数",
             "采购/生产周期(天)",
             "安全库存天数",
+            "再订货点(ROP)",
             "建议补货量",
+            "参考单价(元)",
+            "预估采购金额(元)",
+            "采购紧迫度",
             "风险等级",
         ]
-        rows = []
+        rows_data = []
 
         for _, row in cost_df.iterrows():
             code = row.get(code_col)
@@ -10091,13 +10110,10 @@ class ReportGenerator:
                 continue
 
             qty_sold = sales_qty.get(code)
-            if qty_sold is None or total_days <= 0:
+            if qty_sold is None or total_days <= 0 or qty_sold <= 0:
                 continue
 
-            avg_daily = qty_sold / total_days if total_days else None
-            if not avg_daily or avg_daily <= 0:
-                continue
-
+            avg_daily = qty_sold / total_days
             coverage_days = inv_qty / avg_daily if avg_daily else None
             if coverage_days is None:
                 continue
@@ -10109,47 +10125,296 @@ class ReportGenerator:
             if coverage_days >= need_days:
                 continue
 
-            reorder_qty = max(0, avg_daily * need_days - inv_qty)
-            risk = "高" if coverage_days < row_safety_days else "中"
+            rop = round(avg_daily * need_days, 1)
+            reorder_qty = max(0, math.ceil(avg_daily * need_days - inv_qty))
+
+            unit_price = (self._to_float(row.get(p_end_col)) if p_end_col else None) or 0.0
+            if unit_price <= 0 and amt_end_col and inv_qty and inv_qty > 0:
+                amt_val = self._to_float(row.get(amt_end_col))
+                if amt_val and amt_val > 0:
+                    unit_price = amt_val / inv_qty
+
+            if unit_price <= 0:
+                for suffix in ('减少.1', '期初.1', '增加.1'):
+                    c_alt = self._find_cost_col_suffix(cost_df, suffix)
+                    if c_alt:
+                        alt_p = self._to_float(row.get(c_alt))
+                        if alt_p and alt_p > 0:
+                            unit_price = alt_p
+                            break
+
+            if unit_price <= 0 and hasattr(self, 'data') and 'cost' in self.data:
+                for past_m, past_df in sorted(self.data['cost'].items(), reverse=True):
+                    if past_df is None or past_df.empty or past_m == month_key:
+                        continue
+                    past_code_col = self._find_cost_col_contains(past_df, '品目编码')
+                    if not past_code_col:
+                        continue
+                    sub_past = past_df[past_df[past_code_col].astype(str).str.strip() == code]
+                    if not sub_past.empty:
+                        for suffix in ('期末.1', '减少.1', '期初.1', '增加.1'):
+                            c_alt = self._find_cost_col_suffix(past_df, suffix)
+                            if c_alt:
+                                alt_p = self._to_float(sub_past[c_alt].values[0])
+                                if alt_p and alt_p > 0:
+                                    unit_price = alt_p
+                                    break
+                    if unit_price > 0:
+                        break
+
+            if unit_price <= 0:
+                sub_s = sales_df[sales_df['品目编码'] == code]
+                if not sub_s.empty:
+                    if '销售出库供应价合计' in sub_s.columns and 'Qty' in sub_s.columns:
+                        tot_raw = pd.to_numeric(sub_s['销售出库供应价合计'], errors='coerce').sum()
+                        tot_q = pd.to_numeric(sub_s['Qty'], errors='coerce').sum()
+                        if tot_raw > 0 and tot_q > 0:
+                            unit_price = tot_raw / tot_q
+
+            estimated_amount = round(reorder_qty * unit_price, 2)
+
+            if inv_qty <= 0 or coverage_days <= 0:
+                priority = "P0 紧急/已断货"
+                risk = "极高"
+                rank = 0
+            elif coverage_days <= row_lead_days:
+                priority = "P1 极高/在途缺货"
+                risk = "高"
+                rank = 1
+            else:
+                priority = "P2 安全/计划补货"
+                risk = "中"
+                rank = 2
+
             name_spec = row.get(name_col) if name_col else None
-            resolved_name = name_map.get(code) or name_spec
+            resolved_name = name_map.get(code) or name_spec or code
             category_hint = row.get(cost_category_col) if cost_category_col else None
             if category_hint is None or (isinstance(category_hint, float) and pd.isna(category_hint)):
                 category_hint = sales_category_by_code.get(code)
             category = self._resolve_uncategorized_product(category_hint, resolved_name)
 
-            rows.append([
-                code,
-                resolved_name,
-                category,
-                inv_qty,
-                avg_daily,
-                coverage_days,
-                row_lead_days,
-                row_safety_days,
-                reorder_qty,
-                risk,
-            ])
+            rows_data.append({
+                "code": code,
+                "name": resolved_name,
+                "category": category,
+                "inv_qty": inv_qty,
+                "avg_daily": round(avg_daily, 2),
+                "coverage_days": round(coverage_days, 1),
+                "lead_days": row_lead_days,
+                "safety_days": row_safety_days,
+                "rop": rop,
+                "reorder_qty": reorder_qty,
+                "unit_price": round(unit_price, 2),
+                "estimated_amount": estimated_amount,
+                "priority": priority,
+                "risk": risk,
+                "rank": rank,
+            })
 
-        if not rows:
+        if not rows_data:
             self._write_table(ws, 1, 1, ["提示"], [["未发现需要补货的产品"]])
             return
 
-        rows = sorted(rows, key=lambda x: x[5] if x[5] is not None else 999999)
-        self._write_table(ws, 1, 1, headers, rows)
+        rows_data.sort(key=lambda x: (x["rank"], -x["estimated_amount"], x["coverage_days"]))
+
+        table_rows = [
+            [
+                r["code"],
+                r["name"],
+                r["category"],
+                r["inv_qty"],
+                r["avg_daily"],
+                r["coverage_days"],
+                r["lead_days"],
+                r["safety_days"],
+                r["rop"],
+                r["reorder_qty"],
+                r["unit_price"],
+                r["estimated_amount"],
+                r["priority"],
+                r["risk"],
+            ]
+            for r in rows_data
+        ]
+
+        total_inv = sum(r["inv_qty"] for r in rows_data if r["inv_qty"] is not None)
+        total_daily = sum(r["avg_daily"] for r in rows_data if r["avg_daily"] is not None)
+        total_rop = sum(r["rop"] for r in rows_data if r["rop"] is not None)
+        total_reorder = sum(r["reorder_qty"] for r in rows_data if r["reorder_qty"] is not None)
+        total_amount = sum(r["estimated_amount"] for r in rows_data if r["estimated_amount"] is not None)
+
+        summary_row = [
+            "合计",
+            f"共 {len(rows_data)} 款需补货商品",
+            "-",
+            round(total_inv, 2),
+            round(total_daily, 2),
+            "-",
+            "-",
+            "-",
+            round(total_rop, 1),
+            total_reorder,
+            "-",
+            round(total_amount, 2),
+            "-",
+            "-",
+        ]
+        table_rows.append(summary_row)
+
+        self._write_table(ws, 1, 1, headers, table_rows)
+
+        thin_border = Border(
+            left=Side(style='thin', color='D9D9D9'),
+            right=Side(style='thin', color='D9D9D9'),
+            top=Side(style='thin', color='D9D9D9'),
+            bottom=Side(style='thin', color='D9D9D9'),
+        )
+        total_top_border = Side(style='thin', color='000000')
+        total_bottom_border = Side(style='double', color='000000')
+        total_border = Border(
+            left=Side(style='thin', color='D9D9D9'),
+            right=Side(style='thin', color='D9D9D9'),
+            top=total_top_border,
+            bottom=total_bottom_border,
+        )
+        total_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+
+        data_row_count = len(rows_data)
+        summary_row_idx = 1 + len(table_rows)
+
+        for r_idx in range(2, 2 + data_row_count):
+            for c_idx in range(1, len(headers) + 1):
+                cell = ws.cell(row=r_idx, column=c_idx)
+                cell.font = Font(name="微软雅黑", size=9)
+                cell.border = thin_border
+                if c_idx in (1, 3, 7, 8, 13, 14):
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif c_idx == 2:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+
+                if c_idx in (4, 10):
+                    cell.number_format = "#,##0"
+                elif c_idx in (5, 6, 9):
+                    cell.number_format = "#,##0.0"
+                elif c_idx in (11, 12):
+                    cell.number_format = "#,##0.00"
+
+                if c_idx == 13:
+                    val_str = str(cell.value or "")
+                    if "P0" in val_str:
+                        cell.font = Font(name="微软雅黑", size=9, bold=True, color="C00000")
+                    elif "P1" in val_str:
+                        cell.font = Font(name="微软雅黑", size=9, bold=True, color="ED7D31")
+                    elif "P2" in val_str:
+                        cell.font = Font(name="微软雅黑", size=9, color="1F4E79")
+
+        for c_idx in range(1, len(headers) + 1):
+            scell = ws.cell(row=summary_row_idx, column=c_idx)
+            scell.font = Font(name="微软雅黑", size=9, bold=True)
+            scell.border = total_border
+            scell.fill = total_fill
+            if c_idx in (1, 3, 6, 7, 8, 11, 13, 14):
+                scell.alignment = Alignment(horizontal="center", vertical="center")
+            elif c_idx == 2:
+                scell.alignment = Alignment(horizontal="left", vertical="center")
+            else:
+                scell.alignment = Alignment(horizontal="right", vertical="center")
+
+            if c_idx in (4, 10):
+                scell.number_format = "#,##0"
+            elif c_idx in (5, 9):
+                scell.number_format = "#,##0.0"
+            elif c_idx == 12:
+                scell.number_format = "#,##0.00"
+
+        col_widths = {
+            'A': 15, 'B': 28, 'C': 12, 'D': 14, 'E': 16,
+            'F': 14, 'G': 16, 'H': 14, 'I': 14, 'J': 14,
+            'K': 14, 'L': 18, 'M': 18, 'N': 12, 'O': 3,
+        }
+        for col_letter, width in col_widths.items():
+            ws.column_dimensions[col_letter].width = width
+        ws.freeze_panes = "D2"
+
+        note_row = summary_row_idx + 2
         self._write_chart_note(
             ws,
             1,
-            len(rows) + 3,
+            note_row,
             (
                 f"说明：覆盖天数 < 每个品目的采购/生产周期+安全库存天数列为需补货。"
-                f" 自动模式下按品目历史销售、库存覆盖和入库节奏单独计算，"
+                f" 自动模式下按品目历史入库记录与销售波动率动态推导参数，"
                 f"缺少历史时使用全局兜底({lead_days}+{safety_days}天)。"
                 if use_product_params else
                 f"说明：覆盖天数 < 采购周期({lead_days})+安全库存({safety_days}) 列为需补货。"
             )
             + (f" {param_source_note}" if param_source_note else ""),
         )
+        self._write_chart_note(
+            ws,
+            1,
+            note_row + 1,
+            "计算模型：再订货点(ROP) = 日均销量 × (入库周期 + 安全库存天数)；建议补货量 = max(0, ⌈ROP - 期末库存⌉)；预估采购金额 = 建议补货量 × 参考单价。",
+        )
+        self._write_chart_note(
+            ws,
+            1,
+            note_row + 2,
+            "采购紧迫度分级：P0 紧急/已断货(覆盖天数≤0，行动：立即下单)；P1 极高/在途缺货(覆盖天数≤采购周期，行动：本周内下单)；P2 安全/计划补货(覆盖天数≤采购周期+安全库存，行动：两周内下单)。",
+        )
+
+        top_items = sorted(rows_data, key=lambda x: x["estimated_amount"], reverse=True)[:10]
+        if top_items:
+            ws.cell(row=1, column=23, value="重点品目")
+            ws.cell(row=1, column=24, value="Top采购金额")
+            for idx, item in enumerate(top_items, start=2):
+                short_name = (item["name"] or item["code"])[:14]
+                ws.cell(row=idx, column=23, value=short_name)
+                ws.cell(row=idx, column=24, value=float(item["estimated_amount"]))
+
+            chart1 = BarChart()
+            chart1.type = "col"
+            chart1.style = 10
+            chart1.title = "预估采购金额 Top 10 重点品目"
+            chart1.y_axis.title = "金额 (元)"
+            chart1.x_axis.title = "品目"
+            data_ref = Reference(ws, min_col=24, min_row=1, max_row=1 + len(top_items))
+            cats_ref = Reference(ws, min_col=23, min_row=2, max_row=1 + len(top_items))
+            chart1.add_data(data_ref, titles_from_data=True)
+            chart1.set_categories(cats_ref)
+            chart1.legend = None
+            chart1.width = 16
+            chart1.height = 10
+            ws.add_chart(chart1, "P2")
+
+            p0_amt = sum(r["estimated_amount"] for r in rows_data if r["rank"] == 0)
+            p1_amt = sum(r["estimated_amount"] for r in rows_data if r["rank"] == 1)
+            p2_amt = sum(r["estimated_amount"] for r in rows_data if r["rank"] == 2)
+
+            p_start_row = 14
+            ws.cell(row=p_start_row, column=23, value="紧迫度分级")
+            ws.cell(row=p_start_row, column=24, value="分级采购金额")
+            ws.cell(row=p_start_row + 1, column=23, value="P0 紧急/已断货")
+            ws.cell(row=p_start_row + 1, column=24, value=round(p0_amt, 2))
+            ws.cell(row=p_start_row + 2, column=23, value="P1 极高/在途缺货")
+            ws.cell(row=p_start_row + 2, column=24, value=round(p1_amt, 2))
+            ws.cell(row=p_start_row + 3, column=23, value="P2 安全/计划补货")
+            ws.cell(row=p_start_row + 3, column=24, value=round(p2_amt, 2))
+
+            chart2 = DoughnutChart()
+            chart2.title = "采购计划紧迫度资金分布"
+            data_ref2 = Reference(ws, min_col=24, min_row=p_start_row, max_row=p_start_row + 3)
+            cats_ref2 = Reference(ws, min_col=23, min_row=p_start_row + 1, max_row=p_start_row + 3)
+            chart2.add_data(data_ref2, titles_from_data=True)
+            chart2.set_categories(cats_ref2)
+            chart2.width = 16
+            chart2.height = 10
+            ws.add_chart(chart2, "P18")
+
+            ws.column_dimensions['W'].hidden = True
+            ws.column_dimensions['X'].hidden = True
 
     def _update_slow_moving_inventory_sheet(self, wb, target_year, target_month):
         ws = self._prepare_sheet(wb, "滞销与风险存货", insert_after="存货健康度")
@@ -11486,8 +11751,8 @@ class ReportGenerator:
         self._update_inventory_health_sheet(wb, metrics_by_month_scoped, target_year, target_month, self.year_scope)
         self._update_slow_moving_inventory_sheet(wb, target_year, target_month)
         repl_auto_by_product = not self._bool_param(
-            (self.report_params or {}).get("replenishment", {}).get("manual", True),
-            default=True,
+            (self.report_params or {}).get("replenishment", {}).get("manual", False),
+            default=False,
         )
         repl_params, cash_params, warning_notes = self._resolve_warning_params(
             metrics_by_month_scoped,
