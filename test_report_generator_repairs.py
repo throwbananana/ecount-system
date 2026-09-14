@@ -3824,6 +3824,67 @@ def test_ar_aging_sheet_adds_customer_turnover_and_charts():
     assert any("应收账款账龄结构" in title for title in chart_titles)
 
 
+def test_is_duplicate_download_file_identifies_numbered_suffixes():
+    gen = ReportGenerator('.')
+    all_files = {
+        '科目账簿_期间费用_2026-08-01_to_2026-08-31.xlsx',
+        '科目账簿_期间费用_2026-08-01_to_2026-08-31_2.xlsx',
+        '科目账簿_期间费用_2026-08-01_to_2026-08-31_3.xlsx',
+        '销售出库明细表_2026-08-01_to_2026-08-31 (1).xlsx',
+        '销售出库明细表_2026-08-01_to_2026-08-31.xlsx',
+    }
+    is_dup, canon = gen._is_duplicate_download_file('科目账簿_期间费用_2026-08-01_to_2026-08-31_2.xlsx', all_files)
+    assert is_dup is True
+    assert canon == '科目账簿_期间费用_2026-08-01_to_2026-08-31.xlsx'
+
+    is_dup, canon = gen._is_duplicate_download_file('销售出库明细表_2026-08-01_to_2026-08-31 (1).xlsx', all_files)
+    assert is_dup is True
+    assert canon == '销售出库明细表_2026-08-01_to_2026-08-31.xlsx'
+
+    is_dup, canon = gen._is_duplicate_download_file('科目账簿_期间费用_2026-08-01_to_2026-08-31.xlsx', all_files)
+    assert is_dup is False
+    assert canon is None
+
+
+def test_load_expense_data_deduplicates_duplicate_rows(tmp_path):
+    gen = ReportGenerator(str(tmp_path))
+    file1 = tmp_path / "expense_1.xlsx"
+    file2 = tmp_path / "expense_2.xlsx"
+
+    df_data = [
+        {"日期-号码": "2026/08/01 -1", "科目名": "办公费", "借方金额": 100, "贷方金额": 0, "摘要": "买文具"},
+        {"日期-号码": "2026/08/02 -2", "科目名": "运费", "借方金额": 200, "贷方金额": 0, "摘要": "发快递"},
+    ]
+    pd.DataFrame(df_data).to_excel(file1, index=False)
+    pd.DataFrame(df_data).to_excel(file2, index=False)
+
+    gen._load_expense_data(str(file1), "expense_1.xlsx")
+    assert len(gen.data['expense']['2026-08']) == 2
+
+    gen._load_expense_data(str(file2), "expense_2.xlsx")
+    # Should deduplicate and still be 2 rows, not 4
+    assert len(gen.data['expense']['2026-08']) == 2
+    assert gen.data['expense']['2026-08']['借方金额'].sum() == 300
+
+
+def test_cvp_fixed_cost_includes_all_non_variable_expenses():
+    gen = ReportGenerator('.')
+    gen._calculate_expense_behavior_totals = lambda *args: {
+        "variable": {"2026-08": 50},
+        "fixed": {"2026-08": 200},
+        "financial_adjustment": {"2026-08": 30},
+        "inventory_adjustment": {"2026-08": -10},
+        "unclassified": {"2026-08": 20},
+        "total": {"2026-08": 290},
+    }
+    var_map, fixed_map = gen._calculate_expense_keyword_totals("2026", "08", "all")
+    assert var_map["2026-08"] == 50
+    # Fixed should include 200 + 30 + (-10) + 20 = 240
+    assert fixed_map["2026-08"] == 240
+    # Variable + Fixed = 50 + 240 = 290 == Total
+    assert var_map["2026-08"] + fixed_map["2026-08"] == 290
+
+
 if __name__ == '__main__':
     test_fill_product_summary_aggregates_rows()
     test_list_available_months_uses_core_intersection_when_loaded()
