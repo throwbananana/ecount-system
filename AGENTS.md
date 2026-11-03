@@ -1,58 +1,50 @@
-# Repository Overview
+# AGENTS.md
 
-## Project Description
-- **Project Name:** 亿看智能识别系统
-- **Description:** A general voucher Excel format conversion tool integrated with basic data management functions.
-- **Key Technologies Used:** Python 3.x, Tkinter for GUI, pandas and openpyxl for Excel processing, SQLite3 for database storage.
+Single-window Tkinter desktop app (Chinese-language UI/data) that converts arbitrary Excel/PDF/image files into ECount accounting vouchers, plus a large 经营分析报告 Excel engine. All field names, sheet names, and config keys are **Chinese string literals that are load-bearing** — never translate or rename them casually.
 
-## Architecture Overview
-- **High-level Architecture:** The system consists of a main program (`亿看智能识别系统.py`) that handles the UI and conversion logic. It interacts with a base data manager (`base_data_manager.py`) to manage and retrieve basis data. Additionally, there are modules for summary intelligence (`summary_intelligence.py`), testing (`test_*` scripts), and utility functions.
-- **Main Components:*
-  - `亿看智能识别系统.py`: Main application entry point and GUI controller.
-  - `base_data_manager.py`: Manages the loading and updating of basis data.
-  - `summary_intelligence.py`: Handles summary intelligence recognition for Excel files.
-  - Test modules (`test_base_data.py`, `test_smart_recognition.py`, etc.): Contains unit tests for various components.
-- **Data Flow:** The user selects an Excel file, and the system processes it using the smart recognition engine to fill in fields automatically. The processed data is then saved to a new Excel file.
+**Read `CLAUDE.md` before making non-trivial changes.** It is the authoritative, detailed guide (module map, tab-to-module table, conversion pipeline, report engine, AI backend routing, known traps). This file only lists what an agent most often gets wrong.
 
-## Directory Structure
-- **Important Directories:*
-  - `基础数据/`: Contains all necessary Excel files for basic data management.
-  - `测试/`: Contains test scripts to ensure the system works correctly.
-- **Key Files and Configuration:*
-  - `亿看智能识别系统.py`: Main application code.
-  - `base_data_manager.py`: Manages basis data operations.
-  - `summary_intelligence.py`: Handles summary intelligence recognition.
-  - `Template.xlsx`: The general voucher template required by the system.
-  - `README.md`, `CLAUDE.md`, etc.: Project documentation and usage guides.
-- **Entry Points:*
-  - `亿看智能识别系统.py`: Entry point for running the application.
+## Commands
 
-## Development Workflow
-- **Build/Run:** To start the program, run `python 亿看智能识别系统.py`.
-- **Testing:** Use provided test scripts to ensure functionality:
-  ```bash
-  python test_base_data.py
-  python test_smart_recognition.py
-  python test_preview_function.py
-  python test_multi_field_recognition.py
-  ```
-- **Development Environment Setup:** Ensure Python 3.x is installed along with `pandas`, `openpyxl`, and `SQLite3`.
-- **Lint and Format Commands:*
-  - Linting: Not applicable in this setup.
-  - Formatting: No specific format requirements mentioned.
+```bash
+pip install -r requirements.txt           # pandas openpyxl pdfplumber zhipuai numpy xlrd
+pip install -r requirements-optional.txt  # OCR/image extras (Pillow pytesseract paddleocr easyocr)
 
----
+python 亿看智能识别系统.py                 # run the GUI (entry point)
+python -m py_compile 亿看智能识别系统.py report_generator.py   # pre-commit sanity check
+```
 
-invokable: true
----
+### Testing
 
-Review this code for potential issues, including:
+- **Never run bare `pytest` at the repo root**: `test_ai_key.py` raises `SystemExit` at import time when `ZHIPU_API_KEY` is unset, which aborts collection with an INTERNALERROR.
+- Newer tests are pytest-style; older ones are plain `python <file>` scripts with `__main__` blocks. Run individually:
 
-1. **Code Readability:** Ensure the code is well-structured and follows Python coding standards.
-2. **Error Handling:** Check for proper error handling, especially when dealing with file operations, database interactions, and external data.
-3. **Performance:** Identify any potential performance bottlenecks, particularly in the conversion and summary intelligence processes.
-4. **Security:** Look for any security vulnerabilities, such as SQL injection or improper input validation.
-5. **Documentation:** Ensure all functions, classes, and methods are properly documented.
-6. **Testing Coverage:** Verify that test cases cover edge cases and corner scenarios.
+```bash
+python -m pytest test_report_generator_repairs.py            # report engine regressions (biggest suite)
+python -m pytest test_report_generator_repairs.py -k 品类     # single test
+python test_base_data.py                                     # legacy script-style test
+```
 
-Provide specific, actionable feedback for improvements.
+- `test_template_path_resolution.py` executes the whole main module via `spec.loader.exec_module`, so it catches import-time breakage in `亿看智能识别系统.py` first.
+
+## Must-know gotchas
+
+- `亿看智能识别系统.py` (and likely `report_generator.py`) is stored **UTF-8 with BOM**. Preserve exactly one BOM; a duplicated BOM at byte 0 causes `SyntaxError: invalid non-printable character U+FEFF`.
+- Nothing may assume the CWD. Use `resolve_resource_file()` / `resolve_resource_dir()` / `resolve_template_path()` (from the main module) for any new asset — a bare relative path breaks the PyInstaller build and launches from another directory. The template is found via a search list; `Template_通用凭证.xlsx` (repo root) is preferred, fallback is `基础数据/基础数据/Template.xlsx`; with no template the app falls back to a blank-workbook mode instead of failing.
+- Optional modules (`report_generator`, `excel_merger`, `folder_processor`, `bank_parser`, image/DANFE GUIs) are imported inside `try/except ImportError` — **a broken import silently removes the tab instead of raising**. If a feature "disappeared", check those import guards at the top of `亿看智能识别系统.py`.
+- Worker threads must talk to the UI via `_queue_report_event` / `_report_call_main` (queue drained by `_poll_report_task_queue`), never call Tkinter directly.
+- Runtime state (`config.json`, `base_data.db` ~800 MB, `shipping.bd` [the `.bd` extension is intentional], `reconciliation.db`) lives in `APP_DIR` (next to the script). `runtime_paths.py` + `migrate_runtime_state.py` target `%APPDATA%\ecount-system`, but the app still reads `APP_DIR` — the migration is half-finished; don't assume `runtime_paths` is wired in.
+- `.gitignore` is a whitelist (`*` ignore, then `!*.py`, `!*.md`, `!*/`). All `.xlsx`, `.db`, `.json` (incl. `config.json`), and templates are untracked working data; never copy/rewrite `base_data.db` wholesale. This working copy has no `.git` directory.
+- `亿看智能识别系统/` (subdir with the same name as the repo) and `图片智能识别/` are **stale snapshot copies / raw data**, not live code — greps hit them constantly. Check the path before editing; never edit the snapshot as if it were the app. Root `*.py.rej` files are leftovers from failed patch applications.
+- `亿看智能识别系统.spec` (PyInstaller) hardcodes its Analysis path to `C:\Users\123\Downloads\...` — fix before packaging.
+- Base-data Excel layout: row 1 is a company name, row 2 is the header, and the last row is an export timestamp that must be dropped (`_clean_dataframe()` in `base_data_manager.py` handles this plus per-table column mapping).
+
+## Env vars
+
+- `ZHIPU_API_KEY` / `YIKAN_AI_API_KEY` — ZhipuAI key fallback so keys need not be stored in the DB.
+- `ECOUNT_SYSTEM_HOME` / `YIKAN_APP_HOME` — override the runtime dir used by `runtime_paths.py` (limited effect; app still reads `APP_DIR`).
+
+## Useful entry points beyond the GUI
+
+- `validate_generated_report.py --report Generated_Report.xlsx --year 2026 --month 7 [--base-dir 基础资料] [--year-scope current|all]` — CLI validation of a generated report against source data (no GUI).
+- Repo-local skill: `.agents/skills/monthly-report-annotation/` — procedure + script (`auto_annotate_report.py`) for annotating monthly report workbooks.

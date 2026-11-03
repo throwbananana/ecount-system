@@ -491,6 +491,97 @@ class ReportGenerator:
             return True, canonical_name
         return False, None
 
+    def _resolve_superseded_download_files(self, all_excel_set):
+        """
+        智能识别并解决同名或编号副本文件（如 _2.xlsx, _3.xlsx, (1).xlsx）之间的版本替换关系。
+        不再无脑跳过编号副本文件，而是按以下规则精准决策：
+        1. 仅当同一组副本文件（属于同一 canonical_name）时分析版本替换；
+        2. 若某文件存在文件名标称期间与实际数据期间完全错位（如文件名是2026-02但数据是2026-01），
+           而组内存在实际数据正确匹配标称期间的文件，则错位文件被判定为过时/失效版本，予以跳过；
+        3. 若组内文件均有效或覆盖相同期间，按导出时间（Export Datetime）优先、文件修改时间（mtime）次之的原则，
+           保留最新版本（Keeper），跳过较旧版本（Superseded）；
+        4. 若两文件覆盖的实际月份完全不同且不存在错位替代关系，则两者均不跳过，保留各自月份数据。
+        返回字典: {superseded_filename: (keeper_filename, reason)}
+        """
+        if not all_excel_set:
+            return {}
+
+        groups = {}
+        for f in sorted(all_excel_set):
+            is_dup, canon = self._is_duplicate_download_file(f, all_excel_set)
+            canon_name = canon if is_dup else f
+            groups.setdefault(canon_name, []).append(f)
+
+        superseded = {}
+        for canon_name, file_list in groups.items():
+            if len(file_list) <= 1:
+                continue
+
+            file_metas = []
+            for f in file_list:
+                path = os.path.join(self.base_data_dir, f)
+                try:
+                    cat = self._classify_source_file(f, path)
+                except Exception:
+                    cat = None
+                try:
+                    period_info = self._determine_file_period_info(path, f, category=cat)
+                    periods = period_info.get("periods", [])
+                except Exception:
+                    periods = []
+                try:
+                    exp_dt = self._extract_export_datetime_from_workbook(path)
+                except Exception:
+                    exp_dt = None
+                try:
+                    mtime = os.path.getmtime(path)
+                except Exception:
+                    mtime = 0
+                recency = exp_dt.timestamp() if exp_dt else mtime
+
+                fn_keys = self._extract_month_keys_from_text(f)
+                has_mismatch = bool(fn_keys and periods and not (set(fn_keys) & set(periods)))
+
+                file_metas.append({
+                    "filename": f,
+                    "path": path,
+                    "category": cat,
+                    "periods": set(periods),
+                    "exp_dt": exp_dt,
+                    "mtime": mtime,
+                    "recency": recency,
+                    "has_mismatch": has_mismatch,
+                    "is_canonical": (f == canon_name),
+                })
+
+            matched_files = [m for m in file_metas if not m["has_mismatch"]]
+            mismatched_files = [m for m in file_metas if m["has_mismatch"]]
+
+            if matched_files and mismatched_files:
+                best_matched = max(matched_files, key=lambda m: (m["recency"], m["mtime"]))
+                for m in mismatched_files:
+                    superseded[m["filename"]] = (
+                        best_matched["filename"],
+                        "数据期间与文件名错位，由期间匹配的更新文件替代"
+                    )
+
+            candidates = matched_files if matched_files else file_metas
+            if len(candidates) > 1:
+                sorted_cand = sorted(
+                    candidates,
+                    key=lambda m: (m["recency"], m["mtime"], 0 if m["is_canonical"] else 1),
+                    reverse=True
+                )
+                keeper = sorted_cand[0]
+                for other in sorted_cand[1:]:
+                    if not other["periods"] or other["periods"].issubset(keeper["periods"]) or other["periods"] == keeper["periods"]:
+                        superseded[other["filename"]] = (
+                            keeper["filename"],
+                            f"已存在更新的导出版本 (最新: {keeper['filename']})"
+                        )
+
+        return superseded
+
     def load_all_data(self):
         """加载所有基础资料"""
         self._log_audit("开始加载基础资料")
@@ -504,16 +595,17 @@ class ReportGenerator:
             f for f in files
             if (f.endswith('.xlsx') or f.endswith('.xls')) and not f.startswith('~$')
         }
+        superseded_download_files = self._resolve_superseded_download_files(all_excel_set)
         for f in files:
             if not (f.endswith('.xlsx') or f.endswith('.xls')):
                 continue
             if str(f).startswith('~$'):
                 continue
 
-            # 检测是否为浏览器重复下载的编号副本文件（如 _2.xlsx, _3.xlsx, (1).xlsx）
-            is_dup_copy, canonical_f = self._is_duplicate_download_file(f, all_excel_set)
-            if is_dup_copy:
-                msg = f"检测到重复下载副本文件，已自动跳过: {f} (保留主文件: {canonical_f})"
+            # 检测是否为被更新/期间匹配版本替代的重复下载副本文件
+            if f in superseded_download_files:
+                canonical_f, reason = superseded_download_files[f]
+                msg = f"检测到重复下载副本文件，已自动跳过: {f} (保留文件: {canonical_f}，原因: {reason})"
                 print(msg)
                 self._log_audit(msg)
                 continue
@@ -1703,6 +1795,8 @@ class ReportGenerator:
                 if not month_key or data_frame is None or data_frame.empty:
                     return
                 incoming = data_frame.copy()
+                dedup_cols = [c for c in incoming.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+                incoming = incoming.drop_duplicates(subset=dedup_cols)
                 existing = self.data['expense'].get(month_key)
                 if existing is not None and not existing.empty:
                     combined = pd.concat(
@@ -1710,7 +1804,6 @@ class ReportGenerator:
                         ignore_index=True,
                         sort=False,
                     )
-                    dedup_cols = [c for c in combined.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
                     self.data['expense'][month_key] = combined.drop_duplicates(subset=dedup_cols)
                 else:
                     self.data['expense'][month_key] = incoming
@@ -1918,6 +2011,11 @@ class ReportGenerator:
                 if pd.isna(val):
                     return None
                 s = str(val).strip()
+                # 排除总计/合计行以及文件底部的系统导出时间戳行（如 2026/10/19 (一) 19:48:07 或 2026/08/20 08:00:00）
+                if '合计' in s or '总计' in s:
+                    return None
+                if re.search(r'\([一二三四五六日]\)|\d{1,2}:\d{2}:\d{2}', s):
+                    return None
                 m = re.search(r'(\d{4}[/-]\d{1,2}[/-]\d{1,2})', s)
                 if m:
                     s = m.group(1)
@@ -1930,23 +2028,46 @@ class ReportGenerator:
                 df['ParsedDate'] = df[date_col].apply(parse_sales_date)
                 df = df.dropna(subset=['ParsedDate'])
                 df['MonthStr'] = df['ParsedDate'].dt.strftime('%Y-%m')
+
+                fn_month = self._extract_month_from_filename(filename)
+                if fn_month and fn_month != "Unknown" and not df.empty:
+                    actual_months = sorted(df['MonthStr'].unique())
+                    if fn_month not in actual_months:
+                        msg = (
+                            f"【文件期间错位警告】文件 {filename} 文件名标称期间为 {fn_month}，"
+                            f"但数据行内实际包含月份为 {actual_months}，完全缺失标称月份 {fn_month}！"
+                            f"请检查是否为自动下载模块未正确切换日期导致下载了上月残留数据。"
+                        )
+                        print(msg)
+                        self._log_audit(msg)
+                        self.data_quality_issues.append({
+                            "severity": "ERROR",
+                            "category": "销售出库",
+                            "period": fn_month,
+                            "issue_type": "文件名与数据期间错位",
+                            "detail": msg,
+                        })
+
+                dedup_cols = [c for c in df.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+                df = df.drop_duplicates(subset=dedup_cols)
+
                 for m_key, group in df.groupby('MonthStr'):
+                    clean_group = group.copy().drop_duplicates(subset=dedup_cols)
                     existing = self.data['sales'].get(m_key)
                     if existing is not None and not existing.empty:
-                        combined = pd.concat([existing, group.copy()], ignore_index=True)
-                        dedup_cols = [c for c in combined.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+                        combined = pd.concat([existing, clean_group], ignore_index=True)
                         self.data['sales'][m_key] = combined.drop_duplicates(subset=dedup_cols)
                     else:
-                        self.data['sales'][m_key] = group.copy()
+                        self.data['sales'][m_key] = clean_group
                 if self.sales_df is None:
                     self.sales_df = df
                 else:
                     combined = pd.concat([self.sales_df, df], ignore_index=True)
-                    dedup_cols = [c for c in combined.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
                     self.sales_df = combined.drop_duplicates(subset=dedup_cols)
             else:
                 month = self._determine_period_key(path, filename, df_peek)
-                self.data['sales'][month] = df
+                dedup_cols = [c for c in df.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+                self.data['sales'][month] = df.drop_duplicates(subset=dedup_cols)
         except Exception as e:
             print(f"加载销售数据失败 {filename}: {e}")
 
@@ -1969,28 +2090,29 @@ class ReportGenerator:
                     detail_df["ParsedDate"] = parsed
                     detail_df = detail_df.dropna(subset=["ParsedDate"])
                     detail_df["MonthStr"] = detail_df["ParsedDate"].dt.strftime("%Y-%m")
+                    dedup_cols = [c for c in detail_df.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+                    detail_df = detail_df.drop_duplicates(subset=dedup_cols)
                     for m_key, group in detail_df.groupby("MonthStr"):
+                        clean_group = group.copy().drop_duplicates(subset=dedup_cols)
                         existing = self.data['ar'].get(m_key)
                         if existing is None or existing.empty:
-                            self.data['ar'][m_key] = group.copy()
+                            self.data['ar'][m_key] = clean_group
                         else:
-                            combined = pd.concat([existing, group.copy()], ignore_index=True)
-                            dedup_cols = [c for c in combined.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+                            combined = pd.concat([existing, clean_group], ignore_index=True)
                             self.data['ar'][m_key] = combined.drop_duplicates(subset=dedup_cols)
                     if self.ar_detail_df is None or self.ar_detail_df.empty:
                         self.ar_detail_df = detail_df
                     else:
                         combined = pd.concat([self.ar_detail_df, detail_df], ignore_index=True)
-                        dedup_cols = [c for c in combined.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
                         self.ar_detail_df = combined.drop_duplicates(subset=dedup_cols)
                 else:
                     month = self._determine_period_key(path, filename, df_peek)
-                    self.data['ar'][month] = df
+                    dedup_cols = [c for c in df.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+                    self.data['ar'][month] = df.drop_duplicates(subset=dedup_cols)
                     if self.ar_detail_df is None or self.ar_detail_df.empty:
-                        self.ar_detail_df = detail_df
+                        self.ar_detail_df = detail_df.drop_duplicates(subset=dedup_cols) if detail_df is not None else None
                     else:
                         combined = pd.concat([self.ar_detail_df, detail_df], ignore_index=True)
-                        dedup_cols = [c for c in combined.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
                         self.ar_detail_df = combined.drop_duplicates(subset=dedup_cols)
             except Exception as e:
                 month = self._determine_period_key(path, filename, df_peek)
@@ -2004,12 +2126,13 @@ class ReportGenerator:
     def _append_detail_frame(self, attr_name, df):
         if df is None or df.empty:
             return
+        dedup_cols = [c for c in df.columns if c not in {"SourceFile", "SourcePath", "index"}]
+        clean_df = df.drop_duplicates(subset=dedup_cols)
         existing = getattr(self, attr_name, None)
         if existing is None or existing.empty:
-            setattr(self, attr_name, df.copy())
+            setattr(self, attr_name, clean_df.copy())
         else:
-            combined = pd.concat([existing, df.copy()], ignore_index=True)
-            dedup_cols = [c for c in combined.columns if c not in {"SourceFile", "SourcePath", "index"}]
+            combined = pd.concat([existing, clean_df], ignore_index=True)
             setattr(self, attr_name, combined.drop_duplicates(subset=dedup_cols))
 
     def _load_account_detail_data(self, path, filename, category, detail_attr, label):
@@ -2029,18 +2152,21 @@ class ReportGenerator:
                 detail_df["ParsedDate"] = parsed
                 detail_df = detail_df.dropna(subset=["ParsedDate"])
                 detail_df["MonthStr"] = detail_df["ParsedDate"].dt.strftime("%Y-%m")
+                dedup_cols = [c for c in detail_df.columns if c not in {"SourceFile", "SourcePath", "index"}]
+                detail_df = detail_df.drop_duplicates(subset=dedup_cols)
                 for m_key, group in detail_df.groupby("MonthStr"):
+                    clean_group = group.copy().drop_duplicates(subset=dedup_cols)
                     existing = self.data[category].get(m_key)
                     if existing is None or existing.empty:
-                        self.data[category][m_key] = group.copy()
+                        self.data[category][m_key] = clean_group
                     else:
-                        combined = pd.concat([existing, group.copy()], ignore_index=True)
-                        dedup_cols = [c for c in combined.columns if c not in {"SourceFile", "SourcePath", "index"}]
+                        combined = pd.concat([existing, clean_group], ignore_index=True)
                         self.data[category][m_key] = combined.drop_duplicates(subset=dedup_cols)
                 self._append_detail_frame(detail_attr, detail_df)
             else:
                 month = self._determine_period_key(path, filename, df_peek)
-                self.data[category][month] = detail_df
+                dedup_cols = [c for c in detail_df.columns if c not in {"SourceFile", "SourcePath", "index"}]
+                self.data[category][month] = detail_df.drop_duplicates(subset=dedup_cols)
                 self._append_detail_frame(detail_attr, detail_df)
         except Exception as e:
             print(f"加载{label}数据失败 {filename}: {e}")
@@ -3853,11 +3979,13 @@ class ReportGenerator:
         if sales_df is None or sales_df.empty:
             return {}
         df = sales_df.copy()
+        dedup_cols = [c for c in df.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+        df = df.drop_duplicates(subset=dedup_cols)
         df['Revenue'] = self._extract_sales_revenue(df)
         df['Qty'] = pd.to_numeric(df.get('数量'), errors='coerce')
         try:
             y, m = month_key.split('-', 1)
-            df = self._attach_sales_cost(df, y, m, year_scope="current")
+            df = self._attach_sales_cost(df, int(y), int(m), year_scope="current")
         except Exception:
             df['Cost'] = pd.to_numeric(df.get('销售出库供应价合计'), errors='coerce')
         if 'Cost' not in df.columns:
@@ -3894,13 +4022,9 @@ class ReportGenerator:
         if not category_totals:
             return
 
-        top_rev_row = self._find_row_by_label(ws, "主营业务收入", col=1, start_row=2)
-        top_cost_row = self._find_row_by_label(ws, "主营业务成本", col=1, start_row=2)
-        top_rev_total = self._to_float(ws.cell(row=top_rev_row, column=month_col).value) if top_rev_row else None
-        top_cost_total = self._to_float(ws.cell(row=top_cost_row, column=month_col).value) if top_cost_row else None
-        raw_rev_total = sum(v.get('revenue', 0) for v in category_totals.values() if v.get('revenue') is not None)
-        raw_cost_total = sum(v.get('cost', 0) for v in category_totals.values() if v.get('cost') is not None)
-
+        # 品类行直接写入出库明细口径原始值，不做等比例缩放。
+        # 顶部总额(主营业务收入/成本)来自账面利润表源文件，与出库明细口径存在结转差异，
+        # 若缩放会掩盖业务真实毛利（如鞋类），故仅在单元格为空时填入原始值。
         for r in range((header_row or 1) + 1, ws.max_row + 1):
             raw_label = ws.cell(row=r, column=1).value
             if not isinstance(raw_label, str):
@@ -3925,16 +4049,10 @@ class ReportGenerator:
             if not item:
                 continue
             value = item.get(metric)
-            if metric == 'revenue' and value is not None and top_rev_total is not None and raw_rev_total:
-                value = top_rev_total * value / raw_rev_total
-            elif metric == 'cost' and value is not None and top_cost_total is not None and raw_cost_total:
-                value = top_cost_total * value / raw_cost_total
             if value is None:
                 continue
 
-            current = ws.cell(row=r, column=month_col).value
-            if current is None or (isinstance(current, str) and not current.strip()):
-                ws.cell(row=r, column=month_col).value = value
+            ws.cell(row=r, column=month_col).value = value
 
     def _sync_profit_duplicate_rows(self, ws, month_col):
         if not month_col:
@@ -8148,6 +8266,48 @@ class ReportGenerator:
                     continue
                 value_map[key] = val
                 value_map[f"{key}："] = val
+
+        # 确保固定资产原值类科目为正数（如原始账表中车辆为负数）
+        for fa_key in ["车辆", "机器设备", "办公器具", "电子设备", "运输设备", "房屋及建筑物", "固定资产原价", "固定资产原值"]:
+            if fa_key in value_map and value_map[fa_key] is not None:
+                value_map[fa_key] = abs(value_map[fa_key])
+                value_map[f"{fa_key}："] = value_map[fa_key]
+
+        # 补齐 固定资产原价 / 固定资产原值
+        if "固定资产原价" not in value_map or value_map["固定资产原价"] is None:
+            fa_cost = None
+            if "车辆" in value_map and value_map["车辆"] is not None:
+                fa_cost = abs(value_map["车辆"])
+            elif "固定资产" in value_map and "累计折旧" in value_map:
+                fa_cost = value_map["固定资产"] + abs(value_map["累计折旧"])
+            if fa_cost is not None:
+                value_map["固定资产原价"] = fa_cost
+                value_map["固定资产原价："] = fa_cost
+                value_map["固定资产原值"] = fa_cost
+                value_map["固定资产原值："] = fa_cost
+
+        # 补齐 固定资产净值（在亿看等账表中 1601固定资产即为净值）
+        if "固定资产净值" not in value_map and "固定资产" in value_map:
+            value_map["固定资产净值"] = value_map["固定资产"]
+            value_map["固定资产净值："] = value_map["固定资产"]
+
+        # 补齐 减：累计折旧
+        if "累计折旧" in value_map:
+            depr = abs(value_map["累计折旧"])
+            value_map["累计折旧"] = depr
+            value_map["累计折旧："] = depr
+            value_map["减：累计折旧"] = depr
+            value_map["减：累计折旧："] = depr
+            value_map["减:累计折旧"] = depr
+            value_map["减:累计折旧："] = depr
+
+        # 待处理财产损益 与 待处理财产损溢 别名互通
+        if "待处理财产损溢" in value_map and "待处理财产损益" not in value_map:
+            value_map["待处理财产损益"] = value_map["待处理财产损溢"]
+            value_map["待处理财产损益："] = value_map["待处理财产损溢"]
+        elif "待处理财产损益" in value_map and "待处理财产损溢" not in value_map:
+            value_map["待处理财产损溢"] = value_map["待处理财产损益"]
+            value_map["待处理财产损溢："] = value_map["待处理财产损益"]
 
         return value_map
 
@@ -13337,7 +13497,107 @@ class ReportGenerator:
 
             row_idx += 1
 
+    def _rationalize_balance_sheet_structure(self, ws):
+        """优化资产负债表结构：
+        1. 确保'待处理财产损益'列在非流动资产项下（非流动资产合计之前），移除底部多余行；
+        2. 合理化固定资产及折旧的展示结构（固定资产原价、车辆为正数、减：累计折旧、机器设备/车辆累计折旧、固定资产净值）。
+        """
+        row_labels = {}
+        for r in range(1, ws.max_row + 1):
+            v = ws.cell(row=r, column=1).value
+            if v:
+                clean_v = str(v).strip().replace(" ", "").rstrip("：:")
+                row_labels[clean_v] = r
+
+        nc_asset_row = row_labels.get("非流动资产")
+        nc_total_row = row_labels.get("非流动资产合计")
+        if not nc_asset_row or not nc_total_row:
+            return False
+
+        changed = False
+
+        # 1. 待处理财产损益位置调整：确保位于非流动资产内部（非流动资产合计之前）
+        has_pending = any(
+            clean in row_labels and nc_asset_row < row_labels[clean] < nc_total_row
+            for clean in ["待处理财产损益", "待处理财产损溢"]
+        )
+
+        if not has_pending:
+            bottom_pending_row = None
+            for clean in ["待处理财产损益", "待处理财产损溢"]:
+                if clean in row_labels and row_labels[clean] > nc_total_row:
+                    bottom_pending_row = row_labels[clean]
+                    break
+
+            ws.insert_rows(nc_total_row)
+            ws.cell(row=nc_total_row, column=1).value = "待处理财产损益"
+            src_row = nc_total_row - 1
+            for c in range(1, ws.max_column + 1):
+                sc = ws.cell(row=src_row, column=c)
+                tc = ws.cell(row=nc_total_row, column=c)
+                if sc.has_style:
+                    tc.font = copy.copy(sc.font)
+                    tc.border = copy.copy(sc.border)
+                    tc.fill = copy.copy(sc.fill)
+                    tc.number_format = sc.number_format
+                    tc.alignment = copy.copy(sc.alignment)
+
+            # 若原先在底部，因为插入了一行，原底部行号后移1
+            if bottom_pending_row:
+                shifted_bottom = bottom_pending_row + 1
+                ws.delete_rows(shifted_bottom)
+
+            changed = True
+
+        # 重新扫描行标签
+        row_labels = {}
+        for r in range(1, ws.max_row + 1):
+            v = ws.cell(row=r, column=1).value
+            if v:
+                clean_v = str(v).strip().replace(" ", "").rstrip("：:")
+                row_labels[clean_v] = r
+
+        # 2. 固定资产及折旧结构合理化
+        has_fa_cost = any(k in row_labels for k in ["固定资产原价", "固定资产原值"])
+        has_fa_net = any(k in row_labels for k in ["固定资产净值"])
+
+        if not has_fa_cost and not has_fa_net:
+            r_fa = row_labels.get("固定资产")
+            r_veh = row_labels.get("车辆")
+            r_depr = row_labels.get("累计折旧")
+            r_mach_depr = row_labels.get("机器设备累计折旧")
+            r_veh_depr = row_labels.get("车辆累计折旧")
+
+            if r_fa and r_veh and r_depr and r_mach_depr and r_veh_depr:
+                start_r = min(r_fa, r_veh, r_depr, r_mach_depr, r_veh_depr)
+                ws.insert_rows(start_r + 5)
+                new_labels = [
+                    "固定资产原价",
+                    "  车辆",
+                    "减：累计折旧",
+                    "  机器设备累计折旧",
+                    "  车辆累计折旧",
+                    "固定资产净值",
+                ]
+                for idx, label in enumerate(new_labels):
+                    row_idx = start_r + idx
+                    ws.cell(row=row_idx, column=1).value = label
+                    for c in range(1, ws.max_column + 1):
+                        cell = ws.cell(row=row_idx, column=c)
+                        sc = ws.cell(row=start_r, column=c)
+                        if sc.has_style:
+                            cell.font = copy.copy(sc.font)
+                            cell.border = copy.copy(sc.border)
+                            cell.fill = copy.copy(sc.fill)
+                            cell.number_format = sc.number_format
+                            cell.alignment = copy.copy(sc.alignment)
+                changed = True
+
+        return changed
+
     def _update_balance_sheet(self, ws, target_year, target_month, year_scope=None):
+        self._rationalize_balance_sheet_structure(ws)
+
         month_cols = {}
         for col in range(2, ws.max_column + 1):
             header = ws.cell(row=1, column=col).value
@@ -13367,6 +13627,13 @@ class ReportGenerator:
                 '非流动资产合计': '非流动资产',
                 '流动负债合计': '流动负债',
                 '非流动负债合计': '非流动负债',
+                '待处理财产损益': '待处理财产损溢',
+                '待处理财产损溢': '待处理财产损益',
+                '固定资产净值': '固定资产',
+                '固定资产原值': '固定资产原价',
+                '减：累计折旧': '累计折旧',
+                '减:累计折旧': '累计折旧',
+                '累计折旧合计': '累计折旧',
             }
 
             for r in range(2, ws.max_row + 1):
@@ -13377,8 +13644,12 @@ class ReportGenerator:
                 if not lookup:
                     continue
 
+                clean_lookup = re.sub(r'^(其中：|其中:|\s+)', '', lookup)
                 candidates = [lookup, f"{lookup}："]
-                alias = alias_map.get(lookup)
+                if clean_lookup and clean_lookup != lookup:
+                    candidates.extend([clean_lookup, f"{clean_lookup}："])
+
+                alias = alias_map.get(lookup) or (alias_map.get(clean_lookup) if clean_lookup else None)
                 if alias:
                     candidates.extend([alias, f"{alias}："])
                 if lookup.endswith('合计'):
@@ -13391,6 +13662,9 @@ class ReportGenerator:
                         val = balance_map[key]
                         break
                 if val is not None:
+                    # 确保固定资产原值类（车辆、固定资产原价等）为正数
+                    if lookup in {"车辆", "固定资产原价", "固定资产原值", "机器设备", "办公器具"} or clean_lookup in {"车辆", "固定资产原价", "固定资产原值", "机器设备", "办公器具"}:
+                        val = abs(val)
                     ws.cell(row=r, column=col).value = val
 
     def _update_budget_sheet(self, ws, metrics_by_month, target_year, target_month, year_scope=None):
@@ -13489,6 +13763,8 @@ class ReportGenerator:
                 frames.append(df)
             if frames:
                 self.sales_df = pd.concat(frames, ignore_index=True)
+                dedup_cols = [c for c in self.sales_df.columns if c not in {'SourceFile', 'SourcePath', 'index'}]
+                self.sales_df = self.sales_df.drop_duplicates(subset=dedup_cols)
                 return self.sales_df
         return None
 

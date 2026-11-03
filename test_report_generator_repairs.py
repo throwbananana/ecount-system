@@ -3954,6 +3954,261 @@ def test_cvp_fixed_cost_includes_all_non_variable_expenses():
     assert var_map["2026-08"] + fixed_map["2026-08"] == 290
 
 
+def test_load_all_data_resolves_superseded_and_mismatched_files(tmp_path):
+    gen = ReportGenerator(str(tmp_path))
+    # File 1: Canonical name says 2026-02, but data is 2026-01 (older export)
+    bad_feb = tmp_path / "销售出库明细表_2026-02-01_to_2026-02-28.xlsx"
+    wb1 = Workbook()
+    ws1 = wb1.active
+    ws1.title = "销售出库明细"
+    ws1.append(["日期", "单号", "金额"])
+    ws1.append(["2026-01-15", "ITEM-1", 100])
+    ws1.append(["2026/07/14 (二) 2:14:54", None, None])
+    wb1.save(bad_feb)
+
+    # File 2: Suffix _2 says 2026-02, data is 2026-02 (newer export)
+    good_feb = tmp_path / "销售出库明细表_2026-02-01_to_2026-02-28_2.xlsx"
+    wb2 = Workbook()
+    ws2 = wb2.active
+    ws2.title = "销售出库明细"
+    ws2.append(["日期", "单号", "金额"])
+    ws2.append(["2026-02-15", "ITEM-2", 200])
+    ws2.append(["2026/10/19 (一) 19:47:14", None, None])
+    wb2.save(good_feb)
+
+    gen.load_all_data()
+
+    # The 2026-02 data MUST be loaded from _2.xlsx, and not skipped!
+    assert "2026-02" in gen.data["sales"]
+    assert len(gen.data["sales"]["2026-02"]) == 1
+    assert "2026-01" not in gen.data["sales"]
+
+
+def test_load_all_data_keeps_newer_numbered_duplicate(tmp_path):
+    gen = ReportGenerator(str(tmp_path))
+    # File 1: older canonical file
+    old_file = tmp_path / "销售出库明细表_2026-08-01_to_2026-08-31.xlsx"
+    wb1 = Workbook()
+    ws1 = wb1.active
+    ws1.title = "销售出库明细"
+    ws1.append(["日期", "单号", "金额"])
+    ws1.append(["2026-08-10", "OLD-ITEM", 100])
+    ws1.append(["2026/08/15 08:00:00", None, None])
+    wb1.save(old_file)
+
+    # File 2: newer _2 file with updated/different amount
+    new_file = tmp_path / "销售出库明细表_2026-08-01_to_2026-08-31_2.xlsx"
+    wb2 = Workbook()
+    ws2 = wb2.active
+    ws2.title = "销售出库明细"
+    ws2.append(["日期", "单号", "金额"])
+    ws2.append(["2026-08-10", "NEW-ITEM", 999])
+    ws2.append(["2026/08/20 08:00:00", None, None])
+    wb2.save(new_file)
+
+    gen.load_all_data()
+
+    # The newer file should be kept and older skipped
+    assert "2026-08" in gen.data["sales"]
+    df = gen.data["sales"]["2026-08"]
+    assert len(df) == 1
+    assert "NEW-ITEM" in df["单号"].values
+
+
+def test_load_sales_data_deduplicates_single_file_and_matches_profit_category_totals(tmp_path):
+    gen = ReportGenerator(str(tmp_path))
+    sales_file = tmp_path / "销售出库明细表_2026-09-01_to_2026-09-30.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "销售明细"
+    ws.append(["日期-号码", "品目编码", "品目名", "品目组合1名", "数量", "合计", "销售出库供应价合计"])
+    # 1 normal shoe row
+    ws.append(["2026/09/10 -1", "SHOE-1", "运动鞋", "鞋类", 10, 1000.0, 800.0])
+    # 2 duplicate shoe rows (same content)
+    ws.append(["2026/09/11 -2", "SHOE-2", "网布鞋", "鞋类", 16, 1290.24, 3774.88])
+    ws.append(["2026/09/11 -2", "SHOE-2", "网布鞋", "鞋类", 16, 1290.24, 3774.88])
+    wb.save(sales_file)
+
+    gen._load_sales_data(str(sales_file), "销售出库明细表_2026-09-01_to_2026-09-30.xlsx")
+
+    # Both gen.data['sales']['2026-09'] and gen._get_sales_df() must have 2 rows (duplicate eliminated)
+    assert len(gen.data['sales']['2026-09']) == 2
+    assert len(gen._get_sales_df()) == 2
+
+    # Category totals calculated for profit sheet must match exactly
+    totals = gen._build_profit_category_totals('2026-09')
+    assert "鞋类" in totals
+    assert round(totals["鞋类"]["revenue"], 2) == round(1000.0 + 1290.24, 2)
+    assert round(totals["鞋类"]["cost"], 2) == round(800.0 + 3774.88, 2)
+
+
+def test_extract_balance_value_map_normalizes_fixed_assets_and_pending_loss():
+    gen = ReportGenerator('.')
+    raw_df = pd.DataFrame({
+        "财务报表显示名": [
+            "流动资产",
+            "货币资金",
+            "非流动资产",
+            "固定资产",
+            "车辆",
+            "累计折旧",
+            "机器设备累计折旧",
+            "车辆累计折旧",
+            "待处理财产损溢",
+            "资产总计",
+        ],
+        "2026/07": [
+            1000000.0,
+            1000000.0,
+            2841237.18,
+            242775.06,
+            -358614.50,  # ECOUNT raw negative value
+            115839.44,
+            0.0,
+            115839.44,
+            2616917.30,
+            3841237.18,
+        ]
+    })
+    val_map = gen._extract_balance_value_map(raw_df, target_year="2026", target_month="07")
+
+    # 车辆 must be normalized to positive
+    assert val_map["车辆"] == 358614.50
+    # 固定资产原价 should be calculated and positive
+    assert val_map["固定资产原价"] == 358614.50
+    # 累计折旧 and 减：累计折旧
+    assert val_map["减：累计折旧"] == 115839.44
+    # 固定资产净值
+    assert val_map["固定资产净值"] == 242775.06
+    # 待处理财产损益 alias
+    assert val_map["待处理财产损益"] == 2616917.30
+    assert val_map["待处理财产损溢"] == 2616917.30
+    # Check accounting identity: 原价 - 折旧 == 净值
+    assert round(val_map["固定资产原价"] - val_map["减：累计折旧"], 2) == round(val_map["固定资产净值"], 2)
+
+
+def test_rationalize_balance_sheet_structure_repositions_pending_loss_and_fa():
+    gen = ReportGenerator('.')
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "资产负债表"
+
+    rows = [
+        ["资产", "2026/07"],
+        ["流动资产：", None],
+        ["  货币资金", 1000.0],
+        ["流动资产合计", 1000.0],
+        ["非流动资产：", None],
+        ["  固定资产", 242775.06],
+        ["  车辆", -358614.50],
+        ["  累计折旧", 115839.44],
+        ["  机器设备累计折旧", 0.0],
+        ["  车辆累计折旧", 115839.44],
+        ["非流动资产合计", 2859692.36],
+        ["资产总计", 2860692.36],
+        ["流动负债：", None],
+        ["待处理财产损溢", 2616917.30],  # old stale bottom row
+    ]
+    for r in rows:
+        ws.append(r)
+
+    changed = gen._rationalize_balance_sheet_structure(ws)
+    assert changed is True
+
+    # Check positions
+    labels = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1) if ws.cell(row=r, column=1).value]
+    clean_labels = [str(x).strip().replace(" ", "").rstrip("：:") for x in labels]
+
+    nc_asset_idx = clean_labels.index("非流动资产")
+    nc_total_idx = clean_labels.index("非流动资产合计")
+    pending_idx = clean_labels.index("待处理财产损益")
+
+    # 1. 待处理财产损益 must be strictly inside non-current assets (before 非流动资产合计)
+    assert nc_asset_idx < pending_idx < nc_total_idx
+
+    # 2. No duplicate 待处理财产损益 or 待处理财产损溢 at the bottom
+    assert clean_labels.count("待处理财产损益") == 1
+    assert clean_labels.count("待处理财产损溢") == 0
+
+    # 3. Fixed assets sequence
+    assert "固定资产原价" in clean_labels
+    assert "固定资产净值" in clean_labels
+    assert "减：累计折旧" in clean_labels
+
+    fa_cost_idx = clean_labels.index("固定资产原价")
+    fa_net_idx = clean_labels.index("固定资产净值")
+    assert nc_asset_idx < fa_cost_idx < fa_net_idx < pending_idx
+
+    # Idempotent check
+    second_changed = gen._rationalize_balance_sheet_structure(ws)
+    assert second_changed is False
+
+
+def test_update_balance_sheet_populates_positive_vehicle_and_pending_loss():
+    gen = ReportGenerator('.')
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "资产负债表"
+
+    # Minimal template structure
+    ws.append(["资产", "2026/07"])
+    ws.append(["非流动资产：", None])
+    ws.append(["  固定资产原价", None])
+    ws.append(["    车辆", None])
+    ws.append(["  减：累计折旧", None])
+    ws.append(["    机器设备累计折旧", None])
+    ws.append(["    车辆累计折旧", None])
+    ws.append(["  固定资产净值", None])
+    ws.append(["  待处理财产损益", None])
+    ws.append(["非流动资产合计", None])
+
+    raw_df = pd.DataFrame({
+        "财务报表显示名": [
+            "非流动资产",
+            "固定资产",
+            "车辆",
+            "累计折旧",
+            "机器设备累计折旧",
+            "车辆累计折旧",
+            "待处理财产损溢",
+            "非流动资产合计",
+        ],
+        "2026/07": [
+            2859692.36,
+            242775.06,
+            -358614.50,  # negative in source
+            115839.44,
+            0.0,
+            115839.44,
+            2616917.30,
+            2859692.36,
+        ]
+    })
+    gen.data['asset']['2026-07'] = raw_df
+
+    gen._update_balance_sheet(ws, '2026', '07', 'current')
+
+    label_to_val = {}
+    for r in range(2, ws.max_row + 1):
+        lbl = ws.cell(row=r, column=1).value
+        val = ws.cell(row=r, column=2).value
+        if lbl:
+            clean = str(lbl).strip().replace(" ", "").rstrip("：:")
+            label_to_val[clean] = val
+
+    # 车辆 must be positive
+    assert label_to_val["车辆"] == 358614.50
+    assert label_to_val["固定资产原价"] == 358614.50
+    assert label_to_val["减：累计折旧"] == 115839.44
+    assert label_to_val["固定资产净值"] == 242775.06
+    assert label_to_val["待处理财产损益"] == 2616917.30
+    assert label_to_val["非流动资产合计"] == 2859692.36
+
+    # Arithmetic checks
+    assert round(label_to_val["固定资产原价"] - label_to_val["减：累计折旧"], 2) == round(label_to_val["固定资产净值"], 2)
+    assert round(label_to_val["固定资产净值"] + label_to_val["待处理财产损益"], 2) == round(label_to_val["非流动资产合计"], 2)
+
+
 if __name__ == '__main__':
     test_fill_product_summary_aggregates_rows()
     test_list_available_months_uses_core_intersection_when_loaded()
@@ -3999,4 +4254,7 @@ if __name__ == '__main__':
     test_profit_sheet_highlights_large_expense_mom_and_links_to_expense_details()
     test_update_directory_sheet_realigns_links_and_clears_missing_targets()
     test_ar_aging_sheet_adds_customer_turnover_and_charts()
+    test_extract_balance_value_map_normalizes_fixed_assets_and_pending_loss()
+    test_rationalize_balance_sheet_structure_repositions_pending_loss_and_fa()
+    test_update_balance_sheet_populates_positive_vehicle_and_pending_loss()
     print('PASS: test_report_generator_repairs')
